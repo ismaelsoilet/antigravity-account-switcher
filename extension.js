@@ -94,15 +94,8 @@ function saveProfiles(profiles) {
     }
 }
 
-function isSessionActive(tokens) {
-    if (!tokens) return false;
-    const oauth = tokens['antigravityUnifiedStateSync.oauthToken'];
-    if (!oauth || typeof oauth !== 'string') return false;
-    return oauth.includes('signedIn');
-}
-
 function extractEmail(tokens) {
-    if (!tokens || !isSessionActive(tokens)) return '';
+    if (!tokens) return '';
 
     // 1. Check antigravityAuthStatus (exact active session email)
     const authStatus = tokens['antigravityAuthStatus'];
@@ -115,7 +108,7 @@ function extractEmail(tokens) {
         } catch {}
     }
 
-    // 2. Check jetski.onboarding.lastLoginUsername ONLY IF session is actively signed in
+    // 2. Check jetski.onboarding.lastLoginUsername
     const raw = tokens['google.google-antigravity'];
     if (raw) {
         try {
@@ -131,6 +124,11 @@ function extractEmail(tokens) {
     }
 
     return '';
+}
+
+function isSessionActive(tokens) {
+    if (!tokens) return false;
+    return !!extractEmail(tokens);
 }
 
 function readCurrentTokens() {
@@ -339,6 +337,35 @@ async function showAccountSwitcherMenu() {
     }
 }
 
+function cleanDbSessionTokens() {
+    const dbs = getDbPaths();
+    for (const dbPath of dbs) {
+        if (DatabaseSync) {
+            try {
+                const db = new DatabaseSync(dbPath);
+                const stmt = db.prepare('DELETE FROM ItemTable WHERE key = ?');
+                for (const k of AUTH_KEYS) {
+                    if (k !== 'google.google-antigravity') {
+                        stmt.run(k);
+                    }
+                }
+                const row = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.google-antigravity');
+                if (row && row.value) {
+                    try {
+                        const data = JSON.parse(row.value);
+                        if (data['antigravity-storage']) {
+                            delete data['antigravity-storage']['jetski.onboarding.lastLoginUsername'];
+                            delete data['antigravity-storage']['jetski.onboarding.lastLoginIsGcpTos'];
+                            db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run('google.google-antigravity', JSON.stringify(data));
+                        }
+                    } catch {}
+                }
+                db.close();
+            } catch {}
+        }
+    }
+}
+
 async function logoutAccount() {
     const confirm = await vscode.window.showWarningMessage(
         'Log out of the current Google Account session?',
@@ -349,19 +376,7 @@ async function logoutAccount() {
     if (confirm !== 'Log Out') return;
 
     try {
-        const dbs = getDbPaths();
-        for (const dbPath of dbs) {
-            if (DatabaseSync) {
-                try {
-                    const db = new DatabaseSync(dbPath);
-                    const stmt = db.prepare('DELETE FROM ItemTable WHERE key = ?');
-                    for (const k of AUTH_KEYS) {
-                        stmt.run(k);
-                    }
-                    db.close();
-                } catch {}
-            }
-        }
+        cleanDbSessionTokens();
 
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');
@@ -385,20 +400,7 @@ async function clearAllData() {
 
     try {
         saveProfiles({});
-
-        const dbs = getDbPaths();
-        for (const dbPath of dbs) {
-            if (DatabaseSync) {
-                try {
-                    const db = new DatabaseSync(dbPath);
-                    const stmt = db.prepare('DELETE FROM ItemTable WHERE key = ?');
-                    for (const k of AUTH_KEYS) {
-                        stmt.run(k);
-                    }
-                    db.close();
-                } catch {}
-            }
-        }
+        cleanDbSessionTokens();
 
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');

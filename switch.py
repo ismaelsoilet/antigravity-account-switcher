@@ -68,16 +68,8 @@ def save_profiles(profiles):
         except Exception as e:
             sys.stderr.write(f"Warning: could not write {path_target}: {e}\n")
 
-def is_session_active(tokens):
-    if not tokens:
-        return False
-    oauth = tokens.get("antigravityUnifiedStateSync.oauthToken")
-    if not oauth or not isinstance(oauth, str):
-        return False
-    return "signedIn" in oauth
-
 def extract_email(tokens):
-    if not tokens or not is_session_active(tokens):
+    if not tokens:
         return ""
 
     # 1. Check antigravityAuthStatus (exact active session email)
@@ -105,6 +97,11 @@ def extract_email(tokens):
             pass
 
     return ""
+
+def is_session_active(tokens):
+    if not tokens:
+        return False
+    return bool(extract_email(tokens))
 
 def read_current_tokens():
     tokens = {}
@@ -258,7 +255,20 @@ def cmd_clear():
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             for k in AUTH_KEYS:
-                cur.execute("DELETE FROM ItemTable WHERE key = ?", (k,))
+                if k != "google.google-antigravity":
+                    cur.execute("DELETE FROM ItemTable WHERE key = ?", (k,))
+            # Strip email from google.google-antigravity so no ghost account remains
+            cur.execute("SELECT value FROM ItemTable WHERE key = 'google.google-antigravity'")
+            row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    data = json.loads(row[0])
+                    if "antigravity-storage" in data:
+                        data["antigravity-storage"].pop("jetski.onboarding.lastLoginUsername", None)
+                        data["antigravity-storage"].pop("jetski.onboarding.lastLoginIsGcpTos", None)
+                        cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('google.google-antigravity', ?)", (json.dumps(data),))
+                except Exception:
+                    pass
             conn.commit()
             conn.close()
         except Exception as e:
