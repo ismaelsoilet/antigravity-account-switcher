@@ -94,8 +94,28 @@ function saveProfiles(profiles) {
     }
 }
 
+function isSessionActive(tokens) {
+    if (!tokens) return false;
+    const oauth = tokens['antigravityUnifiedStateSync.oauthToken'];
+    if (!oauth || typeof oauth !== 'string') return false;
+    return oauth.includes('signedIn');
+}
+
 function extractEmail(tokens) {
-    if (!tokens) return '';
+    if (!tokens || !isSessionActive(tokens)) return '';
+
+    // 1. Check antigravityAuthStatus (exact active session email)
+    const authStatus = tokens['antigravityAuthStatus'];
+    if (authStatus) {
+        try {
+            const data = typeof authStatus === 'string' ? JSON.parse(authStatus) : authStatus;
+            if (data && data.email && typeof data.email === 'string' && data.email.includes('@')) {
+                return data.email.trim();
+            }
+        } catch {}
+    }
+
+    // 2. Check jetski.onboarding.lastLoginUsername ONLY IF session is actively signed in
     const raw = tokens['google.google-antigravity'];
     if (raw) {
         try {
@@ -109,29 +129,7 @@ function extractEmail(tokens) {
             }
         } catch {}
     }
-    // Check antigravityAuthStatus JSON
-    const authStatus = tokens['antigravityAuthStatus'];
-    if (authStatus) {
-        try {
-            const data = typeof authStatus === 'string' ? JSON.parse(authStatus) : authStatus;
-            if (data && data.email && data.email.includes('@')) {
-                return data.email.trim();
-            }
-        } catch {}
-    }
-    // Fallback: search any token value for a user email
-    for (const val of Object.values(tokens)) {
-        if (typeof val === 'string') {
-            const matches = val.match(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/g);
-            if (matches) {
-                for (const em of matches) {
-                    if (!em.includes('gserviceaccount.com') && !em.includes('googleapis.com')) {
-                        return em.trim();
-                    }
-                }
-            }
-        }
-    }
+
     return '';
 }
 
@@ -184,26 +182,19 @@ function writeTokensToDbs(tokens) {
 
 async function getActiveAccountInfo() {
     const tokens = readCurrentTokens();
-    const email = extractEmail(tokens);
+    const active = isSessionActive(tokens);
+    const email = active ? extractEmail(tokens) : '';
     const profiles = loadProfiles();
 
     let matched = null;
     if (email && profiles[email]) {
         matched = profiles[email];
-    } else {
-        const currOauth = tokens['antigravityUnifiedStateSync.oauthToken'];
-        for (const p of Object.values(profiles)) {
-            if (currOauth && p.tokens && p.tokens['antigravityUnifiedStateSync.oauthToken'] === currOauth) {
-                matched = p;
-                break;
-            }
-        }
     }
 
-    const label = matched ? matched.label : (email ? email.split('@')[0] : 'Unsaved');
     return {
+        isActive: active && !!email,
         email: email,
-        label: label,
+        label: matched ? matched.label : (email ? email.split('@')[0] : 'No Account'),
         isSaved: !!matched,
         tokens: tokens
     };
@@ -212,22 +203,29 @@ async function getActiveAccountInfo() {
 async function updateStatusBar() {
     try {
         const info = await getActiveAccountInfo();
-        const displayLabel = info.label || 'Account';
-        const displayEmail = info.email ? ` ${info.email}` : '';
-
-        statusBarItem.text = `$(account) [${displayLabel}]${displayEmail}`;
-        statusBarItem.tooltip = new vscode.MarkdownString(
-            `### Antigravity Account Switcher\n` +
-            `* **Active Account:** \`${info.email || 'None'}\`\n` +
-            `* **Profile Label:** \`${displayLabel}\`\n` +
-            `* **Vault Status:** ${info.isSaved ? '✅ Saved in Vault' : '⚠️ Unsaved Session'}\n` +
-            `* **Environment:** Synced across IDE, Desktop 2.0 & CLI\n\n` +
-            `*(Click to switch accounts, add new, or rename profile)*`
-        );
+        if (info.isActive && info.email) {
+            const displayLabel = info.label || info.email.split('@')[0];
+            statusBarItem.text = `$(account) [${displayLabel}] ${info.email}`;
+            statusBarItem.tooltip = new vscode.MarkdownString(
+                `### Antigravity Account Switcher\n` +
+                `* **Active Account:** \`${info.email}\`\n` +
+                `* **Profile Label:** \`${displayLabel}\`\n` +
+                `* **Vault Status:** ${info.isSaved ? '✅ Saved in Vault' : '⚠️ Unsaved Session'}\n` +
+                `* **Environment:** Synced across IDE, Desktop 2.0 & CLI\n\n` +
+                `*(Click to switch accounts, add new, or rename profile)*`
+            );
+        } else {
+            statusBarItem.text = `$(account) [No Account] Sign In`;
+            statusBarItem.tooltip = new vscode.MarkdownString(
+                `### Antigravity Account Switcher\n` +
+                `* **Status:** No Active Google Account (Signed Out)\n\n` +
+                `*(Click to sign in with Google or select a saved profile)*`
+            );
+        }
         statusBarItem.show();
     } catch {
-        statusBarItem.text = `$(account) Antigravity`;
-        statusBarItem.tooltip = `Click to switch Antigravity accounts`;
+        statusBarItem.text = `$(account) [No Account]`;
+        statusBarItem.tooltip = `Click to connect Google account`;
         statusBarItem.show();
     }
 }
@@ -243,7 +241,7 @@ async function showAccountSwitcherMenu() {
         if (savedList.length > 0) {
             items.push({ label: 'GOOGLE ACCOUNTS (SAVED)', kind: vscode.QuickPickItemKind.Separator });
             for (const p of savedList) {
-                const isActive = (activeInfo.email && p.email.toLowerCase() === activeInfo.email.toLowerCase());
+                const isActive = activeInfo.isActive && (activeInfo.email && p.email.toLowerCase() === activeInfo.email.toLowerCase());
                 items.push({
                     label: isActive ? `$(check) [${p.label}] ${p.email}` : `$(account) [${p.label}] ${p.email}`,
                     description: isActive ? 'Active Now' : 'Click to Switch',
@@ -259,22 +257,30 @@ async function showAccountSwitcherMenu() {
         // 2. Account Actions Section
         items.push({ label: 'ACCOUNT ACTIONS', kind: vscode.QuickPickItemKind.Separator });
         items.push({
-            label: '$(add) Add / Sign In to Another Google Account...',
+            label: '$(add) Connect / Sign In to Google Account...',
             detail: 'Opens browser for Google OAuth. Once complete, automatically reloads and saves.',
             action: 'login'
         });
 
-        if (!activeInfo.isSaved && activeInfo.email) {
+        if (activeInfo.isActive && activeInfo.email) {
+            if (!activeInfo.isSaved) {
+                items.push({
+                    label: `$(save) Save Active Account (${activeInfo.email})...`,
+                    detail: 'Save this active account to your switcher vault with a custom label',
+                    action: 'save'
+                });
+            } else {
+                items.push({
+                    label: `$(edit) Rename Profile Label for ${activeInfo.email}...`,
+                    detail: `Currently labeled as "[${activeInfo.label}]"`,
+                    action: 'rename'
+                });
+            }
+
             items.push({
-                label: `$(save) Save Current Account (${activeInfo.email})...`,
-                detail: 'Save this active account to your switcher vault with a custom label',
-                action: 'save'
-            });
-        } else if (activeInfo.isSaved) {
-            items.push({
-                label: `$(edit) Rename Profile Label for ${activeInfo.email}...`,
-                detail: `Currently labeled as "[${activeInfo.label}]"`,
-                action: 'rename'
+                label: '$(sign-out) Log Out Current Account...',
+                detail: 'Disconnect current session from Antigravity IDE and Desktop 2.0',
+                action: 'logout'
             });
         }
 
@@ -287,13 +293,23 @@ async function showAccountSwitcherMenu() {
         }
 
         items.push({
+            label: '$(clear-all) Reset / Clear All Switcher Data...',
+            detail: 'Clear all saved profiles and session tokens for a fresh start',
+            action: 'clear_all'
+        });
+
+        items.push({
             label: '$(refresh) Reload Window',
             detail: 'Reload Antigravity IDE to refresh session and extensions',
             action: 'reload'
         });
 
+        const currentActiveDesc = (activeInfo.isActive && activeInfo.email)
+            ? `[${activeInfo.label}] ${activeInfo.email}`
+            : 'No Account (Signed Out)';
+
         const selected = await vscode.window.showQuickPick(items, {
-            placeHolder: `Currently Active: [${activeInfo.label}] ${activeInfo.email || 'None'}`,
+            placeHolder: `Currently Active: ${currentActiveDesc}`,
             title: 'Antigravity Account Switcher'
         });
 
@@ -309,13 +325,89 @@ async function showAccountSwitcherMenu() {
             await saveOrRenameAccount(activeInfo.email, activeInfo.label);
         } else if (selected.action === 'login') {
             await loginNewAccount();
+        } else if (selected.action === 'logout') {
+            await logoutAccount();
         } else if (selected.action === 'delete') {
             await deleteAccount(savedList);
+        } else if (selected.action === 'clear_all') {
+            await clearAllData();
         } else if (selected.action === 'reload') {
             vscode.commands.executeCommand('workbench.action.reloadWindow');
         }
     } catch (err) {
         vscode.window.showErrorMessage(`Account Switcher Error: ${err.message || err}`);
+    }
+}
+
+async function logoutAccount() {
+    const confirm = await vscode.window.showWarningMessage(
+        'Log out of the current Google Account session?',
+        { modal: true },
+        'Log Out',
+        'Cancel'
+    );
+    if (confirm !== 'Log Out') return;
+
+    try {
+        const dbs = getDbPaths();
+        for (const dbPath of dbs) {
+            if (DatabaseSync) {
+                try {
+                    const db = new DatabaseSync(dbPath);
+                    const stmt = db.prepare('DELETE FROM ItemTable WHERE key = ?');
+                    for (const k of AUTH_KEYS) {
+                        stmt.run(k);
+                    }
+                    db.close();
+                } catch {}
+            }
+        }
+
+        try {
+            await vscode.commands.executeCommand('antigravity.internal.logout');
+        } catch {}
+
+        await updateStatusBar();
+        vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch (err) {
+        vscode.window.showErrorMessage(`Log out failed: ${err.message || err}`);
+    }
+}
+
+async function clearAllData() {
+    const confirm = await vscode.window.showWarningMessage(
+        'Are you sure you want to clear all accounts and switcher data?',
+        { modal: true, detail: 'This will wipe all saved profiles and log out completely so you can test from scratch.' },
+        'Clear Everything',
+        'Cancel'
+    );
+    if (confirm !== 'Clear Everything') return;
+
+    try {
+        saveProfiles({});
+
+        const dbs = getDbPaths();
+        for (const dbPath of dbs) {
+            if (DatabaseSync) {
+                try {
+                    const db = new DatabaseSync(dbPath);
+                    const stmt = db.prepare('DELETE FROM ItemTable WHERE key = ?');
+                    for (const k of AUTH_KEYS) {
+                        stmt.run(k);
+                    }
+                    db.close();
+                } catch {}
+            }
+        }
+
+        try {
+            await vscode.commands.executeCommand('antigravity.internal.logout');
+        } catch {}
+
+        await updateStatusBar();
+        vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch (err) {
+        vscode.window.showErrorMessage(`Clear failed: ${err.message || err}`);
     }
 }
 

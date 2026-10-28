@@ -68,13 +68,34 @@ def save_profiles(profiles):
         except Exception as e:
             sys.stderr.write(f"Warning: could not write {path_target}: {e}\n")
 
-def extract_email(tokens):
+def is_session_active(tokens):
     if not tokens:
+        return False
+    oauth = tokens.get("antigravityUnifiedStateSync.oauthToken")
+    if not oauth or not isinstance(oauth, str):
+        return False
+    return "signedIn" in oauth
+
+def extract_email(tokens):
+    if not tokens or not is_session_active(tokens):
         return ""
+
+    # 1. Check antigravityAuthStatus (exact active session email)
+    auth_status = tokens.get("antigravityAuthStatus")
+    if auth_status:
+        try:
+            data = json.loads(auth_status) if isinstance(auth_status, str) else auth_status
+            em = data.get("email")
+            if em and "@" in em:
+                return em.strip()
+        except Exception:
+            pass
+
+    # 2. Check jetski.onboarding.lastLoginUsername
     raw = tokens.get("google.google-antigravity")
     if raw:
         try:
-            data = json.loads(raw)
+            data = json.loads(raw) if isinstance(raw, str) else raw
             storage = data.get("antigravity-storage", {})
             if isinstance(storage, dict):
                 em = storage.get("jetski.onboarding.lastLoginUsername", "")
@@ -82,35 +103,26 @@ def extract_email(tokens):
                     return em.strip()
         except Exception:
             pass
-    # Fallback regex search across all token values
-    import re
-    for val in tokens.values():
-        if isinstance(val, str):
-            matches = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', val)
-            for em in matches:
-                if "gserviceaccount.com" not in em and "googleapis.com" not in em:
-                    return em.strip()
+
     return ""
 
 def read_current_tokens():
     tokens = {}
     db_paths = get_db_paths()
-    if not db_paths:
-        return tokens
-
-    primary_db = db_paths[0]
-    try:
-        conn = sqlite3.connect(f"file:{primary_db}?mode=ro", uri=True)
-        cur = conn.cursor()
-        for k in AUTH_KEYS:
-            cur.execute("SELECT value FROM ItemTable WHERE key = ?", (k,))
-            row = cur.fetchone()
-            if row:
-                val = row[0]
-                tokens[k] = val if isinstance(val, str) else val.decode("latin1")
-        conn.close()
-    except Exception as e:
-        sys.stderr.write(f"Error reading current tokens: {e}\n")
+    for db_path in db_paths:
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = conn.cursor()
+            for k in AUTH_KEYS:
+                if k not in tokens:
+                    cur.execute("SELECT value FROM ItemTable WHERE key = ?", (k,))
+                    row = cur.fetchone()
+                    if row:
+                        val = row[0]
+                        tokens[k] = val if isinstance(val, str) else val.decode("latin1")
+            conn.close()
+        except Exception as e:
+            sys.stderr.write(f"Error reading {db_path}: {e}\n")
     return tokens
 
 def write_tokens(tokens):
@@ -214,29 +226,44 @@ def cmd_list(as_json=False):
 
 def cmd_current(as_json=False):
     current_tokens = read_current_tokens()
-    email = extract_email(current_tokens)
-    curr_oauth = current_tokens.get("antigravityUnifiedStateSync.oauthToken")
+    active = is_session_active(current_tokens)
+    email = extract_email(current_tokens) if active else ""
 
     profiles = load_profiles()
     matched_label = ""
     if email and email in profiles:
         matched_label = profiles[email].get("label", "")
-    elif curr_oauth:
-        for em, p in profiles.items():
-            if p.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken") == curr_oauth:
-                matched_label = p.get("label", "")
-                break
 
-    label = matched_label or (email.split("@")[0] if email else "Unsaved Session")
+    label = matched_label or (email.split("@")[0] if email else "No Account")
 
     if as_json:
         print(json.dumps({
+            "is_active": active,
             "email": email,
             "label": label,
             "is_saved": bool(matched_label)
         }))
     else:
-        print(f"[{label}] {email or 'No active email detected'}")
+        if active and email:
+            print(f"[{label}] {email}")
+        else:
+            print("[No Account] (Signed Out)")
+    return 0
+
+def cmd_clear():
+    save_profiles({})
+    db_paths = get_db_paths()
+    for db_path in db_paths:
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            for k in AUTH_KEYS:
+                cur.execute("DELETE FROM ItemTable WHERE key = ?", (k,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            sys.stderr.write(f"Error clearing {db_path}: {e}\n")
+    print("All profiles and active sessions cleared successfully!")
     return 0
 
 def cmd_delete(query):
@@ -270,6 +297,8 @@ def main():
     del_p = subparsers.add_parser("delete", help="Remove an account from saved storage")
     del_p.add_argument("query", help="Email or profile label to delete")
 
+    clear_p = subparsers.add_parser("clear", help="Factory reset: clear all profiles and sessions")
+
     args = parser.parse_args()
 
     if args.command == "save":
@@ -282,6 +311,8 @@ def main():
         sys.exit(cmd_current(as_json=args.json))
     elif args.command == "delete":
         sys.exit(cmd_delete(args.query))
+    elif args.command == "clear":
+        sys.exit(cmd_clear())
     else:
         cmd_list()
 
