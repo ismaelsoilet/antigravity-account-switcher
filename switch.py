@@ -174,10 +174,10 @@ def cmd_list(as_json=False):
     for em, data in profiles.items():
         tok = data.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken")
         is_active = False
-        if curr_email and em == curr_email:
-            is_active = True
-        elif curr_oauth and tok and curr_oauth == tok:
-            is_active = True
+        if curr_email:
+            is_active = (em.lower() == curr_email.lower())
+        elif curr_oauth and tok:
+            is_active = (curr_oauth == tok)
 
         out_list.append({
             "email": em,
@@ -209,10 +209,13 @@ def cmd_current(as_json=False):
 
     profiles = load_profiles()
     matched_label = ""
-    for em, p in profiles.items():
-        if (email and em == email) or (curr_oauth and p.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken") == curr_oauth):
-            matched_label = p.get("label", "")
-            break
+    if email and email in profiles:
+        matched_label = profiles[email].get("label", "")
+    elif curr_oauth:
+        for em, p in profiles.items():
+            if p.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken") == curr_oauth:
+                matched_label = p.get("label", "")
+                break
 
     label = matched_label or (email.split("@")[0] if email else "Unsaved Session")
 
