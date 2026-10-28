@@ -29,28 +29,29 @@ function getProfilesFilePath() {
 }
 
 function getDbPaths() {
-    const paths = [];
+    const paths = [
+        '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity IDE/User/globalStorage/state.vscdb',
+        '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity/User/globalStorage/state.vscdb'
+    ];
     if (process.platform === 'win32') {
         const appData = process.env.APPDATA || path.join(getHomeDir(), 'AppData', 'Roaming');
         paths.push(path.join(appData, 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb'));
         paths.push(path.join(appData, 'Antigravity', 'User', 'globalStorage', 'state.vscdb'));
-    } else {
-        const winAppData = '/mnt/c/Users/Ismael/AppData/Roaming';
-        paths.push(path.join(winAppData, 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb'));
-        paths.push(path.join(winAppData, 'Antigravity', 'User', 'globalStorage', 'state.vscdb'));
     }
-    return paths.filter(p => fs.existsSync(p));
+    return [...new Set(paths.filter(p => fs.existsSync(p)))];
 }
 
 function loadProfiles() {
     const targets = [
-        getProfilesFilePath(),
-        process.platform === 'win32'
-            ? path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json')
-            : '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json'
+        path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json'),
+        '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json',
+        '/home/ismaelsoilet/.gemini/antigravity_profiles.json'
     ];
+    if (process.platform === 'win32') {
+        targets.push('C:\\Users\\Ismael\\.gemini\\antigravity_profiles.json');
+    }
 
-    for (const p of targets) {
+    for (const p of [...new Set(targets)]) {
         if (fs.existsSync(p)) {
             try {
                 const raw = JSON.parse(fs.readFileSync(p, 'utf-8'));
@@ -66,7 +67,9 @@ function loadProfiles() {
                         };
                     }
                 }
-                return clean;
+                if (Object.keys(clean).length > 0) {
+                    return clean;
+                }
             } catch {}
         }
     }
@@ -75,13 +78,15 @@ function loadProfiles() {
 
 function saveProfiles(profiles) {
     const targets = [
-        getProfilesFilePath(),
-        process.platform === 'win32'
-            ? path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json')
-            : '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json'
+        path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json'),
+        '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json',
+        '/home/ismaelsoilet/.gemini/antigravity_profiles.json'
     ];
+    if (process.platform === 'win32') {
+        targets.push('C:\\Users\\Ismael\\.gemini\\antigravity_profiles.json');
+    }
 
-    for (const p of targets) {
+    for (const p of [...new Set(targets)]) {
         try {
             fs.mkdirSync(path.dirname(p), { recursive: true });
             fs.writeFileSync(p, JSON.stringify(profiles, null, 2), 'utf-8');
@@ -101,6 +106,16 @@ function extractEmail(tokens) {
                 if (em && em.includes('@')) {
                     return em.trim();
                 }
+            }
+        } catch {}
+    }
+    // Check antigravityAuthStatus JSON
+    const authStatus = tokens['antigravityAuthStatus'];
+    if (authStatus) {
+        try {
+            const data = typeof authStatus === 'string' ? JSON.parse(authStatus) : authStatus;
+            if (data && data.email && data.email.includes('@')) {
+                return data.email.trim();
             }
         } catch {}
     }
@@ -124,26 +139,27 @@ function readCurrentTokens() {
     const dbs = getDbPaths();
     if (dbs.length === 0) return {};
 
-    const primaryDb = dbs[0];
     const tokens = {};
-
     if (DatabaseSync) {
-        try {
-            const db = new DatabaseSync(primaryDb, { readOnly: true });
-            const stmt = db.prepare('SELECT value FROM ItemTable WHERE key = ?');
-            for (const k of AUTH_KEYS) {
-                const row = stmt.get(k);
-                if (row && row.value !== undefined) {
-                    tokens[k] = row.value;
+        for (const dbPath of dbs) {
+            try {
+                const db = new DatabaseSync(dbPath, { readOnly: true });
+                const stmt = db.prepare('SELECT value FROM ItemTable WHERE key = ?');
+                for (const k of AUTH_KEYS) {
+                    if (!tokens[k]) {
+                        const row = stmt.get(k);
+                        if (row && row.value !== undefined) {
+                            tokens[k] = row.value;
+                        }
+                    }
                 }
+                db.close();
+            } catch (e) {
+                console.warn(`DatabaseSync read error for ${dbPath}:`, e);
             }
-            db.close();
-            return tokens;
-        } catch (e) {
-            console.warn('DatabaseSync read error:', e);
         }
     }
-    return {};
+    return tokens;
 }
 
 function writeTokensToDbs(tokens) {
@@ -324,6 +340,12 @@ async function switchAccount(email, label) {
         }
 
         writeTokensToDbs(target.tokens);
+
+        // Notify language server client to reset session
+        try {
+            await vscode.commands.executeCommand('antigravity.internal.logout');
+        } catch {}
+
         await updateStatusBar();
 
         vscode.commands.executeCommand('workbench.action.reloadWindow');

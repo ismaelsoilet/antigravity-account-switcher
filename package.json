@@ -2,7 +2,11 @@
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
   "description": "Visual multi-account switcher and profile manager embedded directly in Antigravity IDE, synchronized across Antigravity 2.0 Desktop and the CLI.",
-  "version": "1.3.0",
+  "version": "1.4.0",
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
   "publisher": "antigravity-community",
   "repository": {
     "type": "git",
