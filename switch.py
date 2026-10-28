@@ -69,6 +69,8 @@ def save_profiles(profiles):
             sys.stderr.write(f"Warning: could not write {path_target}: {e}\n")
 
 def extract_email(tokens):
+    if not tokens:
+        return ""
     raw = tokens.get("google.google-antigravity")
     if raw:
         try:
@@ -77,9 +79,17 @@ def extract_email(tokens):
             if isinstance(storage, dict):
                 em = storage.get("jetski.onboarding.lastLoginUsername", "")
                 if em and "@" in em:
-                    return em
+                    return em.strip()
         except Exception:
             pass
+    # Fallback regex search across all token values
+    import re
+    for val in tokens.values():
+        if isinstance(val, str):
+            matches = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', val)
+            for em in matches:
+                if "gserviceaccount.com" not in em and "googleapis.com" not in em:
+                    return em.strip()
     return ""
 
 def read_current_tokens():
