@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - Core Engine
-Manages Google Antigravity account profiles across Antigravity IDE, Antigravity 2.0, and CLI.
+Antigravity Account Switcher - Core Engine (v1.3.0)
+Deduplicated, email-keyed profile management across Antigravity IDE, 2.0 Desktop, and CLI.
 """
 
 import sys
@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime
 
 PROFILES_FILE = os.path.expanduser("~/.gemini/antigravity_profiles.json")
+WIN_PROFILES_FILE = "/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json"
 ACTIVE_PROFILE_FILE = os.path.expanduser("~/.gemini/antigravity_active_profile.txt")
 
 # Target databases
@@ -35,32 +36,37 @@ def get_db_paths():
     return paths
 
 def load_profiles():
-    if os.path.exists(PROFILES_FILE):
+    target = PROFILES_FILE
+    if not os.path.exists(target) and os.path.exists(WIN_PROFILES_FILE):
+        target = WIN_PROFILES_FILE
+
+    if os.path.exists(target):
         try:
-            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(target, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                clean = {}
+                for k, v in raw.items():
+                    em = v.get("email") or k
+                    if "@" in em:
+                        clean[em] = {
+                            "email": em,
+                            "label": v.get("label") or v.get("name") or em.split("@")[0],
+                            "saved_at": v.get("saved_at", ""),
+                            "tokens": v.get("tokens", {})
+                        }
+                return clean
         except Exception:
             return {}
     return {}
 
 def save_profiles(profiles):
-    os.makedirs(os.path.dirname(PROFILES_FILE), exist_ok=True)
-    with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-        json.dump(profiles, f, indent=2, ensure_ascii=False)
-
-def get_active_profile_name():
-    if os.path.exists(ACTIVE_PROFILE_FILE):
+    for path_target in [PROFILES_FILE, WIN_PROFILES_FILE]:
         try:
-            with open(ACTIVE_PROFILE_FILE, "r", encoding="utf-8") as f:
-                return f.read().strip()
-        except Exception:
-            return None
-    return None
-
-def set_active_profile_name(name):
-    os.makedirs(os.path.dirname(ACTIVE_PROFILE_FILE), exist_ok=True)
-    with open(ACTIVE_PROFILE_FILE, "w", encoding="utf-8") as f:
-        f.write(name)
+            os.makedirs(os.path.dirname(path_target), exist_ok=True)
+            with open(path_target, "w", encoding="utf-8") as f:
+                json.dump(profiles, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not write {path_target}: {e}\n")
 
 def extract_email(tokens):
     raw = tokens.get("google.google-antigravity")
@@ -69,19 +75,9 @@ def extract_email(tokens):
             data = json.loads(raw)
             storage = data.get("antigravity-storage", {})
             if isinstance(storage, dict):
-                email = storage.get("jetski.onboarding.lastLoginUsername", "")
-                if email:
-                    return email
-        except Exception:
-            pass
-    return ""
-
-def extract_display_name(tokens):
-    raw = tokens.get("antigravityAuthStatus")
-    if raw:
-        try:
-            data = json.loads(raw)
-            return data.get("name", "")
+                em = storage.get("jetski.onboarding.lastLoginUsername", "")
+                if em and "@" in em:
+                    return em
         except Exception:
             pass
     return ""
@@ -91,7 +87,7 @@ def read_current_tokens():
     db_paths = get_db_paths()
     if not db_paths:
         return tokens
-    
+
     primary_db = db_paths[0]
     try:
         conn = sqlite3.connect(f"file:{primary_db}?mode=ro", uri=True)
@@ -121,149 +117,158 @@ def write_tokens(tokens):
         except Exception as e:
             sys.stderr.write(f"Error writing tokens to {db_path}: {e}\n")
 
-def cmd_save(name):
+def cmd_save(label=None):
     tokens = read_current_tokens()
     if "antigravityUnifiedStateSync.oauthToken" not in tokens:
         print(f"Error: No active Antigravity session found in {IDE_DB_WIN}")
         return 1
-    
+
     email = extract_email(tokens)
-    display_name = extract_display_name(tokens)
-    
+    if not email:
+        email = "unknown_account@antigravity"
+
+    display_label = label.strip() if label and label.strip() else email.split("@")[0]
+
     profiles = load_profiles()
-    profiles[name] = {
-        "name": name,
+    profiles[email] = {
         "email": email,
-        "display_name": display_name,
+        "label": display_label,
         "saved_at": datetime.now().isoformat(),
         "tokens": tokens
     }
     save_profiles(profiles)
-    set_active_profile_name(name)
-    print(f"Profile '{name}' ({email or 'No email detected'}) saved successfully!")
+    print(f"Account '{email}' saved with label '{display_label}' successfully!")
     return 0
 
-def cmd_load(name):
+def find_profile(query, profiles):
+    # Match by exact email
+    if query in profiles:
+        return query, profiles[query]
+    # Match by case-insensitive email or label
+    q_low = query.lower()
+    for em, data in profiles.items():
+        if em.lower() == q_low or data.get("label", "").lower() == q_low:
+            return em, data
+    return None, None
+
+def cmd_load(query):
     profiles = load_profiles()
-    if name not in profiles:
-        print(f"Error: Profile '{name}' not found. Available: {list(profiles.keys())}")
+    em, profile = find_profile(query, profiles)
+    if not profile:
+        print(f"Error: Account matching '{query}' not found. Saved: {list(profiles.keys())}")
         return 1
-    
-    profile = profiles[name]
+
     tokens = profile.get("tokens", {})
     write_tokens(tokens)
-    set_active_profile_name(name)
-    email = profile.get("email") or extract_email(tokens)
-    print(f"Switched active account to '{name}' ({email}).")
+    label = profile.get("label") or em
+    print(f"Successfully switched to '{label}' ({em}).")
     return 0
 
 def cmd_list(as_json=False):
     profiles = load_profiles()
-    active = get_active_profile_name()
     current_tokens = read_current_tokens()
     curr_oauth = current_tokens.get("antigravityUnifiedStateSync.oauthToken")
     curr_email = extract_email(current_tokens)
-    curr_display = extract_display_name(current_tokens)
 
     out_list = []
-    for name, data in profiles.items():
-        token = data.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken")
+    for em, data in profiles.items():
+        tok = data.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken")
         is_active = False
-        if curr_oauth and token and curr_oauth == token:
+        if curr_email and em == curr_email:
             is_active = True
-        elif name == active and not curr_oauth:
+        elif curr_oauth and tok and curr_oauth == tok:
             is_active = True
-            
+
         out_list.append({
-            "name": name,
-            "email": data.get("email", ""),
-            "display_name": data.get("display_name", ""),
+            "email": em,
+            "label": data.get("label") or em.split("@")[0],
             "active": is_active,
             "saved_at": data.get("saved_at", "")
         })
 
     if as_json:
         result = {
-            "profiles": out_list,
-            "active": active,
+            "accounts": out_list,
             "current_email": curr_email,
-            "current_display_name": curr_display
+            "current_active_found": any(a["active"] for a in out_list)
         }
         print(json.dumps(result))
     else:
-        print("=== Antigravity Saved Profiles ===")
+        print("=== Antigravity Accounts Vault ===")
         if not out_list:
-            print("  (No profiles saved yet. Use 'switch.py save <name>' to save current session.)")
-        for p in out_list:
-            status = " [ACTIVE]" if p["active"] else ""
-            email_info = f" ({p['email']})" if p['email'] else ""
-            print(f"* {p['name']}{email_info}{status} - Saved: {p['saved_at'][:19]}")
+            print("  (No accounts saved yet. Sign in and run 'agy-switch save [label]')")
+        for a in out_list:
+            status = " [ACTIVE NOW]" if a["active"] else ""
+            print(f"* [{a['label']}] {a['email']}{status} (Saved: {a['saved_at'][:19].replace('T', ' ')})")
     return 0
 
 def cmd_current(as_json=False):
     current_tokens = read_current_tokens()
     email = extract_email(current_tokens)
-    name = get_active_profile_name() or "Default"
-    display = extract_display_name(current_tokens)
+    curr_oauth = current_tokens.get("antigravityUnifiedStateSync.oauthToken")
+
+    profiles = load_profiles()
+    matched_label = ""
+    for em, p in profiles.items():
+        if (email and em == email) or (curr_oauth and p.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken") == curr_oauth):
+            matched_label = p.get("label", "")
+            break
+
+    label = matched_label or (email.split("@")[0] if email else "Unsaved Session")
 
     if as_json:
         print(json.dumps({
-            "name": name,
             "email": email,
-            "display_name": display
+            "label": label,
+            "is_saved": bool(matched_label)
         }))
     else:
-        if email:
-            print(f"{name} ({email})")
-        else:
-            print(name)
+        print(f"[{label}] {email or 'No active email detected'}")
     return 0
 
-def cmd_delete(name):
+def cmd_delete(query):
     profiles = load_profiles()
-    if name in profiles:
-        del profiles[name]
-        save_profiles(profiles)
-        active = get_active_profile_name()
-        if active == name:
-            set_active_profile_name("")
-        print(f"Profile '{name}' deleted.")
-        return 0
-    else:
-        print(f"Profile '{name}' not found.")
+    em, profile = find_profile(query, profiles)
+    if not em:
+        print(f"Error: Account '{query}' not found.")
         return 1
+
+    del profiles[em]
+    save_profiles(profiles)
+    print(f"Account '{em}' removed from saved vault.")
+    return 0
 
 def main():
     parser = argparse.ArgumentParser(description="Antigravity Account Switcher")
     subparsers = parser.add_subparsers(dest="command")
 
-    save_p = subparsers.add_parser("save", help="Save current active session")
-    save_p.add_argument("name", help="Profile name (e.g. personal, work)")
+    save_p = subparsers.add_parser("save", help="Snapshot current active account")
+    save_p.add_argument("label", nargs="?", default=None, help="Optional friendly label (e.g. Personal, Work)")
 
-    load_p = subparsers.add_parser("load", help="Load/switch to a profile")
-    load_p.add_argument("name", help="Profile name to switch to")
+    load_p = subparsers.add_parser("load", help="Switch to an account by email or label")
+    load_p.add_argument("query", help="Email or profile label to switch to")
 
-    list_p = subparsers.add_parser("list", help="List all saved profiles")
-    list_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    list_p = subparsers.add_parser("list", help="List all saved accounts")
+    list_p.add_argument("--json", action="store_true", help="Output JSON")
 
-    del_p = subparsers.add_parser("delete", help="Delete a saved profile")
-    del_p.add_argument("name", help="Profile name to delete")
+    curr_p = subparsers.add_parser("current", help="Show currently active account")
+    curr_p.add_argument("--json", action="store_true", help="Output JSON")
 
-    curr_p = subparsers.add_parser("current", help="Get active profile info")
-    curr_p.add_argument("--json", action="store_true", help="Output in JSON format")
+    del_p = subparsers.add_parser("delete", help="Remove an account from saved storage")
+    del_p.add_argument("query", help="Email or profile label to delete")
 
     args = parser.parse_args()
 
     if args.command == "save":
-        sys.exit(cmd_save(args.name))
+        sys.exit(cmd_save(args.label))
     elif args.command == "load":
-        sys.exit(cmd_load(args.name))
+        sys.exit(cmd_load(args.query))
     elif args.command == "list":
         sys.exit(cmd_list(as_json=args.json))
-    elif args.command == "delete":
-        sys.exit(cmd_delete(args.name))
     elif args.command == "current":
         sys.exit(cmd_current(as_json=args.json))
+    elif args.command == "delete":
+        sys.exit(cmd_delete(args.query))
     else:
         cmd_list()
 

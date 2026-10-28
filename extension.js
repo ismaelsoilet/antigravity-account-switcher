@@ -2,7 +2,6 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { exec } = require('child_process');
 
 let statusBarItem;
 
@@ -14,7 +13,6 @@ const AUTH_KEYS = [
     'google.google-antigravity'
 ];
 
-// Helper: Try to require node:sqlite
 let DatabaseSync;
 try {
     DatabaseSync = require('node:sqlite').DatabaseSync;
@@ -48,19 +46,37 @@ function loadProfiles() {
     const p = getProfilesFilePath();
     if (fs.existsSync(p)) {
         try {
-            return JSON.parse(fs.readFileSync(p, 'utf-8'));
+            const raw = JSON.parse(fs.readFileSync(p, 'utf-8'));
+            const clean = {};
+            for (const [k, v] of Object.entries(raw)) {
+                const em = v.email || k;
+                if (em && em.includes('@')) {
+                    clean[em] = {
+                        email: em,
+                        label: v.label || v.name || em.split('@')[0],
+                        saved_at: v.saved_at || '',
+                        tokens: v.tokens || {}
+                    };
+                }
+            }
+            return clean;
         } catch {}
     }
     return {};
 }
 
 function saveProfiles(profiles) {
-    const p = getProfilesFilePath();
-    try {
-        fs.mkdirSync(path.dirname(p), { recursive: true });
-        fs.writeFileSync(p, JSON.stringify(profiles, null, 2), 'utf-8');
-    } catch (err) {
-        console.error('Failed to save profiles to:', p, err);
+    const targets = [
+        getProfilesFilePath(),
+        // Also sync to WSL home if running on Windows
+        process.platform === 'win32' ? path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json') : '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json'
+    ];
+
+    for (const p of targets) {
+        try {
+            fs.mkdirSync(path.dirname(p), { recursive: true });
+            fs.writeFileSync(p, JSON.stringify(profiles, null, 2), 'utf-8');
+        } catch {}
     }
 }
 
@@ -71,7 +87,10 @@ function extractEmail(tokens) {
             const data = JSON.parse(raw);
             const storage = data['antigravity-storage'];
             if (storage && storage['jetski.onboarding.lastLoginUsername']) {
-                return storage['jetski.onboarding.lastLoginUsername'];
+                const em = storage['jetski.onboarding.lastLoginUsername'];
+                if (em && em.includes('@')) {
+                    return em;
+                }
             }
         } catch {}
     }
@@ -98,11 +117,9 @@ function readCurrentTokens() {
             db.close();
             return tokens;
         } catch (e) {
-            console.warn('DatabaseSync read failed, trying fallback:', e);
+            console.warn('DatabaseSync read error:', e);
         }
     }
-
-    // Fallback: via python helper
     return {};
 }
 
@@ -119,9 +136,8 @@ function writeTokensToDbs(tokens) {
                     }
                 }
                 db.close();
-                continue;
             } catch (e) {
-                console.error(`DatabaseSync write failed for ${dbPath}:`, e);
+                console.error(`DatabaseSync write error for ${dbPath}:`, e);
             }
         }
     }
@@ -132,24 +148,24 @@ async function getActiveAccountInfo() {
     const email = extractEmail(tokens);
     const profiles = loadProfiles();
 
-    let matchedProfile = null;
-    const currentOauth = tokens['antigravityUnifiedStateSync.oauthToken'];
-
-    for (const [name, data] of Object.entries(profiles)) {
-        const profOauth = data.tokens && data.tokens['antigravityUnifiedStateSync.oauthToken'];
-        if (currentOauth && profOauth && currentOauth === profOauth) {
-            matchedProfile = name;
-            break;
-        }
-        if (email && data.email === email) {
-            matchedProfile = name;
-            break;
+    let matched = null;
+    if (email && profiles[email]) {
+        matched = profiles[email];
+    } else {
+        const currOauth = tokens['antigravityUnifiedStateSync.oauthToken'];
+        for (const p of Object.values(profiles)) {
+            if (currOauth && p.tokens && p.tokens['antigravityUnifiedStateSync.oauthToken'] === currOauth) {
+                matched = p;
+                break;
+            }
         }
     }
 
+    const label = matched ? matched.label : (email ? email.split('@')[0] : 'Unsaved');
     return {
-        profileName: matchedProfile || (email ? email.split('@')[0] : 'Default'),
         email: email,
+        label: label,
+        isSaved: !!matched,
         tokens: tokens
     };
 }
@@ -157,20 +173,20 @@ async function getActiveAccountInfo() {
 async function updateStatusBar() {
     try {
         const info = await getActiveAccountInfo();
-        const profile = info.profileName;
-        const email = info.email ? ` (${info.email})` : '';
+        const displayLabel = info.label || 'Account';
+        const displayEmail = info.email ? ` ${info.email}` : '';
 
-        statusBarItem.text = `$(account) [${profile}]${email}`;
+        statusBarItem.text = `$(account) [${displayLabel}]${displayEmail}`;
         statusBarItem.tooltip = new vscode.MarkdownString(
             `### Antigravity Account Switcher\n` +
-            `* **Active Profile:** \`${profile}\`\n` +
-            (info.email ? `* **Google Account:** \`${info.email}\`\n` : '') +
+            `* **Active Account:** \`${info.email || 'None'}\`\n` +
+            `* **Profile Label:** \`${displayLabel}\`\n` +
             `* **Status:** Connected & Synced (IDE, Desktop 2.0 & CLI)\n\n` +
-            `*(Click to switch, add accounts, or manage profiles)*`
+            `*(Click to switch accounts or manage profiles)*`
         );
         statusBarItem.show();
-    } catch (err) {
-        statusBarItem.text = `$(account) Antigravity: Account`;
+    } catch {
+        statusBarItem.text = `$(account) Antigravity`;
         statusBarItem.tooltip = `Click to switch Antigravity accounts`;
         statusBarItem.show();
     }
@@ -182,45 +198,62 @@ async function showAccountSwitcherMenu() {
         const profiles = loadProfiles();
         const items = [];
 
-        const profileEntries = Object.entries(profiles);
-        if (profileEntries.length > 0) {
-            items.push({ label: 'SAVED PROFILES', kind: vscode.QuickPickItemKind.Separator });
-            for (const [name, p] of profileEntries) {
-                const isActive = (name === activeInfo.profileName) || (p.email && p.email === activeInfo.email);
-                const emailDesc = p.email ? ` • ${p.email}` : '';
+        // 1. Saved Accounts
+        const savedList = Object.values(profiles);
+        if (savedList.length > 0) {
+            items.push({ label: 'GOOGLE ACCOUNTS (SAVED)', kind: vscode.QuickPickItemKind.Separator });
+            for (const p of savedList) {
+                const isActive = (activeInfo.email && p.email === activeInfo.email);
                 items.push({
-                    label: isActive ? `$(check) ${name}` : `$(account) ${name}`,
-                    description: isActive ? `Currently Active${emailDesc}` : (p.email || 'Saved Profile'),
+                    label: isActive ? `$(check) [${p.label}] ${p.email}` : `$(account) [${p.label}] ${p.email}`,
+                    description: isActive ? 'Active Now' : 'Click to Switch',
                     detail: `Saved on: ${(p.saved_at || '').slice(0, 19).replace('T', ' ')}`,
-                    profileName: name,
-                    profileEmail: p.email,
+                    accountEmail: p.email,
+                    accountLabel: p.label,
                     isActive,
                     action: 'switch'
                 });
             }
         }
 
+        // 2. Account Actions
         items.push({ label: 'ACCOUNT ACTIONS', kind: vscode.QuickPickItemKind.Separator });
         items.push({
-            label: '$(key) Sign In to New Google Account...',
-            detail: 'Connect another account via browser OAuth. Reloads automatically upon completion.',
+            label: '$(add) Add / Sign In to Another Google Account...',
+            detail: 'Opens browser for Google OAuth. Automatically captures new account and reloads.',
             action: 'login'
         });
-        items.push({
-            label: '$(save) Snapshot Current Session as Profile...',
-            detail: `Save current session (${activeInfo.email || activeInfo.profileName}) under a custom profile name`,
-            action: 'save'
-        });
-        if (profileEntries.length > 0) {
+
+        if (!activeInfo.isSaved && activeInfo.email) {
             items.push({
-                label: '$(trash) Delete a Saved Profile...',
-                detail: 'Remove a profile from saved storage',
+                label: `$(save) Save Active Account (${activeInfo.email})...`,
+                detail: 'Save this currently logged-in account to the switcher vault',
+                action: 'save'
+            });
+        } else if (activeInfo.isSaved) {
+            items.push({
+                label: `$(edit) Rename Profile Label for ${activeInfo.email}...`,
+                detail: `Currently labeled as "${activeInfo.label}"`,
+                action: 'rename'
+            });
+        }
+
+        if (savedList.length > 0) {
+            items.push({
+                label: '$(trash) Remove Saved Account from Switcher...',
+                detail: 'Delete an account from saved vault',
                 action: 'delete'
             });
         }
 
+        items.push({
+            label: '$(refresh) Reload Window',
+            detail: 'Reload Antigravity IDE to refresh session and extensions',
+            action: 'reload'
+        });
+
         const selected = await vscode.window.showQuickPick(items, {
-            placeHolder: `Active: [${activeInfo.profileName}] ${activeInfo.email || ''}`,
+            placeHolder: `Currently Active: [${activeInfo.label}] ${activeInfo.email || 'None'}`,
             title: 'Antigravity Account Switcher'
         });
 
@@ -228,30 +261,30 @@ async function showAccountSwitcherMenu() {
 
         if (selected.action === 'switch') {
             if (selected.isActive) {
-                vscode.window.showInformationMessage(`Account profile '${selected.profileName}' is already active.`);
+                vscode.window.showInformationMessage(`Account ${selected.accountEmail} is already active.`);
                 return;
             }
-            await switchProfile(selected.profileName, selected.profileEmail);
-        } else if (selected.action === 'save') {
-            await saveCurrentProfile(activeInfo.email);
+            await switchAccount(selected.accountEmail, selected.accountLabel);
+        } else if (selected.action === 'save' || selected.action === 'rename') {
+            await saveOrRenameAccount(activeInfo.email, activeInfo.label);
         } else if (selected.action === 'login') {
             await loginNewAccount(activeInfo.email);
         } else if (selected.action === 'delete') {
-            await deleteProfile(profileEntries);
+            await deleteAccount(savedList);
+        } else if (selected.action === 'reload') {
+            vscode.commands.executeCommand('workbench.action.reloadWindow');
         }
     } catch (err) {
         vscode.window.showErrorMessage(`Account Switcher Error: ${err.message || err}`);
     }
 }
 
-async function switchProfile(name, email) {
-    const emailStr = email ? ` (${email})` : '';
-
+async function switchAccount(email, label) {
     const confirm = await vscode.window.showWarningMessage(
-        `Switch to Antigravity profile '${name}'${emailStr}?`,
+        `Switch to account "[${label}] ${email}"?`,
         {
             modal: true,
-            detail: `Antigravity IDE will reload immediately to activate the session across the IDE, Antigravity 2.0 Desktop, and the CLI.\n\nPlease save all ongoing work before proceeding.`
+            detail: `Antigravity IDE will immediately reload to apply this account across the IDE, Antigravity 2.0 Desktop, and the CLI.\n\nPlease save all open files before proceeding.`
         },
         'Switch & Reload',
         'Cancel'
@@ -261,9 +294,9 @@ async function switchProfile(name, email) {
 
     try {
         const profiles = loadProfiles();
-        const target = profiles[name];
+        const target = profiles[email];
         if (!target || !target.tokens) {
-            throw new Error(`Profile '${name}' has no saved tokens.`);
+            throw new Error(`Account '${email}' has no saved credentials.`);
         }
 
         writeTokensToDbs(target.tokens);
@@ -271,46 +304,50 @@ async function switchProfile(name, email) {
 
         vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (err) {
-        vscode.window.showErrorMessage(`Failed to switch profile: ${err.message || err}`);
+        vscode.window.showErrorMessage(`Failed to switch account: ${err.message || err}`);
     }
 }
 
-async function saveCurrentProfile(defaultEmail) {
+async function saveOrRenameAccount(email, currentLabel) {
     const tokens = readCurrentTokens();
-    const email = extractEmail(tokens) || defaultEmail;
-    const suggested = email ? email.split('@')[0] : 'Work';
+    const actualEmail = email || extractEmail(tokens);
 
-    const name = await vscode.window.showInputBox({
-        prompt: `Enter profile name for ${email || 'this account'} (e.g. Personal, Work, Secondary):`,
-        value: suggested,
-        placeHolder: 'Personal',
+    if (!actualEmail) {
+        vscode.window.showErrorMessage('No active Google Account detected to save.');
+        return;
+    }
+
+    const defaultVal = currentLabel && currentLabel !== 'Unsaved' ? currentLabel : actualEmail.split('@')[0];
+    const newLabel = await vscode.window.showInputBox({
+        prompt: `Enter friendly label for ${actualEmail} (e.g. Personal, Work, Client):`,
+        value: defaultVal,
         ignoreFocusOut: true
     });
 
-    if (!name || !name.trim()) return;
+    if (!newLabel || !newLabel.trim()) return;
 
     try {
         const profiles = loadProfiles();
-        profiles[name.trim()] = {
-            name: name.trim(),
-            email: email,
+        profiles[actualEmail] = {
+            email: actualEmail,
+            label: newLabel.trim(),
             saved_at: new Date().toISOString(),
             tokens: tokens
         };
         saveProfiles(profiles);
         await updateStatusBar();
-        vscode.window.showInformationMessage(`Account profile '${name.trim()}' (${email}) saved successfully!`);
+        vscode.window.showInformationMessage(`Account ${actualEmail} saved as "[${newLabel.trim()}]"!`);
     } catch (err) {
-        vscode.window.showErrorMessage(`Failed to save profile: ${err.message || err}`);
+        vscode.window.showErrorMessage(`Failed to save account: ${err.message || err}`);
     }
 }
 
 async function loginNewAccount(currentEmail) {
     const proceed = await vscode.window.showInformationMessage(
-        'Connect New Google Account',
+        'Connect Another Google Account',
         {
             modal: true,
-            detail: 'This will launch your browser to sign in with another Google Account.\n\nOnce authentication completes in your browser, Antigravity IDE will automatically detect the new login, prompt you for a profile name, and reload into the new session.'
+            detail: 'This will launch your browser for Google OAuth.\n\nOnce sign-in succeeds, Antigravity IDE will automatically detect your new email, save it to the switcher vault, and reload into the new session.'
         },
         'Proceed to Sign In',
         'Cancel'
@@ -324,7 +361,7 @@ async function loginNewAccount(currentEmail) {
     try {
         vscode.commands.executeCommand('antigravity.internal.loginWithRedirect');
     } catch (err) {
-        vscode.window.showErrorMessage(`Failed to trigger Google Sign-In: ${err.message || err}`);
+        vscode.window.showErrorMessage(`Failed to launch Google Sign-In: ${err.message || err}`);
         return;
     }
 
@@ -349,27 +386,27 @@ async function loginNewAccount(currentEmail) {
                     const newEmail = extractEmail(latestTokens);
 
                     if (newOauth && newOauth !== initialOauth) {
-                        progress.report({ message: `Signed in as ${newEmail || 'new account'}!` });
+                        progress.report({ message: `Authenticated as ${newEmail || 'new account'}!` });
 
-                        const defaultName = newEmail ? newEmail.split('@')[0] : 'Work';
-                        const profileName = await vscode.window.showInputBox({
-                            prompt: `Google Sign-in successful (${newEmail})! Enter a profile name:`,
-                            value: defaultName,
+                        const defaultLabel = newEmail ? newEmail.split('@')[0] : 'Work';
+                        const enteredLabel = await vscode.window.showInputBox({
+                            prompt: `Google Sign-in successful for ${newEmail}! Enter a label for this profile:`,
+                            value: defaultLabel,
                             ignoreFocusOut: true
                         });
 
-                        const finalName = (profileName && profileName.trim()) ? profileName.trim() : defaultName;
+                        const finalLabel = (enteredLabel && enteredLabel.trim()) ? enteredLabel.trim() : defaultLabel;
                         const profiles = loadProfiles();
-                        profiles[finalName] = {
-                            name: finalName,
+                        profiles[newEmail] = {
                             email: newEmail,
+                            label: finalLabel,
                             saved_at: new Date().toISOString(),
                             tokens: latestTokens
                         };
                         saveProfiles(profiles);
 
                         await vscode.window.showInformationMessage(
-                            `Profile '${finalName}' (${newEmail}) saved! Reloading Antigravity IDE...`
+                            `Account [${finalLabel}] ${newEmail} saved! Reloading Antigravity IDE...`
                         );
 
                         vscode.commands.executeCommand('workbench.action.reloadWindow');
@@ -378,27 +415,27 @@ async function loginNewAccount(currentEmail) {
                 } catch {}
             }
 
-            vscode.window.showWarningMessage('Sign-in wait timed out. If you signed in successfully, click the status bar and select "Snapshot Current Session".');
+            vscode.window.showWarningMessage('Sign-in wait timed out. If you signed in successfully, click the status bar and select "Save Active Account".');
         }
     );
 }
 
-async function deleteProfile(profileEntries) {
-    const items = profileEntries.map(([name, p]) => ({
-        label: name,
-        description: p.email || 'Saved Profile',
+async function deleteAccount(savedList) {
+    const items = savedList.map(p => ({
+        label: `[${p.label}] ${p.email}`,
+        accountEmail: p.email,
         detail: `Saved: ${(p.saved_at || '').slice(0, 10)}`
     }));
 
     const selected = await vscode.window.showQuickPick(items, {
-        placeHolder: 'Select profile to delete...',
-        title: 'Delete Saved Profile'
+        placeHolder: 'Select an account to remove from saved vault...',
+        title: 'Remove Saved Account'
     });
 
     if (!selected) return;
 
     const confirm = await vscode.window.showWarningMessage(
-        `Are you sure you want to delete profile '${selected.label}'?`,
+        `Are you sure you want to remove ${selected.accountEmail} from the switcher?`,
         { modal: true },
         'Delete',
         'Cancel'
@@ -408,12 +445,12 @@ async function deleteProfile(profileEntries) {
 
     try {
         const profiles = loadProfiles();
-        delete profiles[selected.label];
+        delete profiles[selected.accountEmail];
         saveProfiles(profiles);
         await updateStatusBar();
-        vscode.window.showInformationMessage(`Profile '${selected.label}' deleted.`);
+        vscode.window.showInformationMessage(`Account ${selected.accountEmail} removed.`);
     } catch (err) {
-        vscode.window.showErrorMessage(`Failed to delete profile: ${err.message || err}`);
+        vscode.window.showErrorMessage(`Failed to remove account: ${err.message || err}`);
     }
 }
 
@@ -426,10 +463,10 @@ function activate(context) {
         vscode.commands.registerCommand('antigravity-account-switcher.switch', showAccountSwitcherMenu)
     );
     context.subscriptions.push(
-        vscode.commands.registerCommand('antigravity-account-switcher.save', () => saveCurrentProfile(''))
+        vscode.commands.registerCommand('antigravity-account-switcher.save', () => saveOrRenameAccount('', ''))
     );
     context.subscriptions.push(
-        vscode.commands.registerCommand('antigravity-account-switcher.login', loginNewAccount)
+        vscode.commands.registerCommand('antigravity-account-switcher.login', () => loginNewAccount(''))
     );
 
     updateStatusBar();
