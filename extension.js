@@ -4,7 +4,6 @@ const path = require('path');
 const tokenManager = require('./tokenManager');
 
 let statusBarItem;
-let tokenFileWatcher = null;
 let lastKnownEmail = '';
 
 /**
@@ -50,8 +49,8 @@ async function updateStatusBar() {
             statusBarItem.text = `$(account) [No Account] Sign In`;
             statusBarItem.tooltip = new vscode.MarkdownString(
                 `### Antigravity Account Switcher\n` +
-                `* **Status:** No Active Google Account (Signed Out)\n\n` +
-                `*(Click to sign in with Google or select a saved profile)*`
+                `* **Status:** No Active Google Account Detected (Signed Out)\n\n` +
+                `*(Click to sign in with Google, select a saved profile, or register account)*`
             );
         }
         statusBarItem.show();
@@ -101,7 +100,7 @@ async function showAccountSwitcherMenu() {
             if (!activeInfo.isSaved) {
                 items.push({
                     label: `$(save) Save Active Account (${activeInfo.email})...`,
-                    detail: 'Save this active account to your switcher vault with a custom label',
+                    detail: 'Save this active session to your switcher vault with a custom label',
                     action: 'save'
                 });
             } else {
@@ -116,6 +115,13 @@ async function showAccountSwitcherMenu() {
                 label: '$(sign-out) Log Out Current Account...',
                 detail: 'Disconnect current session from Antigravity IDE and Desktop 2.0',
                 action: 'logout'
+            });
+        } else {
+            // Always allow manual registration so the user is NEVER blocked from saving
+            items.push({
+                label: '$(save) Save / Register Active Account Manually...',
+                detail: 'If you are already logged in, enter your Google email to register and snapshot this profile',
+                action: 'manual_save'
             });
         }
 
@@ -158,6 +164,8 @@ async function showAccountSwitcherMenu() {
             await switchAccount(selected.accountEmail, selected.accountLabel);
         } else if (selected.action === 'save' || selected.action === 'rename') {
             await saveOrRenameAccount(activeInfo.email, activeInfo.label);
+        } else if (selected.action === 'manual_save') {
+            await manualRegisterAccount();
         } else if (selected.action === 'login') {
             await loginNewAccount();
         } else if (selected.action === 'logout') {
@@ -175,7 +183,7 @@ async function showAccountSwitcherMenu() {
 }
 
 /**
- * Switch account to target email: restores DB tokens & token files, then reloads window
+ * Switch account: restores DB tokens & token files, then reloads window
  */
 async function switchAccount(email, label) {
     const confirm = await vscode.window.showWarningMessage(
@@ -200,9 +208,7 @@ async function switchAccount(email, label) {
         // Restore all tokens across SQLite DBs and OAuth files
         tokenManager.restoreProfile(target);
 
-        // NOTE: We do NOT call 'antigravity.internal.logout' here because that
-        // actively tells the backend server to invalidate the session!
-
+        // DO NOT call antigravity.internal.logout here!
         await updateStatusBar();
 
         // Reload window to let IDE and language server read restored tokens
@@ -216,11 +222,10 @@ async function switchAccount(email, label) {
  * Save active account or rename its friendly label
  */
 async function saveOrRenameAccount(email, currentLabel) {
-    const activeEmail = email || tokenManager.detectActiveEmail();
+    let activeEmail = email || tokenManager.detectActiveEmail();
 
     if (!activeEmail) {
-        vscode.window.showErrorMessage('No active Google Account detected to save.');
-        return;
+        return manualRegisterAccount();
     }
 
     const defaultVal = currentLabel && currentLabel !== 'Unsaved' ? currentLabel : activeEmail.split('@')[0];
@@ -233,11 +238,49 @@ async function saveOrRenameAccount(email, currentLabel) {
     if (!newLabel || !newLabel.trim()) return;
 
     try {
-        tokenManager.snapshotActiveAccount(newLabel.trim());
+        tokenManager.snapshotActiveAccount(newLabel.trim(), activeEmail);
         await updateStatusBar();
         vscode.window.showInformationMessage(`Account ${activeEmail} saved as "[${newLabel.trim()}]"!`);
     } catch (err) {
         vscode.window.showErrorMessage(`Failed to save account: ${err.message || err}`);
+    }
+}
+
+/**
+ * Manual registration fallback: asks user for email and label, then snapshots session
+ */
+async function manualRegisterAccount() {
+    const detected = tokenManager.detectActiveEmail();
+    const emailInput = await vscode.window.showInputBox({
+        prompt: 'Enter the Google Account email currently signed in:',
+        placeHolder: 'user@gmail.com',
+        value: detected || '',
+        ignoreFocusOut: true,
+        validateInput: val => {
+            if (!val || !tokenManager.isValidEmail(val)) {
+                return 'Please enter a valid email address (e.g. name@domain.com)';
+            }
+            return null;
+        }
+    });
+
+    if (!emailInput || !emailInput.trim()) return;
+    const cleanEmail = emailInput.trim();
+
+    const labelInput = await vscode.window.showInputBox({
+        prompt: `Enter a friendly label for ${cleanEmail} (e.g. Personal, Work):`,
+        value: cleanEmail.split('@')[0],
+        ignoreFocusOut: true
+    });
+
+    const cleanLabel = (labelInput && labelInput.trim()) || cleanEmail.split('@')[0];
+
+    try {
+        tokenManager.snapshotActiveAccount(cleanLabel, cleanEmail);
+        await updateStatusBar();
+        vscode.window.showInformationMessage(`Account ${cleanEmail} registered and saved as "[${cleanLabel}]"!`);
+    } catch (err) {
+        vscode.window.showErrorMessage(`Failed to register account: ${err.message || err}`);
     }
 }
 
@@ -258,10 +301,8 @@ async function loginNewAccount() {
     if (proceed !== 'Open Browser & Sign In') return;
 
     try {
-        // Record initial state to detect new token arrival
         const preLoginEmail = tokenManager.detectActiveEmail();
 
-        // Run Google OAuth login command with progress indicator
         await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
@@ -273,15 +314,12 @@ async function loginNewAccount() {
             }
         );
 
-        // Verification after OAuth redirect
         const postLoginEmail = tokenManager.detectActiveEmail();
         const successMessage = postLoginEmail && postLoginEmail !== preLoginEmail
             ? `Google authentication successful for ${postLoginEmail}! Reloading Antigravity IDE...`
             : 'Google authentication successful! Reloading Antigravity IDE...';
 
         vscode.window.showInformationMessage(successMessage, 'Reload Now');
-
-        // Immediate reload to flush and load new credentials
         vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (err) {
         vscode.window.showErrorMessage(`Google Sign-In failed or was cancelled: ${err.message || err}`);
@@ -303,7 +341,6 @@ async function logoutAccount() {
     try {
         tokenManager.clearAllSessionTokens();
 
-        // Explicitly notify backend language server to log out
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');
         } catch {}
@@ -383,7 +420,7 @@ async function deleteAccount(savedList) {
 }
 
 /**
- * Check if the active account is not yet saved in the vault and offer to save it
+ * Check on startup if current active account is unsaved and prompt user
  */
 async function checkAndPromptNewAccountOnStartup() {
     try {
@@ -409,24 +446,25 @@ function setupTokenFileWatchers(context) {
     const watchedDirs = new Set();
 
     for (const p of tokenPaths.cliToken) {
-        watchedDirs.add(path.dirname(p));
+        try {
+            const dir = path.dirname(p);
+            if (fs.existsSync(dir)) watchedDirs.add(dir);
+        } catch {}
     }
 
     for (const dir of watchedDirs) {
-        if (fs.existsSync(dir)) {
-            try {
-                const watcher = fs.watch(dir, (eventType, filename) => {
-                    if (filename && filename.includes('token')) {
-                        const currentEmail = tokenManager.detectActiveEmail();
-                        if (currentEmail && currentEmail !== lastKnownEmail) {
-                            updateStatusBar();
-                            checkAndPromptNewAccountOnStartup();
-                        }
+        try {
+            const watcher = fs.watch(dir, (eventType, filename) => {
+                if (filename && filename.includes('token')) {
+                    const currentEmail = tokenManager.detectActiveEmail();
+                    if (currentEmail && currentEmail !== lastKnownEmail) {
+                        updateStatusBar();
+                        checkAndPromptNewAccountOnStartup();
                     }
-                });
-                context.subscriptions.push({ dispose: () => watcher.close() });
-            } catch {}
-        }
+                }
+            });
+            context.subscriptions.push({ dispose: () => watcher.close() });
+        } catch {}
     }
 }
 
@@ -448,7 +486,6 @@ function activate(context) {
     updateStatusBar();
     setupTokenFileWatchers(context);
 
-    // Update status bar and check for new logins when IDE window gains focus
     context.subscriptions.push(
         vscode.window.onDidChangeWindowState(e => {
             if (e.focused) {
@@ -458,18 +495,11 @@ function activate(context) {
         })
     );
 
-    // Initial check on startup
     setTimeout(checkAndPromptNewAccountOnStartup, 1500);
     setTimeout(checkAndPromptNewAccountOnStartup, 4500);
 }
 
-function deactivate() {
-    if (tokenFileWatcher) {
-        try {
-            tokenFileWatcher.close();
-        } catch {}
-    }
-}
+function deactivate() {}
 
 module.exports = {
     activate,
@@ -477,6 +507,7 @@ module.exports = {
     getActiveAccountInfo,
     switchAccount,
     saveOrRenameAccount,
+    manualRegisterAccount,
     logoutAccount,
     clearAllData
 };

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.4.0)
+Antigravity Account Switcher - CLI Core Engine (v2.0)
 Multi-store authentication management across:
 - SQLite databases (state.vscdb)
 - Standalone CLI OAuth token (antigravity-oauth-token)
@@ -13,32 +13,29 @@ import os
 import json
 import sqlite3
 import base64
+import re
 import argparse
 from datetime import datetime
 
-# Profile storage targets
-PROFILES_FILE = os.path.expanduser("~/.gemini/antigravity_profiles.json")
-WIN_PROFILES_FILE = "/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json"
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-# SQLite DB targets
-IDE_DB_WIN = "/mnt/c/Users/Ismael/AppData/Roaming/Antigravity IDE/User/globalStorage/state.vscdb"
-APP_DB_WIN = "/mnt/c/Users/Ismael/AppData/Roaming/Antigravity/User/globalStorage/state.vscdb"
+def is_valid_email(val):
+    return bool(val and isinstance(val, str) and EMAIL_REGEX.match(val.strip()))
 
-DB_AUTH_KEYS = [
-    "antigravityUnifiedStateSync.oauthToken",
-    "antigravityUnifiedStateSync.userStatus",
-    "antigravityUnifiedStateSync.modelCredits",
-    "antigravityAuthStatus",
-    "google.google-antigravity"
-]
+def get_candidate_homes():
+    homes = [
+        os.path.expanduser("~"),
+        "/home/ismaelsoilet",
+        "/mnt/c/Users/Ismael"
+    ]
+    return list(dict.fromkeys([h for h in homes if os.path.exists(h)]))
 
 def get_gemini_dirs():
-    dirs = [
-        os.path.expanduser("~/.gemini"),
-        "/home/ismaelsoilet/.gemini",
-        "/mnt/c/Users/Ismael/.gemini"
-    ]
-    return list(dict.fromkeys([d for d in dirs if d]))
+    dirs = []
+    for h in get_candidate_homes():
+        g = os.path.join(h, ".gemini")
+        dirs.append(g)
+    return list(dict.fromkeys(dirs))
 
 def get_token_file_paths():
     gdirs = get_gemini_dirs()
@@ -49,12 +46,14 @@ def get_token_file_paths():
     }
 
 def get_db_paths():
-    paths = []
-    if os.path.exists(IDE_DB_WIN):
-        paths.append(IDE_DB_WIN)
-    if os.path.exists(APP_DB_WIN):
-        paths.append(APP_DB_WIN)
-    return paths
+    candidates = [
+        "/mnt/c/Users/Ismael/AppData/Roaming/Antigravity IDE/User/globalStorage/state.vscdb",
+        "/mnt/c/Users/Ismael/AppData/Roaming/Antigravity/User/globalStorage/state.vscdb"
+    ]
+    return [p for p in candidates if os.path.exists(p)]
+
+def get_profiles_file_paths():
+    return [os.path.join(d, "antigravity_profiles.json") for d in get_gemini_dirs()]
 
 def decode_jwt_payload(jwt_str):
     if not jwt_str or not isinstance(jwt_str, str):
@@ -71,28 +70,90 @@ def decode_jwt_payload(jwt_str):
 
 def detect_active_email():
     """
-    Cascading detection of active account email across all token files and databases
+    Cascading detection of active account email across all databases and token files
     """
-    files = get_token_file_paths()
+    # 1. Check SQLite Databases
+    for db_path in get_db_paths():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = conn.cursor()
 
-    # 1. Check antigravity-oauth-token
+            # 1a. google.google-antigravity
+            cur.execute("SELECT value FROM ItemTable WHERE key = 'google.google-antigravity'")
+            row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    data = json.loads(row[0])
+                    storage = data.get("antigravity-storage", {})
+                    if isinstance(storage, dict):
+                        candidates = [
+                            storage.get("agy.onboarding.lastLoginUsername"),
+                            storage.get("jetski.onboarding.lastLoginUsername"),
+                            storage.get("onboarding.lastLoginUsername"),
+                            storage.get("lastLoginUsername")
+                        ]
+                        for cand in candidates:
+                            if is_valid_email(cand):
+                                conn.close()
+                                return cand.strip()
+
+                        for val in storage.values():
+                            if is_valid_email(val):
+                                conn.close()
+                                return str(val).strip()
+                except Exception:
+                    pass
+
+            # 1b. antigravityAuthStatus
+            cur.execute("SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus'")
+            row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    data = json.loads(row[0])
+                    em = data.get("email")
+                    if is_valid_email(em):
+                        conn.close()
+                        return em.strip()
+                except Exception:
+                    pass
+
+            # 1c. google.geminicodeassist
+            cur.execute("SELECT value FROM ItemTable WHERE key = 'google.geminicodeassist'")
+            row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    data = json.loads(row[0])
+                    threads = data.get("geminiCodeAssist.chatThreads", {})
+                    if isinstance(threads, dict):
+                        for k in threads.keys():
+                            if is_valid_email(k):
+                                conn.close()
+                                return k.strip()
+                except Exception:
+                    pass
+
+            conn.close()
+        except Exception:
+            pass
+
+    # 2. Check token files
+    files = get_token_file_paths()
     for p in files["cli_token"]:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     em = data.get("id_token_email")
-                    if em and "@" in em:
+                    if is_valid_email(em):
                         return em.strip()
                     id_tok = data.get("token", {}).get("id_token")
                     if id_tok:
                         payload = decode_jwt_payload(id_tok)
-                        if payload and payload.get("email"):
+                        if payload and is_valid_email(payload.get("email")):
                             return payload["email"].strip()
             except Exception:
                 pass
 
-    # 2. Check oauth_creds.json
     for p in files["oauth_creds"]:
         if os.path.exists(p):
             try:
@@ -101,51 +162,15 @@ def detect_active_email():
                     id_tok = data.get("id_token")
                     if id_tok:
                         payload = decode_jwt_payload(id_tok)
-                        if payload and payload.get("email"):
+                        if payload and is_valid_email(payload.get("email")):
                             return payload["email"].strip()
             except Exception:
                 pass
 
-    # 3. Check SQLite Databases
-    for db_path in get_db_paths():
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            cur = conn.cursor()
-
-            # 3a. antigravityAuthStatus
-            cur.execute("SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus'")
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0])
-                    em = data.get("email")
-                    if em and "@" in em:
-                        conn.close()
-                        return em.strip()
-                except Exception:
-                    pass
-
-            # 3b. google.google-antigravity
-            cur.execute("SELECT value FROM ItemTable WHERE key = 'google.google-antigravity'")
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0])
-                    em = data.get("antigravity-storage", {}).get("jetski.onboarding.lastLoginUsername")
-                    if em and "@" in em:
-                        conn.close()
-                        return em.strip()
-                except Exception:
-                    pass
-
-            conn.close()
-        except Exception:
-            pass
-
     return ""
 
 def load_profiles():
-    targets = [PROFILES_FILE, WIN_PROFILES_FILE]
+    targets = get_profiles_file_paths()
     for target in targets:
         if os.path.exists(target):
             try:
@@ -154,9 +179,9 @@ def load_profiles():
                     clean = {}
                     for k, v in raw.items():
                         em = v.get("email") or k
-                        if "@" in em:
-                            clean[em] = {
-                                "email": em,
+                        if is_valid_email(em):
+                            clean[em.strip()] = {
+                                "email": em.strip(),
                                 "label": v.get("label") or v.get("name") or em.split("@")[0],
                                 "saved_at": v.get("saved_at", ""),
                                 "db_tokens": v.get("db_tokens") or v.get("tokens", {}),
@@ -171,7 +196,7 @@ def load_profiles():
 
 def save_profiles(profiles):
     data_str = json.dumps(profiles, indent=2, ensure_ascii=False)
-    for target in [PROFILES_FILE, WIN_PROFILES_FILE]:
+    for target in get_profiles_file_paths():
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8") as f:
@@ -181,11 +206,18 @@ def save_profiles(profiles):
 
 def read_current_db_tokens():
     tokens = {}
+    auth_keys = [
+        "antigravityUnifiedStateSync.oauthToken",
+        "antigravityUnifiedStateSync.userStatus",
+        "antigravityUnifiedStateSync.modelCredits",
+        "antigravityAuthStatus",
+        "google.google-antigravity"
+    ]
     for db_path in get_db_paths():
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             cur = conn.cursor()
-            for k in DB_AUTH_KEYS:
+            for k in auth_keys:
                 if k not in tokens:
                     cur.execute("SELECT value FROM ItemTable WHERE key = ?", (k,))
                     row = cur.fetchone()
@@ -231,7 +263,6 @@ def read_current_file_tokens():
             except Exception:
                 pass
 
-    # Ensure standalone format compatibility
     if not res["standalone_token"] and res["cli_token"] and "token" in res["cli_token"]:
         tok = res["cli_token"]["token"]
         res["standalone_token"] = {
@@ -263,7 +294,6 @@ def write_file_tokens(file_tokens):
         return
     paths = get_token_file_paths()
 
-    # 1. CLI Token
     cli_tok = file_tokens.get("cli_token")
     if cli_tok:
         content = json.dumps(cli_tok, indent=2)
@@ -275,7 +305,6 @@ def write_file_tokens(file_tokens):
             except Exception:
                 pass
 
-    # 2. Standalone Token
     standalone_tok = file_tokens.get("standalone_token")
     if not standalone_tok and cli_tok and "token" in cli_tok:
         tok = cli_tok["token"]
@@ -296,7 +325,6 @@ def write_file_tokens(file_tokens):
             except Exception:
                 pass
 
-    # 3. OAuth Creds
     oauth_creds = file_tokens.get("oauth_creds")
     if oauth_creds:
         content = json.dumps(oauth_creds, indent=2)
@@ -311,24 +339,67 @@ def write_file_tokens(file_tokens):
 def restore_profile(profile):
     if not profile:
         raise ValueError("Cannot restore empty profile")
-    db_tokens = profile.get("db_tokens") or profile.get("tokens", {})
-    file_tokens = profile.get("file_tokens", {})
-    write_db_tokens(db_tokens)
-    write_file_tokens(file_tokens)
+    email = profile.get("email")
 
-def cmd_save(label=None):
-    email = detect_active_email()
-    if not email:
-        print("Error: No active Antigravity session detected across token files and databases.")
+    db_tokens = dict(profile.get("db_tokens") or profile.get("tokens", {}))
+    # Patch all known email keys in google.google-antigravity
+    ag_data = {}
+    if db_tokens.get("google.google-antigravity"):
+        try:
+            ag_data = json.loads(db_tokens["google.google-antigravity"])
+        except Exception:
+            pass
+    if "antigravity-storage" not in ag_data:
+        ag_data["antigravity-storage"] = {}
+    ag_data["antigravity-storage"]["agy.onboarding.lastLoginUsername"] = email
+    ag_data["antigravity-storage"]["jetski.onboarding.lastLoginUsername"] = email
+    ag_data["antigravity-storage"]["agy.onboarding.lastLoginIsGcpTos"] = "false"
+    ag_data["antigravity-storage"]["jetski.onboarding.lastLoginIsGcpTos"] = "false"
+    db_tokens["google.google-antigravity"] = json.dumps(ag_data)
+
+    if "antigravityAuthStatus" not in db_tokens:
+        db_tokens["antigravityAuthStatus"] = json.dumps({"email": email, "apiKey": ""})
+
+    write_db_tokens(db_tokens)
+    write_file_tokens(profile.get("file_tokens", {}))
+
+def cmd_save(label=None, manual_email=None):
+    email = (manual_email and manual_email.strip()) or detect_active_email()
+    if not email or not is_valid_email(email):
+        print("Error: No active Antigravity session detected across databases and token files.")
+        print("You can manually specify an email: python3 switch.py save [label] --email user@example.com")
         return 1
 
-    display_label = label.strip() if label and label.strip() else email.split("@")[0]
+    clean_email = email.strip()
+    display_label = label.strip() if label and label.strip() else clean_email.split("@")[0]
+
     db_tokens = read_current_db_tokens()
     file_tokens = read_current_file_tokens()
 
+    # Ensure google.google-antigravity contains correct email keys
+    ag_data = {}
+    if db_tokens.get("google.google-antigravity"):
+        try:
+            ag_data = json.loads(db_tokens["google.google-antigravity"])
+        except Exception:
+            pass
+    if "antigravity-storage" not in ag_data:
+        ag_data["antigravity-storage"] = {}
+    ag_data["antigravity-storage"]["agy.onboarding.lastLoginUsername"] = clean_email
+    ag_data["antigravity-storage"]["jetski.onboarding.lastLoginUsername"] = clean_email
+    ag_data["antigravity-storage"]["agy.onboarding.lastLoginIsGcpTos"] = "false"
+    ag_data["antigravity-storage"]["jetski.onboarding.lastLoginIsGcpTos"] = "false"
+    db_tokens["google.google-antigravity"] = json.dumps(ag_data)
+
+    if "antigravityAuthStatus" not in db_tokens:
+        db_tokens["antigravityAuthStatus"] = json.dumps({"email": clean_email, "apiKey": ""})
+
+    if file_tokens.get("cli_token"):
+        file_tokens["cli_token"]["id_token_email"] = clean_email
+
     profiles = load_profiles()
-    profiles[email] = {
-        "email": email,
+    profiles[clean_email] = {
+        "email": clean_email,
         "label": display_label,
         "saved_at": datetime.now().isoformat(),
         "db_tokens": db_tokens,
@@ -336,7 +407,9 @@ def cmd_save(label=None):
         "tokens": db_tokens
     }
     save_profiles(profiles)
-    print(f"Account '{email}' saved as '[{display_label}]' successfully!")
+    write_db_tokens(db_tokens)
+
+    print(f"Account '{clean_email}' saved as '[{display_label}]' successfully!")
     return 0
 
 def find_profile(query, profiles):
@@ -416,14 +489,19 @@ def cmd_current(as_json=False):
 def cmd_clear():
     save_profiles({})
 
-    # 1. Clear DB keys
+    auth_keys = [
+        "antigravityUnifiedStateSync.oauthToken",
+        "antigravityUnifiedStateSync.userStatus",
+        "antigravityUnifiedStateSync.modelCredits",
+        "antigravityAuthStatus"
+    ]
+
     for db_path in get_db_paths():
         try:
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
-            for k in DB_AUTH_KEYS:
-                if k != "google.google-antigravity":
-                    cur.execute("DELETE FROM ItemTable WHERE key = ?", (k,))
+            for k in auth_keys:
+                cur.execute("DELETE FROM ItemTable WHERE key = ?", (k,))
             # Strip username from google.google-antigravity
             cur.execute("SELECT value FROM ItemTable WHERE key = 'google.google-antigravity'")
             row = cur.fetchone()
@@ -431,7 +509,9 @@ def cmd_clear():
                 try:
                     data = json.loads(row[0])
                     if "antigravity-storage" in data:
+                        data["antigravity-storage"].pop("agy.onboarding.lastLoginUsername", None)
                         data["antigravity-storage"].pop("jetski.onboarding.lastLoginUsername", None)
+                        data["antigravity-storage"].pop("agy.onboarding.lastLoginIsGcpTos", None)
                         data["antigravity-storage"].pop("jetski.onboarding.lastLoginIsGcpTos", None)
                         cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('google.google-antigravity', ?)", (json.dumps(data),))
                 except Exception:
@@ -441,7 +521,6 @@ def cmd_clear():
         except Exception:
             pass
 
-    # 2. Clear token files
     paths = get_token_file_paths()
     for cat in ["cli_token", "standalone_token", "oauth_creds"]:
         for p in paths[cat]:
@@ -472,6 +551,7 @@ def main():
 
     save_p = subparsers.add_parser("save", help="Snapshot current active account")
     save_p.add_argument("label", nargs="?", default=None, help="Friendly label")
+    save_p.add_argument("--email", default=None, help="Explicit Google email if auto-detection fails")
 
     load_p = subparsers.add_parser("load", help="Switch to an account by email or label")
     load_p.add_argument("query", help="Email or label to switch to")
@@ -490,7 +570,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "save":
-        sys.exit(cmd_save(args.label))
+        sys.exit(cmd_save(args.label, args.email))
     elif args.command == "load":
         sys.exit(cmd_load(args.query))
     elif args.command == "list":

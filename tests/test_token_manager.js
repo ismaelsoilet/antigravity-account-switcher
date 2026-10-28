@@ -5,7 +5,7 @@ const os = require('os');
 const tokenManager = require('../tokenManager');
 
 async function runTests() {
-    console.log('--- Running TokenManager Unit Tests ---');
+    console.log('--- Running TokenManager Unit Tests (Cycle 2) ---');
     let passed = 0;
     let failed = 0;
 
@@ -39,7 +39,17 @@ async function runTests() {
         assert.strictEqual(tokenManager.decodeJwtPayload('invalid.token'), null);
     });
 
-    // Test 2: File Tokens Generation & Standalone Fallback
+    // Test 2: isValidEmail
+    test('isValidEmail correctly identifies valid and invalid emails', () => {
+        assert.strictEqual(tokenManager.isValidEmail('user@gmail.com'), true);
+        assert.strictEqual(tokenManager.isValidEmail('engineer.alpha+dev@company.org'), true);
+        assert.strictEqual(tokenManager.isValidEmail('not-an-email'), false);
+        assert.strictEqual(tokenManager.isValidEmail('user@'), false);
+        assert.strictEqual(tokenManager.isValidEmail('@domain.com'), false);
+        assert.strictEqual(tokenManager.isValidEmail(null), false);
+    });
+
+    // Test 3: Standalone Synthesis
     test('readCurrentFileTokens synthesizes standalone format from cliToken', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-test-'));
         const cliTokenDir = path.join(tmpDir, 'antigravity-cli');
@@ -58,19 +68,11 @@ async function runTests() {
         const cliPath = path.join(cliTokenDir, 'antigravity-oauth-token');
         fs.writeFileSync(cliPath, JSON.stringify(mockCliToken), 'utf-8');
 
-        // Test restore and standalone synthesis
-        const fileTokens = {
-            cliToken: mockCliToken,
-            standaloneToken: null,
-            oauthCreds: null
-        };
-
         const standaloneTarget = path.join(tmpDir, 'jetski-standalone-oauth-token');
-        // Synthesize
         const standaloneData = {
             token: {
-                access_token: fileTokens.cliToken.token.access_token,
-                expiry: fileTokens.cliToken.token.expiry
+                access_token: mockCliToken.token.access_token,
+                expiry: mockCliToken.token.expiry
             }
         };
         fs.writeFileSync(standaloneTarget, JSON.stringify(standaloneData), 'utf-8');
@@ -83,7 +85,50 @@ async function runTests() {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    // Test 3: Backward Compatibility with Legacy Profiles
+    // Test 4: Key Support in google.google-antigravity
+    test('detects email under agy.onboarding.lastLoginUsername', () => {
+        const mockStorage = {
+            'projectsOrder': '[]',
+            'agy.onboarding.lastLoginUsername': 'active.dev@gmail.com',
+            'agy.onboarding.lastLoginIsGcpTos': 'false'
+        };
+
+        let found = '';
+        const candidates = [
+            mockStorage['agy.onboarding.lastLoginUsername'],
+            mockStorage['jetski.onboarding.lastLoginUsername'],
+            mockStorage['onboarding.lastLoginUsername'],
+            mockStorage['lastLoginUsername']
+        ];
+        for (const cand of candidates) {
+            if (tokenManager.isValidEmail(cand)) {
+                found = cand.trim();
+                break;
+            }
+        }
+        assert.strictEqual(found, 'active.dev@gmail.com');
+    });
+
+    test('detects email under jetski.onboarding.lastLoginUsername', () => {
+        const mockStorage = {
+            'jetski.onboarding.lastLoginUsername': 'jetski.user@example.com'
+        };
+
+        let found = '';
+        const candidates = [
+            mockStorage['agy.onboarding.lastLoginUsername'],
+            mockStorage['jetski.onboarding.lastLoginUsername']
+        ];
+        for (const cand of candidates) {
+            if (tokenManager.isValidEmail(cand)) {
+                found = cand.trim();
+                break;
+            }
+        }
+        assert.strictEqual(found, 'jetski.user@example.com');
+    });
+
+    // Test 5: Backward Compatibility with Legacy Profiles
     test('loadProfiles correctly parses legacy profile with only tokens map', () => {
         const tmpFile = path.join(os.tmpdir(), `legacy_profiles_${Date.now()}.json`);
         const legacyData = {
@@ -93,7 +138,7 @@ async function runTests() {
                 tokens: {
                     'google.google-antigravity': JSON.stringify({
                         'antigravity-storage': {
-                            'jetski.onboarding.lastLoginUsername': 'legacy.user@example.com'
+                            'agy.onboarding.lastLoginUsername': 'legacy.user@example.com'
                         }
                     })
                 }
@@ -102,12 +147,11 @@ async function runTests() {
 
         fs.writeFileSync(tmpFile, JSON.stringify(legacyData), 'utf-8');
 
-        // Parse mock using the same logic as loadProfiles
         const raw = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
         const clean = {};
         for (const [k, v] of Object.entries(raw)) {
             const em = v.email || k;
-            if (em && em.includes('@')) {
+            if (tokenManager.isValidEmail(em)) {
                 clean[em] = {
                     email: em,
                     label: v.label || v.name || em.split('@')[0],

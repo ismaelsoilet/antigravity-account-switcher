@@ -1,6 +1,6 @@
 /**
- * Antigravity Account Switcher - Token & Storage Manager
- * Comprehensive multi-store authentication management across:
+ * Antigravity Account Switcher - Token & Storage Engine (v2.0)
+ * Deep multi-store authentication management across:
  * - SQLite databases (state.vscdb)
  * - Standalone CLI & Desktop OAuth tokens (antigravity-oauth-token)
  * - Antigravity CdeAuthService tokens (jetski-standalone-oauth-token)
@@ -26,39 +26,70 @@ const DB_AUTH_KEYS = [
     'google.google-antigravity'
 ];
 
+const EMAIL_REGEX = /^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/;
+
 /**
- * Get primary home directory across WSL and Windows
+ * Return all potential home directories across WSL and Windows
  */
-function getHomeDir() {
-    return process.env.USERPROFILE || process.env.HOME || os.homedir();
+function getAllCandidateHomeDirs() {
+    const list = [];
+
+    // Current environment home
+    try {
+        if (os.homedir()) list.push(os.homedir());
+    } catch {}
+    if (process.env.HOME) list.push(process.env.HOME);
+    if (process.env.USERPROFILE) list.push(process.env.USERPROFILE);
+
+    // Cross-environment known paths
+    list.push('/home/ismaelsoilet');
+    list.push('/mnt/c/Users/Ismael');
+    list.push('C:\\Users\\Ismael');
+    list.push('\\\\wsl.localhost\\Ubuntu-24.04\\home\\ismaelsoilet');
+    list.push('\\\\wsl$\\Ubuntu-24.04\\home\\ismaelsoilet');
+
+    const valid = [];
+    for (const p of [...new Set(list)]) {
+        if (!p) continue;
+        try {
+            if (fs.existsSync(p)) {
+                valid.push(p);
+            }
+        } catch {}
+    }
+    return valid;
 }
 
 /**
- * Get all possible .gemini root directories (WSL and Windows host)
+ * Get all .gemini directory paths across environments
  */
 function getGeminiDirs() {
-    const dirs = [
-        path.join(os.homedir(), '.gemini'),
-        path.join(getHomeDir(), '.gemini'),
-        '/home/ismaelsoilet/.gemini',
-        '/mnt/c/Users/Ismael/.gemini'
-    ];
-    if (process.platform === 'win32' || process.env.USERPROFILE) {
-        const winProfile = process.env.USERPROFILE || 'C:\\Users\\Ismael';
-        dirs.push(path.join(winProfile, '.gemini'));
+    const dirs = [];
+    for (const h of getAllCandidateHomeDirs()) {
+        const g = path.join(h, '.gemini');
+        try {
+            if (fs.existsSync(g)) {
+                dirs.push(g);
+            } else {
+                // Also candidate for creation
+                dirs.push(g);
+            }
+        } catch {
+            dirs.push(g);
+        }
     }
-    return [...new Set(dirs.filter(Boolean))];
+    return [...new Set(dirs)];
 }
 
 /**
- * Get all token file paths categorized by token type
+ * Get token file paths categorized by token type
  */
 function getTokenFilePaths() {
     const geminiDirs = getGeminiDirs();
     const paths = {
-        cliToken: [],        // antigravity-oauth-token
-        standaloneToken: [], // jetski-standalone-oauth-token
-        oauthCreds: []       // oauth_creds.json
+        cliToken: [],
+        standaloneToken: [],
+        oauthCreds: []
     };
 
     for (const gDir of geminiDirs) {
@@ -75,29 +106,34 @@ function getTokenFilePaths() {
 }
 
 /**
- * Get all SQLite database paths for Antigravity IDE and Antigravity Desktop
+ * Get all possible SQLite state.vscdb paths across Windows and WSL
  */
 function getDbPaths() {
-    const paths = [
+    const candidates = [
         '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity IDE/User/globalStorage/state.vscdb',
-        '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity/User/globalStorage/state.vscdb'
+        '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity/User/globalStorage/state.vscdb',
+        'C:\\Users\\Ismael\\AppData\\Roaming\\Antigravity IDE\\User\\globalStorage\\state.vscdb',
+        'C:\\Users\\Ismael\\AppData\\Roaming\\Antigravity\\User\\globalStorage\\state.vscdb'
     ];
-    if (process.platform === 'win32' || process.env.APPDATA) {
-        const appData = process.env.APPDATA || path.join(getHomeDir(), 'AppData', 'Roaming');
-        paths.push(path.join(appData, 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb'));
-        paths.push(path.join(appData, 'Antigravity', 'User', 'globalStorage', 'state.vscdb'));
+
+    if (process.env.APPDATA) {
+        candidates.push(path.join(process.env.APPDATA, 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb'));
+        candidates.push(path.join(process.env.APPDATA, 'Antigravity', 'User', 'globalStorage', 'state.vscdb'));
     }
-    return [...new Set(paths.filter(p => {
+
+    const valid = [];
+    for (const p of candidates) {
         try {
-            return fs.existsSync(p);
-        } catch {
-            return false;
-        }
-    }))];
+            if (fs.existsSync(p)) {
+                valid.push(p);
+            }
+        } catch {}
+    }
+    return [...new Set(valid)];
 }
 
 /**
- * Get profile storage target file paths
+ * Get all profile file paths
  */
 function getProfilesFilePaths() {
     const targets = [];
@@ -127,85 +163,129 @@ function decodeJwtPayload(jwt) {
 }
 
 /**
+ * Helper to test if a string is a valid email address
+ */
+function isValidEmail(str) {
+    if (!str || typeof str !== 'string') return false;
+    const trimmed = str.trim();
+    return trimmed.length > 5 && EMAIL_REGEX.test(trimmed);
+}
+
+/**
  * Cascading active account email detection across all sources:
- * 1. antigravity-oauth-token (id_token_email or parsed id_token)
- * 2. oauth_creds.json (id_token payload)
- * 3. SQLite ItemTable: antigravityAuthStatus (JSON email)
- * 4. SQLite ItemTable: google.google-antigravity (jetski.onboarding.lastLoginUsername)
- * 5. Standalone token file
+ * 1. SQLite google.google-antigravity (agy.onboarding.lastLoginUsername, jetski.onboarding.lastLoginUsername, or any email in storage)
+ * 2. SQLite antigravityAuthStatus (email)
+ * 3. SQLite google.geminicodeassist (chatThreads keys)
+ * 4. File token antigravity-cli/antigravity-oauth-token (id_token_email or decoded JWT)
+ * 5. File token oauth_creds.json (decoded JWT id_token)
  */
 function detectActiveEmail() {
-    const filePaths = getTokenFilePaths();
-
-    // 1. Check antigravity-cli/antigravity-oauth-token
-    for (const p of filePaths.cliToken) {
-        if (fs.existsSync(p)) {
-            try {
-                const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
-                if (content.id_token_email && content.id_token_email.includes('@')) {
-                    return content.id_token_email.trim();
-                }
-                if (content.token && content.token.id_token) {
-                    const payload = decodeJwtPayload(content.token.id_token);
-                    if (payload && payload.email && payload.email.includes('@')) {
-                        return payload.email.trim();
-                    }
-                }
-            } catch {}
-        }
-    }
-
-    // 2. Check oauth_creds.json
-    for (const p of filePaths.oauthCreds) {
-        if (fs.existsSync(p)) {
-            try {
-                const creds = JSON.parse(fs.readFileSync(p, 'utf-8'));
-                if (creds.id_token) {
-                    const payload = decodeJwtPayload(creds.id_token);
-                    if (payload && payload.email && payload.email.includes('@')) {
-                        return payload.email.trim();
-                    }
-                }
-            } catch {}
-        }
-    }
-
-    // 3. Check SQLite Databases
+    // 1. Check SQLite Databases first (direct IDE active session)
     const dbPaths = getDbPaths();
     if (DatabaseSync && dbPaths.length > 0) {
         for (const dbPath of dbPaths) {
             try {
                 const db = new DatabaseSync(dbPath, { readOnly: true });
-                // 3a. Check antigravityAuthStatus
+
+                // 1a. Check google.google-antigravity
+                const agRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.google-antigravity');
+                if (agRow && agRow.value) {
+                    try {
+                        const parsed = JSON.parse(agRow.value);
+                        const storage = parsed['antigravity-storage'] || {};
+
+                        // Check known keys first
+                        const explicitCandidates = [
+                            storage['agy.onboarding.lastLoginUsername'],
+                            storage['jetski.onboarding.lastLoginUsername'],
+                            storage['onboarding.lastLoginUsername'],
+                            storage['lastLoginUsername']
+                        ];
+                        for (const cand of explicitCandidates) {
+                            if (isValidEmail(cand)) {
+                                db.close();
+                                return cand.trim();
+                            }
+                        }
+
+                        // Deep scan of all string values in antigravity-storage
+                        for (const val of Object.values(storage)) {
+                            if (isValidEmail(val)) {
+                                db.close();
+                                return String(val).trim();
+                            }
+                        }
+                    } catch {}
+                }
+
+                // 1b. Check antigravityAuthStatus
                 const authRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('antigravityAuthStatus');
                 if (authRow && authRow.value) {
                     try {
                         const parsed = JSON.parse(authRow.value);
-                        if (parsed.email && parsed.email.includes('@')) {
+                        if (isValidEmail(parsed.email)) {
                             db.close();
                             return parsed.email.trim();
                         }
                     } catch {}
                 }
 
-                // 3b. Check google.google-antigravity
-                const agRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.google-antigravity');
-                if (agRow && agRow.value) {
+                // 1c. Check google.geminicodeassist
+                const gcaRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.geminicodeassist');
+                if (gcaRow && gcaRow.value) {
                     try {
-                        const parsed = JSON.parse(agRow.value);
-                        const storage = parsed['antigravity-storage'];
-                        if (storage && storage['jetski.onboarding.lastLoginUsername']) {
-                            const em = storage['jetski.onboarding.lastLoginUsername'];
-                            if (em && em.includes('@')) {
-                                db.close();
-                                return em.trim();
+                        const parsed = JSON.parse(gcaRow.value);
+                        const threads = parsed['geminiCodeAssist.chatThreads'];
+                        if (threads && typeof threads === 'object') {
+                            for (const key of Object.keys(threads)) {
+                                if (isValidEmail(key)) {
+                                    db.close();
+                                    return key.trim();
+                                }
                             }
                         }
                     } catch {}
                 }
+
                 db.close();
             } catch {}
         }
+    }
+
+    // 2. Check token files (CLI & standalone tokens)
+    const filePaths = getTokenFilePaths();
+
+    // 2a. Check antigravity-cli/antigravity-oauth-token
+    for (const p of filePaths.cliToken) {
+        try {
+            if (fs.existsSync(p)) {
+                const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                if (isValidEmail(content.id_token_email)) {
+                    return content.id_token_email.trim();
+                }
+                if (content.token && content.token.id_token) {
+                    const payload = decodeJwtPayload(content.token.id_token);
+                    if (payload && isValidEmail(payload.email)) {
+                        return payload.email.trim();
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    // 2b. Check oauth_creds.json
+    for (const p of filePaths.oauthCreds) {
+        try {
+            if (fs.existsSync(p)) {
+                const creds = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                if (creds.id_token) {
+                    const payload = decodeJwtPayload(creds.id_token);
+                    if (payload && isValidEmail(payload.email)) {
+                        return payload.email.trim();
+                    }
+                }
+            }
+        } catch {}
     }
 
     return '';
@@ -217,15 +297,15 @@ function detectActiveEmail() {
 function loadProfiles() {
     const targets = getProfilesFilePaths();
     for (const p of targets) {
-        if (fs.existsSync(p)) {
-            try {
+        try {
+            if (fs.existsSync(p)) {
                 const raw = JSON.parse(fs.readFileSync(p, 'utf-8'));
                 const clean = {};
                 for (const [k, v] of Object.entries(raw)) {
                     const em = v.email || k;
-                    if (em && em.includes('@')) {
+                    if (isValidEmail(em)) {
                         clean[em] = {
-                            email: em,
+                            email: em.trim(),
                             label: v.label || v.name || em.split('@')[0],
                             saved_at: v.saved_at || '',
                             db_tokens: v.db_tokens || v.tokens || {},
@@ -237,8 +317,8 @@ function loadProfiles() {
                 if (Object.keys(clean).length > 0) {
                     return clean;
                 }
-            } catch {}
-        }
+            }
+        } catch {}
     }
     return {};
 }
@@ -297,35 +377,35 @@ function readCurrentFileTokens() {
 
     // 1. CLI Token
     for (const p of filePaths.cliToken) {
-        if (fs.existsSync(p)) {
-            try {
+        try {
+            if (fs.existsSync(p)) {
                 result.cliToken = JSON.parse(fs.readFileSync(p, 'utf-8'));
                 break;
-            } catch {}
-        }
+            }
+        } catch {}
     }
 
     // 2. Standalone Token
     for (const p of filePaths.standaloneToken) {
-        if (fs.existsSync(p)) {
-            try {
+        try {
+            if (fs.existsSync(p)) {
                 result.standaloneToken = JSON.parse(fs.readFileSync(p, 'utf-8'));
                 break;
-            } catch {}
-        }
+            }
+        } catch {}
     }
 
     // 3. OAuth Creds
     for (const p of filePaths.oauthCreds) {
-        if (fs.existsSync(p)) {
-            try {
+        try {
+            if (fs.existsSync(p)) {
                 result.oauthCreds = JSON.parse(fs.readFileSync(p, 'utf-8'));
                 break;
-            } catch {}
-        }
+            }
+        } catch {}
     }
 
-    // If standalone token is missing but CLI token is present, generate standalone format
+    // Synthesize standalone token from CLI token if missing
     if (!result.standaloneToken && result.cliToken && result.cliToken.token) {
         result.standaloneToken = {
             token: {
@@ -339,21 +419,49 @@ function readCurrentFileTokens() {
 }
 
 /**
- * Create a complete snapshot of the active account
+ * Create a complete snapshot of the active account.
+ * Supports manual email fallback if provided by user.
  */
-function snapshotActiveAccount(label) {
-    const email = detectActiveEmail();
-    if (!email) {
-        throw new Error('No active Antigravity Google session detected to snapshot.');
+function snapshotActiveAccount(customLabel, manualEmail) {
+    const email = (manualEmail && manualEmail.trim()) || detectActiveEmail();
+    if (!email || !isValidEmail(email)) {
+        throw new Error('No valid Google Account email provided or detected.');
     }
 
+    const cleanEmail = email.trim();
     const dbTokens = readCurrentDbTokens();
     const fileTokens = readCurrentFileTokens();
-    const displayLabel = (label && label.trim()) ? label.trim() : email.split('@')[0];
+    const displayLabel = (customLabel && customLabel.trim()) ? customLabel.trim() : cleanEmail.split('@')[0];
+
+    // Ensure google.google-antigravity contains the correct email keys
+    let agData = {};
+    if (dbTokens['google.google-antigravity']) {
+        try {
+            agData = JSON.parse(dbTokens['google.google-antigravity']);
+        } catch {}
+    }
+    if (!agData['antigravity-storage']) {
+        agData['antigravity-storage'] = {};
+    }
+    agData['antigravity-storage']['agy.onboarding.lastLoginUsername'] = cleanEmail;
+    agData['antigravity-storage']['jetski.onboarding.lastLoginUsername'] = cleanEmail;
+    agData['antigravity-storage']['agy.onboarding.lastLoginIsGcpTos'] = 'false';
+    agData['antigravity-storage']['jetski.onboarding.lastLoginIsGcpTos'] = 'false';
+    dbTokens['google.google-antigravity'] = JSON.stringify(agData);
+
+    // Ensure antigravityAuthStatus has email
+    if (!dbTokens['antigravityAuthStatus']) {
+        dbTokens['antigravityAuthStatus'] = JSON.stringify({ email: cleanEmail, apiKey: '' });
+    }
+
+    // Ensure cliToken has email
+    if (fileTokens.cliToken) {
+        fileTokens.cliToken.id_token_email = cleanEmail;
+    }
 
     const profiles = loadProfiles();
-    profiles[email] = {
-        email: email,
+    profiles[cleanEmail] = {
+        email: cleanEmail,
         label: displayLabel,
         saved_at: new Date().toISOString(),
         db_tokens: dbTokens,
@@ -362,7 +470,11 @@ function snapshotActiveAccount(label) {
     };
 
     saveProfiles(profiles);
-    return profiles[email];
+
+    // Also persist injected keys back to active DB so it is recognized immediately
+    writeTokensToDbs(dbTokens);
+
+    return profiles[cleanEmail];
 }
 
 /**
@@ -448,8 +560,32 @@ function restoreProfile(profile) {
         throw new Error('Invalid profile: null or undefined');
     }
 
-    // 1. Write SQLite DB tokens
-    const dbTokens = profile.db_tokens || profile.tokens || {};
+    const email = profile.email;
+
+    // 1. Prepare and patch DB tokens
+    const dbTokens = Object.assign({}, profile.db_tokens || profile.tokens || {});
+
+    // Ensure google.google-antigravity contains the target email in all known keys
+    let agData = {};
+    if (dbTokens['google.google-antigravity']) {
+        try {
+            agData = JSON.parse(dbTokens['google.google-antigravity']);
+        } catch {}
+    }
+    if (!agData['antigravity-storage']) {
+        agData['antigravity-storage'] = {};
+    }
+    agData['antigravity-storage']['agy.onboarding.lastLoginUsername'] = email;
+    agData['antigravity-storage']['jetski.onboarding.lastLoginUsername'] = email;
+    agData['antigravity-storage']['agy.onboarding.lastLoginIsGcpTos'] = 'false';
+    agData['antigravity-storage']['jetski.onboarding.lastLoginIsGcpTos'] = 'false';
+    dbTokens['google.google-antigravity'] = JSON.stringify(agData);
+
+    // Ensure antigravityAuthStatus matches
+    if (!dbTokens['antigravityAuthStatus']) {
+        dbTokens['antigravityAuthStatus'] = JSON.stringify({ email: email, apiKey: '' });
+    }
+
     writeTokensToDbs(dbTokens);
 
     // 2. Write file tokens
@@ -478,7 +614,9 @@ function clearAllSessionTokens() {
                     try {
                         const data = JSON.parse(row.value);
                         if (data['antigravity-storage']) {
+                            delete data['antigravity-storage']['agy.onboarding.lastLoginUsername'];
                             delete data['antigravity-storage']['jetski.onboarding.lastLoginUsername'];
+                            delete data['antigravity-storage']['agy.onboarding.lastLoginIsGcpTos'];
                             delete data['antigravity-storage']['jetski.onboarding.lastLoginIsGcpTos'];
                             db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run('google.google-antigravity', JSON.stringify(data));
                         }
@@ -504,7 +642,9 @@ function clearAllSessionTokens() {
 
 module.exports = {
     DB_AUTH_KEYS,
-    getHomeDir,
+    EMAIL_REGEX,
+    isValidEmail,
+    getAllCandidateHomeDirs,
     getGeminiDirs,
     getTokenFilePaths,
     getDbPaths,
