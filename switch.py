@@ -138,13 +138,10 @@ def write_tokens(tokens):
 
 def cmd_save(label=None):
     tokens = read_current_tokens()
-    if "antigravityUnifiedStateSync.oauthToken" not in tokens:
-        print(f"Error: No active Antigravity session found in {IDE_DB_WIN}")
-        return 1
-
     email = extract_email(tokens)
     if not email:
-        email = "unknown_account@antigravity"
+        print(f"Error: No active Antigravity session found in {IDE_DB_WIN}")
+        return 1
 
     display_label = label.strip() if label and label.strip() else email.split("@")[0]
 
