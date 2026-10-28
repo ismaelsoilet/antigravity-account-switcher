@@ -1,188 +1,18 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const tokenManager = require('./tokenManager');
 
 let statusBarItem;
+let tokenFileWatcher = null;
+let lastKnownEmail = '';
 
-const AUTH_KEYS = [
-    'antigravityUnifiedStateSync.oauthToken',
-    'antigravityUnifiedStateSync.userStatus',
-    'antigravityUnifiedStateSync.modelCredits',
-    'antigravityAuthStatus',
-    'google.google-antigravity'
-];
-
-let DatabaseSync;
-try {
-    DatabaseSync = require('node:sqlite').DatabaseSync;
-} catch {
-    DatabaseSync = null;
-}
-
-function getHomeDir() {
-    return process.env.USERPROFILE || process.env.HOME || os.homedir();
-}
-
-function getProfilesFilePath() {
-    return path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json');
-}
-
-function getDbPaths() {
-    const paths = [
-        '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity IDE/User/globalStorage/state.vscdb',
-        '/mnt/c/Users/Ismael/AppData/Roaming/Antigravity/User/globalStorage/state.vscdb'
-    ];
-    if (process.platform === 'win32') {
-        const appData = process.env.APPDATA || path.join(getHomeDir(), 'AppData', 'Roaming');
-        paths.push(path.join(appData, 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb'));
-        paths.push(path.join(appData, 'Antigravity', 'User', 'globalStorage', 'state.vscdb'));
-    }
-    return [...new Set(paths.filter(p => fs.existsSync(p)))];
-}
-
-function loadProfiles() {
-    const targets = [
-        path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json'),
-        '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json',
-        '/home/ismaelsoilet/.gemini/antigravity_profiles.json'
-    ];
-    if (process.platform === 'win32') {
-        targets.push('C:\\Users\\Ismael\\.gemini\\antigravity_profiles.json');
-    }
-
-    for (const p of [...new Set(targets)]) {
-        if (fs.existsSync(p)) {
-            try {
-                const raw = JSON.parse(fs.readFileSync(p, 'utf-8'));
-                const clean = {};
-                for (const [k, v] of Object.entries(raw)) {
-                    const em = v.email || k;
-                    if (em && em.includes('@')) {
-                        clean[em] = {
-                            email: em,
-                            label: v.label || v.name || em.split('@')[0],
-                            saved_at: v.saved_at || '',
-                            tokens: v.tokens || {}
-                        };
-                    }
-                }
-                if (Object.keys(clean).length > 0) {
-                    return clean;
-                }
-            } catch {}
-        }
-    }
-    return {};
-}
-
-function saveProfiles(profiles) {
-    const targets = [
-        path.join(getHomeDir(), '.gemini', 'antigravity_profiles.json'),
-        '/mnt/c/Users/Ismael/.gemini/antigravity_profiles.json',
-        '/home/ismaelsoilet/.gemini/antigravity_profiles.json'
-    ];
-    if (process.platform === 'win32') {
-        targets.push('C:\\Users\\Ismael\\.gemini\\antigravity_profiles.json');
-    }
-
-    for (const p of [...new Set(targets)]) {
-        try {
-            fs.mkdirSync(path.dirname(p), { recursive: true });
-            fs.writeFileSync(p, JSON.stringify(profiles, null, 2), 'utf-8');
-        } catch {}
-    }
-}
-
-function extractEmail(tokens) {
-    if (!tokens) return '';
-
-    // 1. Check antigravityAuthStatus (exact active session email)
-    const authStatus = tokens['antigravityAuthStatus'];
-    if (authStatus) {
-        try {
-            const data = typeof authStatus === 'string' ? JSON.parse(authStatus) : authStatus;
-            if (data && data.email && typeof data.email === 'string' && data.email.includes('@')) {
-                return data.email.trim();
-            }
-        } catch {}
-    }
-
-    // 2. Check jetski.onboarding.lastLoginUsername
-    const raw = tokens['google.google-antigravity'];
-    if (raw) {
-        try {
-            const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            const storage = data['antigravity-storage'];
-            if (storage && storage['jetski.onboarding.lastLoginUsername']) {
-                const em = storage['jetski.onboarding.lastLoginUsername'];
-                if (em && em.includes('@')) {
-                    return em.trim();
-                }
-            }
-        } catch {}
-    }
-
-    return '';
-}
-
-function isSessionActive(tokens) {
-    if (!tokens) return false;
-    return !!extractEmail(tokens);
-}
-
-function readCurrentTokens() {
-    const dbs = getDbPaths();
-    if (dbs.length === 0) return {};
-
-    const tokens = {};
-    if (DatabaseSync) {
-        for (const dbPath of dbs) {
-            try {
-                const db = new DatabaseSync(dbPath, { readOnly: true });
-                const stmt = db.prepare('SELECT value FROM ItemTable WHERE key = ?');
-                for (const k of AUTH_KEYS) {
-                    if (!tokens[k]) {
-                        const row = stmt.get(k);
-                        if (row && row.value !== undefined) {
-                            tokens[k] = row.value;
-                        }
-                    }
-                }
-                db.close();
-            } catch (e) {
-                console.warn(`DatabaseSync read error for ${dbPath}:`, e);
-            }
-        }
-    }
-    return tokens;
-}
-
-function writeTokensToDbs(tokens) {
-    const dbs = getDbPaths();
-    for (const dbPath of dbs) {
-        if (DatabaseSync) {
-            try {
-                const db = new DatabaseSync(dbPath);
-                const stmt = db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)');
-                for (const [k, v] of Object.entries(tokens)) {
-                    if (v !== undefined && v !== null) {
-                        stmt.run(k, String(v));
-                    }
-                }
-                db.close();
-            } catch (e) {
-                console.error(`DatabaseSync write error for ${dbPath}:`, e);
-            }
-        }
-    }
-}
-
+/**
+ * Get active account information for UI and menus
+ */
 async function getActiveAccountInfo() {
-    const tokens = readCurrentTokens();
-    const active = isSessionActive(tokens);
-    const email = active ? extractEmail(tokens) : '';
-    const profiles = loadProfiles();
+    const email = tokenManager.detectActiveEmail();
+    const profiles = tokenManager.loadProfiles();
 
     let matched = null;
     if (email && profiles[email]) {
@@ -190,17 +20,21 @@ async function getActiveAccountInfo() {
     }
 
     return {
-        isActive: active && !!email,
-        email: email,
+        isActive: Boolean(email),
+        email: email || '',
         label: matched ? matched.label : (email ? email.split('@')[0] : 'No Account'),
-        isSaved: !!matched,
-        tokens: tokens
+        isSaved: Boolean(matched)
     };
 }
 
+/**
+ * Update the status bar item with the current account status
+ */
 async function updateStatusBar() {
     try {
         const info = await getActiveAccountInfo();
+        lastKnownEmail = info.email;
+
         if (info.isActive && info.email) {
             const displayLabel = info.label || info.email.split('@')[0];
             statusBarItem.text = `$(account) [${displayLabel}] ${info.email}`;
@@ -209,7 +43,7 @@ async function updateStatusBar() {
                 `* **Active Account:** \`${info.email}\`\n` +
                 `* **Profile Label:** \`${displayLabel}\`\n` +
                 `* **Vault Status:** ${info.isSaved ? '✅ Saved in Vault' : '⚠️ Unsaved Session'}\n` +
-                `* **Environment:** Synced across IDE, Desktop 2.0 & CLI\n\n` +
+                `* **Storage:** Synced across IDE, Antigravity 2.0 & CLI\n\n` +
                 `*(Click to switch accounts, add new, or rename profile)*`
             );
         } else {
@@ -228,16 +62,19 @@ async function updateStatusBar() {
     }
 }
 
+/**
+ * Show the account switcher QuickPick menu
+ */
 async function showAccountSwitcherMenu() {
     try {
         const activeInfo = await getActiveAccountInfo();
-        const profiles = loadProfiles();
+        const profiles = tokenManager.loadProfiles();
         const items = [];
 
         // 1. Saved Accounts Section
         const savedList = Object.values(profiles);
         if (savedList.length > 0) {
-            items.push({ label: 'GOOGLE ACCOUNTS (SAVED)', kind: vscode.QuickPickItemKind.Separator });
+            items.push({ label: 'GOOGLE ACCOUNTS (SAVED IN VAULT)', kind: vscode.QuickPickItemKind.Separator });
             for (const p of savedList) {
                 const isActive = activeInfo.isActive && (activeInfo.email && p.email.toLowerCase() === activeInfo.email.toLowerCase());
                 items.push({
@@ -256,7 +93,7 @@ async function showAccountSwitcherMenu() {
         items.push({ label: 'ACCOUNT ACTIONS', kind: vscode.QuickPickItemKind.Separator });
         items.push({
             label: '$(add) Connect / Sign In to Google Account...',
-            detail: 'Opens browser for Google OAuth. Once complete, automatically reloads and saves.',
+            detail: 'Opens browser for Google OAuth. Once complete, automatically reloads into new session.',
             action: 'login'
         });
 
@@ -284,7 +121,7 @@ async function showAccountSwitcherMenu() {
 
         if (savedList.length > 0) {
             items.push({
-                label: '$(trash) Remove an Account from Switcher...',
+                label: '$(trash) Remove an Account from Vault...',
                 detail: 'Delete an account profile from local storage',
                 action: 'delete'
             });
@@ -337,47 +174,136 @@ async function showAccountSwitcherMenu() {
     }
 }
 
-function cleanDbSessionTokens() {
-    const dbs = getDbPaths();
-    for (const dbPath of dbs) {
-        if (DatabaseSync) {
-            try {
-                const db = new DatabaseSync(dbPath);
-                const stmt = db.prepare('DELETE FROM ItemTable WHERE key = ?');
-                for (const k of AUTH_KEYS) {
-                    if (k !== 'google.google-antigravity') {
-                        stmt.run(k);
-                    }
-                }
-                const row = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.google-antigravity');
-                if (row && row.value) {
-                    try {
-                        const data = JSON.parse(row.value);
-                        if (data['antigravity-storage']) {
-                            delete data['antigravity-storage']['jetski.onboarding.lastLoginUsername'];
-                            delete data['antigravity-storage']['jetski.onboarding.lastLoginIsGcpTos'];
-                            db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run('google.google-antigravity', JSON.stringify(data));
-                        }
-                    } catch {}
-                }
-                db.close();
-            } catch {}
+/**
+ * Switch account to target email: restores DB tokens & token files, then reloads window
+ */
+async function switchAccount(email, label) {
+    const confirm = await vscode.window.showWarningMessage(
+        `Switch to account "[${label}] ${email}"?`,
+        {
+            modal: true,
+            detail: `Antigravity IDE will immediately reload to apply this account across the IDE, Antigravity 2.0 Desktop, and CLI tools.\n\nPlease save all open files before proceeding.`
+        },
+        'Switch & Reload',
+        'Cancel'
+    );
+
+    if (confirm !== 'Switch & Reload') return;
+
+    try {
+        const profiles = tokenManager.loadProfiles();
+        const target = profiles[email];
+        if (!target) {
+            throw new Error(`Account '${email}' not found in saved vault.`);
         }
+
+        // Restore all tokens across SQLite DBs and OAuth files
+        tokenManager.restoreProfile(target);
+
+        // NOTE: We do NOT call 'antigravity.internal.logout' here because that
+        // actively tells the backend server to invalidate the session!
+
+        await updateStatusBar();
+
+        // Reload window to let IDE and language server read restored tokens
+        vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch (err) {
+        vscode.window.showErrorMessage(`Failed to switch account: ${err.message || err}`);
     }
 }
 
+/**
+ * Save active account or rename its friendly label
+ */
+async function saveOrRenameAccount(email, currentLabel) {
+    const activeEmail = email || tokenManager.detectActiveEmail();
+
+    if (!activeEmail) {
+        vscode.window.showErrorMessage('No active Google Account detected to save.');
+        return;
+    }
+
+    const defaultVal = currentLabel && currentLabel !== 'Unsaved' ? currentLabel : activeEmail.split('@')[0];
+    const newLabel = await vscode.window.showInputBox({
+        prompt: `Enter a friendly label for ${activeEmail} (e.g. Personal, Work, Secondary):`,
+        value: defaultVal,
+        ignoreFocusOut: true
+    });
+
+    if (!newLabel || !newLabel.trim()) return;
+
+    try {
+        tokenManager.snapshotActiveAccount(newLabel.trim());
+        await updateStatusBar();
+        vscode.window.showInformationMessage(`Account ${activeEmail} saved as "[${newLabel.trim()}]"!`);
+    } catch (err) {
+        vscode.window.showErrorMessage(`Failed to save account: ${err.message || err}`);
+    }
+}
+
+/**
+ * Connect a new Google Account via OAuth login
+ */
+async function loginNewAccount() {
+    const proceed = await vscode.window.showInformationMessage(
+        'Connect Google Account',
+        {
+            modal: true,
+            detail: 'This will launch your browser for Google OAuth sign-in.\n\nOnce completed in your browser, Antigravity IDE will automatically reload into the new session and prompt you to name the profile.'
+        },
+        'Open Browser & Sign In',
+        'Cancel'
+    );
+
+    if (proceed !== 'Open Browser & Sign In') return;
+
+    try {
+        // Record initial state to detect new token arrival
+        const preLoginEmail = tokenManager.detectActiveEmail();
+
+        // Run Google OAuth login command with progress indicator
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Antigravity: Complete Google Sign-In in your browser window...',
+                cancellable: false
+            },
+            async () => {
+                await vscode.commands.executeCommand('antigravity.internal.loginWithRedirect');
+            }
+        );
+
+        // Verification after OAuth redirect
+        const postLoginEmail = tokenManager.detectActiveEmail();
+        const successMessage = postLoginEmail && postLoginEmail !== preLoginEmail
+            ? `Google authentication successful for ${postLoginEmail}! Reloading Antigravity IDE...`
+            : 'Google authentication successful! Reloading Antigravity IDE...';
+
+        vscode.window.showInformationMessage(successMessage, 'Reload Now');
+
+        // Immediate reload to flush and load new credentials
+        vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch (err) {
+        vscode.window.showErrorMessage(`Google Sign-In failed or was cancelled: ${err.message || err}`);
+    }
+}
+
+/**
+ * Log out of current Google Account
+ */
 async function logoutAccount() {
     const confirm = await vscode.window.showWarningMessage(
         'Log out of the current Google Account session?',
-        { modal: true },
+        { modal: true, detail: 'This will clear all session credentials and reset the language server.' },
         'Log Out',
         'Cancel'
     );
     if (confirm !== 'Log Out') return;
 
     try {
-        cleanDbSessionTokens();
+        tokenManager.clearAllSessionTokens();
 
+        // Explicitly notify backend language server to log out
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');
         } catch {}
@@ -389,18 +315,24 @@ async function logoutAccount() {
     }
 }
 
+/**
+ * Factory reset: clear all saved profiles and session tokens
+ */
 async function clearAllData() {
     const confirm = await vscode.window.showWarningMessage(
         'Are you sure you want to clear all accounts and switcher data?',
-        { modal: true, detail: 'This will wipe all saved profiles and log out completely so you can test from scratch.' },
+        {
+            modal: true,
+            detail: 'This will wipe all saved vault profiles and log out completely so you can start fresh.'
+        },
         'Clear Everything',
         'Cancel'
     );
     if (confirm !== 'Clear Everything') return;
 
     try {
-        saveProfiles({});
-        cleanDbSessionTokens();
+        tokenManager.saveProfiles({});
+        tokenManager.clearAllSessionTokens();
 
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');
@@ -413,114 +345,9 @@ async function clearAllData() {
     }
 }
 
-async function switchAccount(email, label) {
-    const confirm = await vscode.window.showWarningMessage(
-        `Switch to account "[${label}] ${email}"?`,
-        {
-            modal: true,
-            detail: `Antigravity IDE will immediately reload to apply this account across the IDE, Antigravity 2.0 Desktop, and the CLI.\n\nPlease save all open files before proceeding.`
-        },
-        'Switch & Reload',
-        'Cancel'
-    );
-
-    if (confirm !== 'Switch & Reload') return;
-
-    try {
-        const profiles = loadProfiles();
-        const target = profiles[email];
-        if (!target || !target.tokens) {
-            throw new Error(`Account '${email}' has no saved credentials.`);
-        }
-
-        writeTokensToDbs(target.tokens);
-
-        // Notify language server client to reset session
-        try {
-            await vscode.commands.executeCommand('antigravity.internal.logout');
-        } catch {}
-
-        await updateStatusBar();
-
-        vscode.commands.executeCommand('workbench.action.reloadWindow');
-    } catch (err) {
-        vscode.window.showErrorMessage(`Failed to switch account: ${err.message || err}`);
-    }
-}
-
-async function saveOrRenameAccount(email, currentLabel) {
-    const tokens = readCurrentTokens();
-    const actualEmail = email || extractEmail(tokens);
-
-    if (!actualEmail) {
-        vscode.window.showErrorMessage('No active Google Account detected to save.');
-        return;
-    }
-
-    const defaultVal = currentLabel && currentLabel !== 'Unsaved' ? currentLabel : actualEmail.split('@')[0];
-    const newLabel = await vscode.window.showInputBox({
-        prompt: `Enter a friendly label for ${actualEmail} (e.g. Personal, Work, Secondary):`,
-        value: defaultVal,
-        ignoreFocusOut: true
-    });
-
-    if (!newLabel || !newLabel.trim()) return;
-
-    try {
-        const profiles = loadProfiles();
-        profiles[actualEmail] = {
-            email: actualEmail,
-            label: newLabel.trim(),
-            saved_at: new Date().toISOString(),
-            tokens: tokens
-        };
-        saveProfiles(profiles);
-        await updateStatusBar();
-        vscode.window.showInformationMessage(`Account ${actualEmail} saved as "[${newLabel.trim()}]"!`);
-    } catch (err) {
-        vscode.window.showErrorMessage(`Failed to save account: ${err.message || err}`);
-    }
-}
-
-async function loginNewAccount() {
-    const proceed = await vscode.window.showInformationMessage(
-        'Connect Another Google Account',
-        {
-            modal: true,
-            detail: 'This will launch your browser for Google OAuth.\n\nComplete the sign-in in your browser. Once authenticated, Antigravity IDE will automatically reload into the new session and prompt you to name this profile.'
-        },
-        'Open Browser & Sign In',
-        'Cancel'
-    );
-
-    if (proceed !== 'Open Browser & Sign In') return;
-
-    try {
-        // Run Google OAuth login with progress indicator
-        await vscode.window.withProgress(
-            {
-                location: vscode.ProgressLocation.Notification,
-                title: 'Antigravity: Complete Google Sign-In in your browser window...',
-                cancellable: false
-            },
-            async () => {
-                await vscode.commands.executeCommand('antigravity.internal.loginWithRedirect');
-            }
-        );
-
-        // Once the OAuth promise resolves, login has succeeded!
-        vscode.window.showInformationMessage(
-            'Google authentication successful! Reloading Antigravity IDE to activate the new account...',
-            'Reload Now'
-        );
-
-        // Immediate reload to flush and load new credentials
-        vscode.commands.executeCommand('workbench.action.reloadWindow');
-    } catch (err) {
-        vscode.window.showErrorMessage(`Google Sign-In failed or was cancelled: ${err.message || err}`);
-    }
-}
-
+/**
+ * Delete a single account from the vault
+ */
 async function deleteAccount(savedList) {
     const items = savedList.map(p => ({
         label: `[${p.label}] ${p.email}`,
@@ -545,9 +372,9 @@ async function deleteAccount(savedList) {
     if (confirm !== 'Delete') return;
 
     try {
-        const profiles = loadProfiles();
+        const profiles = tokenManager.loadProfiles();
         delete profiles[selected.accountEmail];
-        saveProfiles(profiles);
+        tokenManager.saveProfiles(profiles);
         await updateStatusBar();
         vscode.window.showInformationMessage(`Account ${selected.accountEmail} removed.`);
     } catch (err) {
@@ -555,13 +382,15 @@ async function deleteAccount(savedList) {
     }
 }
 
+/**
+ * Check if the active account is not yet saved in the vault and offer to save it
+ */
 async function checkAndPromptNewAccountOnStartup() {
-    // Check if the currently active account on startup is not yet in the vault
     try {
         const info = await getActiveAccountInfo();
         if (info.email && !info.isSaved) {
             const choice = await vscode.window.showInformationMessage(
-                `Antigravity Account Switcher: New active account detected (${info.email})! Save it to your vault?`,
+                `Antigravity Account Switcher: Active account detected (${info.email})! Save it to your vault?`,
                 'Save Account',
                 'Later'
             );
@@ -570,6 +399,35 @@ async function checkAndPromptNewAccountOnStartup() {
             }
         }
     } catch {}
+}
+
+/**
+ * Start watching token files for login changes
+ */
+function setupTokenFileWatchers(context) {
+    const tokenPaths = tokenManager.getTokenFilePaths();
+    const watchedDirs = new Set();
+
+    for (const p of tokenPaths.cliToken) {
+        watchedDirs.add(path.dirname(p));
+    }
+
+    for (const dir of watchedDirs) {
+        if (fs.existsSync(dir)) {
+            try {
+                const watcher = fs.watch(dir, (eventType, filename) => {
+                    if (filename && filename.includes('token')) {
+                        const currentEmail = tokenManager.detectActiveEmail();
+                        if (currentEmail && currentEmail !== lastKnownEmail) {
+                            updateStatusBar();
+                            checkAndPromptNewAccountOnStartup();
+                        }
+                    }
+                });
+                context.subscriptions.push({ dispose: () => watcher.close() });
+            } catch {}
+        }
+    }
 }
 
 function activate(context) {
@@ -588,6 +446,7 @@ function activate(context) {
     );
 
     updateStatusBar();
+    setupTokenFileWatchers(context);
 
     // Update status bar and check for new logins when IDE window gains focus
     context.subscriptions.push(
@@ -599,14 +458,25 @@ function activate(context) {
         })
     );
 
-    // Check on startup if current account is newly logged in
+    // Initial check on startup
     setTimeout(checkAndPromptNewAccountOnStartup, 1500);
     setTimeout(checkAndPromptNewAccountOnStartup, 4500);
 }
 
-function deactivate() {}
+function deactivate() {
+    if (tokenFileWatcher) {
+        try {
+            tokenFileWatcher.close();
+        } catch {}
+    }
+}
 
 module.exports = {
     activate,
-    deactivate
+    deactivate,
+    getActiveAccountInfo,
+    switchAccount,
+    saveOrRenameAccount,
+    logoutAccount,
+    clearAllData
 };

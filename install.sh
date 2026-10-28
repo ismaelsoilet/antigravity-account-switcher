@@ -15,6 +15,7 @@ echo "[1/3] Installing extension to Windows Antigravity IDE..."
 for target in "$IDE_EXT_DIR" "$IDE_VERSIONED_DIR"; do
     mkdir -p "$target"
     cp "$REPO_DIR/extension.js" "$target/"
+    cp "$REPO_DIR/tokenManager.js" "$target/"
     cp "$REPO_DIR/package.json" "$target/"
     cp "$REPO_DIR/switch.py" "$target/"
     cp "$REPO_DIR/LICENSE" "$target/" 2>/dev/null || true
@@ -26,6 +27,7 @@ echo "[2/3] Installing extension to Antigravity Remote Server (WSL)..."
 for target in "$SERVER_EXT_DIR" "$SERVER_VERSIONED_DIR"; do
     mkdir -p "$target"
     cp "$REPO_DIR/extension.js" "$target/"
+    cp "$REPO_DIR/tokenManager.js" "$target/"
     cp "$REPO_DIR/package.json" "$target/"
     cp "$REPO_DIR/switch.py" "$target/"
     cp "$REPO_DIR/LICENSE" "$target/" 2>/dev/null || true

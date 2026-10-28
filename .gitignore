@@ -4,3 +4,6 @@ node_modules/
 *.vsix
 __pycache__/
 *.pyc
+*profiles*.json
+*-oauth-token
+oauth_creds.json
