@@ -5,6 +5,8 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(grep '"version"' "$REPO_DIR/package.json" | head -n 1 | awk -F'"' '{print $4}')"
 IDE_EXT_DIR="/mnt/c/Users/Ismael/.antigravity-ide/extensions/antigravity-account-switcher"
 IDE_VERSIONED_DIR="/mnt/c/Users/Ismael/.antigravity-ide/extensions/antigravity-community.antigravity-account-switcher-${VERSION}"
+IDE_LEGACY_EXT_DIR="/mnt/c/Users/Ismael/.antigravity/extensions/antigravity-account-switcher"
+IDE_LEGACY_VERSIONED_DIR="/mnt/c/Users/Ismael/.antigravity/extensions/antigravity-community.antigravity-account-switcher-${VERSION}"
 SERVER_EXT_DIR="$HOME/.antigravity-server/extensions/antigravity-account-switcher"
 SERVER_VERSIONED_DIR="$HOME/.antigravity-server/extensions/antigravity-community.antigravity-account-switcher-${VERSION}"
 IDE_SERVER_EXT_DIR="$HOME/.antigravity-ide-server/extensions/antigravity-account-switcher"
@@ -15,7 +17,7 @@ echo "=== Installing Antigravity Account Switcher ==="
 
 # 1. Install to Windows Antigravity IDE (both folder names for maximum compatibility)
 echo "[1/4] Installing extension to Windows Antigravity IDE..."
-for target in "$IDE_EXT_DIR" "$IDE_VERSIONED_DIR"; do
+for target in "$IDE_EXT_DIR" "$IDE_VERSIONED_DIR" "$IDE_LEGACY_EXT_DIR" "$IDE_LEGACY_VERSIONED_DIR"; do
     mkdir -p "$target"
     cp "$REPO_DIR/extension.js" "$target/"
     cp "$REPO_DIR/tokenManager.js" "$target/"
