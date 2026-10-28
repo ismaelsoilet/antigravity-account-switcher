@@ -1,14 +1,29 @@
 {
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
-  "description": "Visual account switcher and profile manager embedded directly in Antigravity IDE and synchronized with Antigravity 2.0 & CLI.",
-  "version": "1.0.0",
+  "description": "Visual multi-account switcher and profile manager embedded directly in Antigravity IDE, synchronized across Antigravity 2.0 Desktop and the CLI.",
+  "version": "1.1.0",
   "publisher": "antigravity-community",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ismaelsoilet/antigravity-account-switcher.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Programming Languages",
+    "AI"
+  ],
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "account",
+    "profile",
+    "switcher",
+    "google-antigravity",
+    "auth"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -23,12 +38,12 @@
       },
       {
         "command": "antigravity-account-switcher.save",
-        "title": "Antigravity: Save Current Account as Profile",
+        "title": "Antigravity: Snapshot Current Session as Profile",
         "category": "Antigravity"
       },
       {
         "command": "antigravity-account-switcher.login",
-        "title": "Antigravity: Log In to Another Google Account",
+        "title": "Antigravity: Sign In to New Google Account",
         "category": "Antigravity"
       }
     ]

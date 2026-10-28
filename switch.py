@@ -22,7 +22,8 @@ AUTH_KEYS = [
     "antigravityUnifiedStateSync.oauthToken",
     "antigravityUnifiedStateSync.userStatus",
     "antigravityUnifiedStateSync.modelCredits",
-    "antigravityAuthStatus"
+    "antigravityAuthStatus",
+    "google.google-antigravity"
 ]
 
 def get_db_paths():
@@ -61,13 +62,36 @@ def set_active_profile_name(name):
     with open(ACTIVE_PROFILE_FILE, "w", encoding="utf-8") as f:
         f.write(name)
 
+def extract_email(tokens):
+    raw = tokens.get("google.google-antigravity")
+    if raw:
+        try:
+            data = json.loads(raw)
+            storage = data.get("antigravity-storage", {})
+            if isinstance(storage, dict):
+                email = storage.get("jetski.onboarding.lastLoginUsername", "")
+                if email:
+                    return email
+        except Exception:
+            pass
+    return ""
+
+def extract_display_name(tokens):
+    raw = tokens.get("antigravityAuthStatus")
+    if raw:
+        try:
+            data = json.loads(raw)
+            return data.get("name", "")
+        except Exception:
+            pass
+    return ""
+
 def read_current_tokens():
     tokens = {}
     db_paths = get_db_paths()
     if not db_paths:
         return tokens
     
-    # Read from the primary IDE DB
     primary_db = db_paths[0]
     try:
         conn = sqlite3.connect(f"file:{primary_db}?mode=ro", uri=True)
@@ -103,15 +127,20 @@ def cmd_save(name):
         print(f"Error: No active Antigravity session found in {IDE_DB_WIN}")
         return 1
     
+    email = extract_email(tokens)
+    display_name = extract_display_name(tokens)
+    
     profiles = load_profiles()
     profiles[name] = {
         "name": name,
+        "email": email,
+        "display_name": display_name,
         "saved_at": datetime.now().isoformat(),
         "tokens": tokens
     }
     save_profiles(profiles)
     set_active_profile_name(name)
-    print(f"Profile '{name}' saved successfully!")
+    print(f"Profile '{name}' ({email or 'No email detected'}) saved successfully!")
     return 0
 
 def cmd_load(name):
@@ -124,7 +153,8 @@ def cmd_load(name):
     tokens = profile.get("tokens", {})
     write_tokens(tokens)
     set_active_profile_name(name)
-    print(f"Switched active account to '{name}'.")
+    email = profile.get("email") or extract_email(tokens)
+    print(f"Switched active account to '{name}' ({email}).")
     return 0
 
 def cmd_list(as_json=False):
@@ -132,29 +162,61 @@ def cmd_list(as_json=False):
     active = get_active_profile_name()
     current_tokens = read_current_tokens()
     curr_oauth = current_tokens.get("antigravityUnifiedStateSync.oauthToken")
+    curr_email = extract_email(current_tokens)
+    curr_display = extract_display_name(current_tokens)
 
     out_list = []
     for name, data in profiles.items():
-        is_active = (name == active)
         token = data.get("tokens", {}).get("antigravityUnifiedStateSync.oauthToken")
+        is_active = False
         if curr_oauth and token and curr_oauth == token:
             is_active = True
-        
+        elif name == active and not curr_oauth:
+            is_active = True
+            
         out_list.append({
             "name": name,
+            "email": data.get("email", ""),
+            "display_name": data.get("display_name", ""),
             "active": is_active,
             "saved_at": data.get("saved_at", "")
         })
 
     if as_json:
-        print(json.dumps({"profiles": out_list, "active": active}))
+        result = {
+            "profiles": out_list,
+            "active": active,
+            "current_email": curr_email,
+            "current_display_name": curr_display
+        }
+        print(json.dumps(result))
     else:
         print("=== Antigravity Saved Profiles ===")
         if not out_list:
             print("  (No profiles saved yet. Use 'switch.py save <name>' to save current session.)")
         for p in out_list:
             status = " [ACTIVE]" if p["active"] else ""
-            print(f"* {p['name']}{status} (Saved: {p['saved_at'][:19]})")
+            email_info = f" ({p['email']})" if p['email'] else ""
+            print(f"* {p['name']}{email_info}{status} - Saved: {p['saved_at'][:19]}")
+    return 0
+
+def cmd_current(as_json=False):
+    current_tokens = read_current_tokens()
+    email = extract_email(current_tokens)
+    name = get_active_profile_name() or "Default"
+    display = extract_display_name(current_tokens)
+
+    if as_json:
+        print(json.dumps({
+            "name": name,
+            "email": email,
+            "display_name": display
+        }))
+    else:
+        if email:
+            print(f"{name} ({email})")
+        else:
+            print(name)
     return 0
 
 def cmd_delete(name):
@@ -187,7 +249,8 @@ def main():
     del_p = subparsers.add_parser("delete", help="Delete a saved profile")
     del_p.add_argument("name", help="Profile name to delete")
 
-    current_p = subparsers.add_parser("current", help="Get active profile")
+    curr_p = subparsers.add_parser("current", help="Get active profile info")
+    curr_p.add_argument("--json", action="store_true", help="Output in JSON format")
 
     args = parser.parse_args()
 
@@ -200,8 +263,7 @@ def main():
     elif args.command == "delete":
         sys.exit(cmd_delete(args.name))
     elif args.command == "current":
-        active = get_active_profile_name() or "Unknown"
-        print(active)
+        sys.exit(cmd_current(as_json=args.json))
     else:
         cmd_list()
 

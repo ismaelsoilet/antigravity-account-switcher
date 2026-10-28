@@ -1,81 +1,106 @@
 # Antigravity Account Switcher
 
-> **Visual Account & Profile Switcher for Google Antigravity (IDE, Desktop 2.0, and CLI)**
+> **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
-An embedded extension and CLI utility that allows developers to seamlessly save, manage, and toggle between multiple Google accounts on the same computer without constant browser re-authentication.
+[![GitHub license](https://img.shields.io/github/license/ismaelsoilet/antigravity-account-switcher)](https://github.com/ismaelsoilet/antigravity-account-switcher)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher)
+
+An embedded extension and CLI utility that allows developers to seamlessly save, manage, and toggle between multiple Google accounts on the same computer without continuous browser re-authentication.
 
 ---
 
-## 💡 Why Google Unified Accounts & What Gets Synced
+## 🌟 What's New & Key Features
+
+* **Live Account Indicator in Status Bar:**  
+  Directly displays your active profile and Google email at the bottom of Antigravity IDE:
+  ```
+  $(account) [Primary] onmultimidiaservice@gmail.com
+  ```
+  *Hovering displays account metadata, user details, and synchronization status.*
+
+* **Safeguarded Account Switching with Confirmation Dialog:**  
+  Prevents accidental switches during active work. Selecting a profile opens a modal confirmation with a reload alert. Upon confirmation, Antigravity IDE immediately applies the session and reloads.
+
+* **Streamlined New Account Flow with Auto-Reload:**  
+  When adding a new Google account:
+  1. Displays an explanatory confirmation dialog.
+  2. Opens Google OAuth in your browser.
+  3. Detects successful sign-in automatically, prompts you to label the profile, and reloads Antigravity IDE with the new session active.
+
+* **Unified Master Controller:**  
+  Switching an account in the IDE automatically updates:
+  * **Antigravity IDE** *(active immediately after reload)*
+  * **Antigravity 2.0 Desktop App** *(active on restart)*
+  * **Terminal CLI (`agy`)** *(active immediately)*
+
+* **Dedicated CLI (`agy-switch`):**  
+  Full terminal control for power users and CI/CD environments.
+
+---
+
+## 💡 Why Did Google Unify Accounts?
 
 In recent updates, Google introduced **Unified State Sync (USS)** (`antigravityUnifiedStateSync`).
 
-### Why Google Did This:
-1. **Eliminating Fragmented Logins:** Previously, developers had to authenticate separately on Antigravity IDE (VS Code fork), Antigravity 2.0 (Electron desktop companion), and the CLI (`agy`).
-2. **Unified Quota & Model Tiers:** Model credit allocations, custom speeds, and feature flags were siloed. With USS, credit status and settings (`uss-tabPreferences`) sync in real-time.
-3. **Single Local Daemon:** Under the hood, all surfaces now communicate with a single local Language Server / agent host (`agy --hub`) pointing to `--app_data_dir=antigravity`.
+1. **Eliminating Fragmented Logins:** Previously, you had to authenticate separately across the IDE, Desktop 2.0, and CLI.
+2. **Unified Quota & Model Tiers:** Model credit allocations (`antigravityUnifiedStateSync.modelCredits`), autocomplete speed, and settings sync across all tools in real-time.
+3. **Single Local Daemon:** Under the hood, all surfaces now communicate with a single local Language Server / agent host (`agy --hub`) pointing to `~/.gemini/antigravity`.
 
 ### Are AI Chats and Sessions Synced Too?
-* **Yes!** All conversation history is stored locally in `~/.gemini/antigravity/conversation_summaries.db` (and `~/.gemini/antigravity/conversations/`).
+* **Yes!** All conversation history is stored locally in `~/.gemini/antigravity/conversation_summaries.db` and the `conversations/` and `brain/` directories.
 * Both Antigravity 2.0 and Antigravity IDE share access to these conversation threads and brain artifacts.
-* **The only difference:**
-  * **In the IDE:** The sidebar filters conversations to show those belonging to the currently open workspace folder.
-  * **In Antigravity 2.0:** Conversations are listed globally across all projects.
-* **Scope:** All synchronization is **local** to your machine (it does not leak to personal cloud sync across different machines unless explicitly using Google Cloud Code Assist workspace sync).
+* **UI Filtering Differences:**
+  * **In Antigravity IDE:** The sidebar chat list automatically filters sessions to only show conversations associated with the currently open workspace folder (`workspace_uris`).
+  * **In Antigravity 2.0 Desktop:** The left sidebar displays conversations globally across all your projects and workspaces.
+* **Cross-App Continuation:** You can start a conversation in the IDE, let the turn finish, and continue it in Antigravity 2.0 or via `agy -c` in your terminal.
 
 ---
 
-## 🚀 Features
+## 🛠️ Usage Guide
 
-* **Visual Status Bar Item:** Always visible in Antigravity IDE's bottom bar:
-  `$(account) Antigravity: [Primary] ▾`
-* **1-Click QuickPick Menu:** Click to toggle between saved accounts with instant reload.
-* **Unified Master Controller:** Switching an account in the IDE automatically updates Antigravity 2.0 and the terminal CLI (`agy`).
-* **Profile Vault:** Saves sessions cleanly in `~/.gemini/antigravity_profiles.json`.
-* **Zero Dependencies:** Pure lightweight Node.js + Python standard library.
+### A. From Antigravity IDE (Visual UI)
 
----
-
-## 🛠️ Usage
-
-### From Antigravity IDE (Visual UI)
-1. Look at the bottom-right status bar in Antigravity IDE:
-   Click **`Antigravity: [Profile Name]`**.
-2. **To Save an Account:**
-   * Log into your desired Google account.
-   * Click the status bar → **`Save Current Session as Profile...`** → Enter name (e.g. `Personal` or `Work`).
-3. **To Switch Accounts:**
-   * Click the status bar → Select the target profile.
-   * Click **`Reload Now`** to instantly apply the new session.
-4. **To Add a Second Account:**
+1. Look at the bottom-right status bar in Antigravity IDE:  
+   Click **`Antigravity: [Profile] email@...`**.
+2. **Switching Accounts:**
+   * Select a saved profile.
+   * A confirmation dialog appears explaining that the window will reload.
+   * Click **`Switch & Reload`**.
+3. **Adding a New Account:**
    * Click the status bar → **`Sign In to New Google Account...`**.
-   * Finish the browser OAuth prompt.
-   * Click the status bar → **`Save Current Session as Profile...`** (e.g. `Work`).
+   * Confirm the dialog → Browser opens for Google OAuth.
+   * Complete sign-in in browser → The IDE detects completion, asks you for a profile name, and reloads!
+4. **Snapshotting Current Account:**
+   * Click the status bar → **`Snapshot Current Session as Profile...`** → Enter a label (e.g. `Personal`, `Work`, `ClientA`).
 
-### From the Terminal (`agy-switch` CLI)
+---
+
+### B. From the Terminal (`agy-switch` CLI)
+
 ```bash
 # List all saved profiles and see which is active
 agy-switch list
 
-# Save current session
-agy-switch save "Work"
-
-# Switch active account
-agy-switch load "Personal"
-
-# View current active profile
+# Output active profile information
 agy-switch current
 
-# Delete a profile
+# Save the currently active session as a named profile
+agy-switch save "Work"
+
+# Switch active account across all surfaces
+agy-switch load "Personal"
+
+# Delete a profile from vault
 agy-switch delete "OldAccount"
 ```
 
 ---
 
-## 📦 Installation
+## 📦 Installation & Sync
 
-Run the installer script:
+Run the installer from the repo:
 ```bash
 ./install.sh
 ```
-Then restart or reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
+
+Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
