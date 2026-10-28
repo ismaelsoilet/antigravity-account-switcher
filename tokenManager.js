@@ -172,123 +172,139 @@ function isValidEmail(str) {
 }
 
 /**
- * Cascading active account email detection across all sources:
- * 1. SQLite google.google-antigravity (agy.onboarding.lastLoginUsername, jetski.onboarding.lastLoginUsername, or any email in storage)
- * 2. SQLite antigravityAuthStatus (email)
- * 3. SQLite google.geminicodeassist (chatThreads keys)
- * 4. File token antigravity-cli/antigravity-oauth-token (id_token_email or decoded JWT)
- * 5. File token oauth_creds.json (decoded JWT id_token)
+ * Detect active authentication session strictly from the Single Source of Truth:
+ * The presence of a valid, active OAuth token file with a non-empty access_token or refresh_token.
+ * 
+ * Sources checked (in priority):
+ * 1. antigravity-cli/antigravity-oauth-token
+ * 2. jetski-standalone-oauth-token
+ * 3. oauth_creds.json
+ * 
+ * If no valid active token exists across these files, the session is strictly SIGNED OUT ({ isActive: false, email: '', source: null }).
+ * Historical SQLite onboarding keys (e.g. agy.onboarding.lastLoginUsername) are NEVER
+ * used to infer or synthesize an active session.
  */
-function detectActiveEmail() {
-    // 1. Check SQLite Databases first (direct IDE active session)
-    const dbPaths = getDbPaths();
-    if (DatabaseSync && dbPaths.length > 0) {
-        for (const dbPath of dbPaths) {
-            try {
-                const db = new DatabaseSync(dbPath, { readOnly: true });
-
-                // 1a. Check google.google-antigravity
-                const agRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.google-antigravity');
-                if (agRow && agRow.value) {
-                    try {
-                        const parsed = JSON.parse(agRow.value);
-                        const storage = parsed['antigravity-storage'] || {};
-
-                        // Check known keys first
-                        const explicitCandidates = [
-                            storage['agy.onboarding.lastLoginUsername'],
-                            storage['jetski.onboarding.lastLoginUsername'],
-                            storage['onboarding.lastLoginUsername'],
-                            storage['lastLoginUsername']
-                        ];
-                        for (const cand of explicitCandidates) {
-                            if (isValidEmail(cand)) {
-                                db.close();
-                                return cand.trim();
-                            }
-                        }
-
-                        // Deep scan of all string values in antigravity-storage
-                        for (const val of Object.values(storage)) {
-                            if (isValidEmail(val)) {
-                                db.close();
-                                return String(val).trim();
-                            }
-                        }
-                    } catch {}
-                }
-
-                // 1b. Check antigravityAuthStatus
-                const authRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('antigravityAuthStatus');
-                if (authRow && authRow.value) {
-                    try {
-                        const parsed = JSON.parse(authRow.value);
-                        if (isValidEmail(parsed.email)) {
-                            db.close();
-                            return parsed.email.trim();
-                        }
-                    } catch {}
-                }
-
-                // 1c. Check google.geminicodeassist
-                const gcaRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('google.geminicodeassist');
-                if (gcaRow && gcaRow.value) {
-                    try {
-                        const parsed = JSON.parse(gcaRow.value);
-                        const threads = parsed['geminiCodeAssist.chatThreads'];
-                        if (threads && typeof threads === 'object') {
-                            for (const key of Object.keys(threads)) {
-                                if (isValidEmail(key)) {
-                                    db.close();
-                                    return key.trim();
-                                }
-                            }
-                        }
-                    } catch {}
-                }
-
-                db.close();
-            } catch {}
-        }
-    }
-
-    // 2. Check token files (CLI & standalone tokens)
+function detectActiveSession() {
     const filePaths = getTokenFilePaths();
 
-    // 2a. Check antigravity-cli/antigravity-oauth-token
+    function hasActiveTokens(obj) {
+        if (!obj || typeof obj !== 'object') return false;
+        const inner = obj.token || obj;
+        const hasAccess = typeof inner.access_token === 'string' && inner.access_token.trim().length > 0;
+        const hasRefresh = typeof inner.refresh_token === 'string' && inner.refresh_token.trim().length > 0;
+        return hasAccess || hasRefresh;
+    }
+
+    function extractEmailFromToken(content) {
+        if (!content || typeof content !== 'object') return '';
+        // 1. Direct id_token_email
+        if (isValidEmail(content.id_token_email)) {
+            return content.id_token_email.trim();
+        }
+        // 2. JWT in token.id_token
+        const inner = content.token || content;
+        if (inner.id_token) {
+            const payload = decodeJwtPayload(inner.id_token);
+            if (payload && isValidEmail(payload.email)) {
+                return payload.email.trim();
+            }
+        }
+        // 3. JWT in root id_token
+        if (content.id_token) {
+            const payload = decodeJwtPayload(content.id_token);
+            if (payload && isValidEmail(payload.email)) {
+                return payload.email.trim();
+            }
+        }
+        return '';
+    }
+
+    function getEmailFromDbs() {
+        const dbPaths = getDbPaths();
+        if (DatabaseSync && dbPaths.length > 0) {
+            for (const dbPath of dbPaths) {
+                try {
+                    const db = new DatabaseSync(dbPath, { readOnly: true });
+                    const authRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get('antigravityAuthStatus');
+                    if (authRow && authRow.value) {
+                        try {
+                            const parsed = JSON.parse(authRow.value);
+                            if (isValidEmail(parsed.email)) {
+                                db.close();
+                                return parsed.email.trim();
+                            }
+                        } catch {}
+                    }
+                    db.close();
+                } catch {}
+            }
+        }
+        return '';
+    }
+
+    // 1. CLI Token (antigravity-cli/antigravity-oauth-token)
     for (const p of filePaths.cliToken) {
         try {
             if (fs.existsSync(p)) {
                 const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
-                if (isValidEmail(content.id_token_email)) {
-                    return content.id_token_email.trim();
-                }
-                if (content.token && content.token.id_token) {
-                    const payload = decodeJwtPayload(content.token.id_token);
-                    if (payload && isValidEmail(payload.email)) {
-                        return payload.email.trim();
+                if (hasActiveTokens(content)) {
+                    let email = extractEmailFromToken(content);
+                    if (!email) {
+                        email = getEmailFromDbs();
+                    }
+                    if (isValidEmail(email)) {
+                        return { isActive: true, email: email.trim(), source: p };
                     }
                 }
             }
         } catch {}
     }
 
-    // 2b. Check oauth_creds.json
+    // 2. Standalone Token (jetski-standalone-oauth-token)
+    for (const p of filePaths.standaloneToken) {
+        try {
+            if (fs.existsSync(p)) {
+                const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                if (hasActiveTokens(content)) {
+                    let email = extractEmailFromToken(content);
+                    if (!email) {
+                        email = getEmailFromDbs();
+                    }
+                    if (isValidEmail(email)) {
+                        return { isActive: true, email: email.trim(), source: p };
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    // 3. OAuth Creds (oauth_creds.json)
     for (const p of filePaths.oauthCreds) {
         try {
             if (fs.existsSync(p)) {
-                const creds = JSON.parse(fs.readFileSync(p, 'utf-8'));
-                if (creds.id_token) {
-                    const payload = decodeJwtPayload(creds.id_token);
-                    if (payload && isValidEmail(payload.email)) {
-                        return payload.email.trim();
+                const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                if (hasActiveTokens(content)) {
+                    let email = extractEmailFromToken(content);
+                    if (!email) {
+                        email = getEmailFromDbs();
+                    }
+                    if (isValidEmail(email)) {
+                        return { isActive: true, email: email.trim(), source: p };
                     }
                 }
             }
         } catch {}
     }
 
-    return '';
+    // Strictly signed out if no valid token file exists
+    return { isActive: false, email: '', source: null };
+}
+
+/**
+ * Returns active email address if an active session exists, or empty string if signed out
+ */
+function detectActiveEmail() {
+    return detectActiveSession().email;
 }
 
 /**
@@ -423,9 +439,10 @@ function readCurrentFileTokens() {
  * Supports manual email fallback if provided by user.
  */
 function snapshotActiveAccount(customLabel, manualEmail) {
-    const email = (manualEmail && manualEmail.trim()) || detectActiveEmail();
+    const session = detectActiveSession();
+    const email = (manualEmail && manualEmail.trim()) || session.email;
     if (!email || !isValidEmail(email)) {
-        throw new Error('No valid Google Account email provided or detected.');
+        throw new Error('No active Antigravity session detected. Please sign in to Antigravity before saving.');
     }
 
     const cleanEmail = email.trim();
@@ -616,6 +633,8 @@ function clearAllSessionTokens() {
                         if (data['antigravity-storage']) {
                             delete data['antigravity-storage']['agy.onboarding.lastLoginUsername'];
                             delete data['antigravity-storage']['jetski.onboarding.lastLoginUsername'];
+                            delete data['antigravity-storage']['onboarding.lastLoginUsername'];
+                            delete data['antigravity-storage']['lastLoginUsername'];
                             delete data['antigravity-storage']['agy.onboarding.lastLoginIsGcpTos'];
                             delete data['antigravity-storage']['jetski.onboarding.lastLoginIsGcpTos'];
                             db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run('google.google-antigravity', JSON.stringify(data));
@@ -650,6 +669,7 @@ module.exports = {
     getDbPaths,
     getProfilesFilePaths,
     decodeJwtPayload,
+    detectActiveSession,
     detectActiveEmail,
     loadProfiles,
     saveProfiles,

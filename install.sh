@@ -2,12 +2,13 @@
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="$(grep '"version"' "$REPO_DIR/package.json" | head -n 1 | awk -F'"' '{print $4}')"
 IDE_EXT_DIR="/mnt/c/Users/Ismael/.antigravity-ide/extensions/antigravity-account-switcher"
-IDE_VERSIONED_DIR="/mnt/c/Users/Ismael/.antigravity-ide/extensions/antigravity-community.antigravity-account-switcher-1.4.0"
+IDE_VERSIONED_DIR="/mnt/c/Users/Ismael/.antigravity-ide/extensions/antigravity-community.antigravity-account-switcher-${VERSION}"
 SERVER_EXT_DIR="$HOME/.antigravity-server/extensions/antigravity-account-switcher"
-SERVER_VERSIONED_DIR="$HOME/.antigravity-server/extensions/antigravity-community.antigravity-account-switcher-1.4.0"
+SERVER_VERSIONED_DIR="$HOME/.antigravity-server/extensions/antigravity-community.antigravity-account-switcher-${VERSION}"
 IDE_SERVER_EXT_DIR="$HOME/.antigravity-ide-server/extensions/antigravity-account-switcher"
-IDE_SERVER_VERSIONED_DIR="$HOME/.antigravity-ide-server/extensions/antigravity-community.antigravity-account-switcher-1.4.0"
+IDE_SERVER_VERSIONED_DIR="$HOME/.antigravity-ide-server/extensions/antigravity-community.antigravity-account-switcher-${VERSION}"
 BIN_TARGET="$HOME/.local/bin/agy-switch"
 
 echo "=== Installing Antigravity Account Switcher ==="
@@ -44,7 +45,7 @@ chmod +x "$BIN_TARGET"
 
 # 4. Attempt VSIX registration via server CLI if available
 echo "[4/4] Ensuring VSIX registration..."
-VSIX_FILE="$REPO_DIR/antigravity-account-switcher-1.4.0.vsix"
+VSIX_FILE="$(ls -t "$REPO_DIR"/antigravity-account-switcher-*.vsix 2>/dev/null | head -n 1)"
 SERVER_BIN="$(find "$HOME/.antigravity-ide-server/bin" -name "antigravity-ide-server" 2>/dev/null | head -n 1 || true)"
 if [ -n "$SERVER_BIN" ] && [ -x "$SERVER_BIN" ] && [ -f "$VSIX_FILE" ]; then
     "$SERVER_BIN" --install-extension "$VSIX_FILE" --force 2>/dev/null || true

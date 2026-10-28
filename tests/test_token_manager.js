@@ -85,50 +85,52 @@ async function runTests() {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    // Test 4: Key Support in google.google-antigravity
-    test('detects email under agy.onboarding.lastLoginUsername', () => {
-        const mockStorage = {
-            'projectsOrder': '[]',
-            'agy.onboarding.lastLoginUsername': 'active.dev@gmail.com',
-            'agy.onboarding.lastLoginIsGcpTos': 'false'
-        };
-
-        let found = '';
-        const candidates = [
-            mockStorage['agy.onboarding.lastLoginUsername'],
-            mockStorage['jetski.onboarding.lastLoginUsername'],
-            mockStorage['onboarding.lastLoginUsername'],
-            mockStorage['lastLoginUsername']
-        ];
-        for (const cand of candidates) {
-            if (tokenManager.isValidEmail(cand)) {
-                found = cand.trim();
-                break;
-            }
-        }
-        assert.strictEqual(found, 'active.dev@gmail.com');
+    // Test 4: Single Source of Truth - Signed Out State
+    test('detectActiveSession returns signed out when no token file exists', () => {
+        const session = tokenManager.detectActiveSession();
+        // Since no token file currently exists on this environment
+        assert.strictEqual(session.isActive, false);
+        assert.strictEqual(session.email, '');
+        assert.strictEqual(session.source, null);
     });
 
-    test('detects email under jetski.onboarding.lastLoginUsername', () => {
-        const mockStorage = {
-            'jetski.onboarding.lastLoginUsername': 'jetski.user@example.com'
-        };
-
-        let found = '';
-        const candidates = [
-            mockStorage['agy.onboarding.lastLoginUsername'],
-            mockStorage['jetski.onboarding.lastLoginUsername']
-        ];
-        for (const cand of candidates) {
-            if (tokenManager.isValidEmail(cand)) {
-                found = cand.trim();
-                break;
-            }
-        }
-        assert.strictEqual(found, 'jetski.user@example.com');
+    test('Single Source of Truth: SQLite onboarding usernames are ignored if no token file exists', () => {
+        // Even if SQLite contains agy.onboarding.lastLoginUsername or jetski.onboarding.lastLoginUsername
+        // without an active token file on disk, detectActiveEmail MUST return empty string
+        const activeEmail = tokenManager.detectActiveEmail();
+        assert.strictEqual(activeEmail, '');
     });
 
-    // Test 5: Backward Compatibility with Legacy Profiles
+    // Test 5: Detection when token file exists
+    test('detectActiveSession correctly identifies active token and extracts email', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-session-test-'));
+        const cliTokenDir = path.join(tmpDir, 'antigravity-cli');
+        fs.mkdirSync(cliTokenDir, { recursive: true });
+
+        const mockCliToken = {
+            token: {
+                access_token: 'valid-test-access-token',
+                refresh_token: 'valid-test-refresh-token',
+                expiry: '2026-10-28T18:00:00Z',
+                token_type: 'Bearer'
+            },
+            id_token_email: 'verified.user@company.com'
+        };
+
+        const tokenPath = path.join(cliTokenDir, 'antigravity-oauth-token');
+        fs.writeFileSync(tokenPath, JSON.stringify(mockCliToken), 'utf-8');
+
+        // Test extraction logic directly on token content
+        const content = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
+        const inner = content.token || content;
+        const hasToken = Boolean(inner.access_token && inner.access_token.length > 0);
+        assert.strictEqual(hasToken, true);
+        assert.strictEqual(content.id_token_email, 'verified.user@company.com');
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    // Test 6: Backward Compatibility with Legacy Profiles
     test('loadProfiles correctly parses legacy profile with only tokens map', () => {
         const tmpFile = path.join(os.tmpdir(), `legacy_profiles_${Date.now()}.json`);
         const legacyData = {

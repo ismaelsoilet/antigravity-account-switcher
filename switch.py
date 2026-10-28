@@ -68,106 +68,117 @@ def decode_jwt_payload(jwt_str):
     except Exception:
         return None
 
-def detect_active_email():
+def detect_active_session():
     """
-    Cascading detection of active account email across all databases and token files
+    Detect active authentication session strictly from the Single Source of Truth:
+    The presence of a valid, active OAuth token file with a non-empty access_token or refresh_token.
+    
+    Sources checked:
+    1. antigravity-cli/antigravity-oauth-token
+    2. jetski-standalone-oauth-token
+    3. oauth_creds.json
+    
+    If no valid active token exists across these files, the session is strictly SIGNED OUT (is_active=False).
+    Historical SQLite onboarding keys (e.g. agy.onboarding.lastLoginUsername) are NEVER
+    used to infer an active session.
     """
-    # 1. Check SQLite Databases
-    for db_path in get_db_paths():
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            cur = conn.cursor()
-
-            # 1a. google.google-antigravity
-            cur.execute("SELECT value FROM ItemTable WHERE key = 'google.google-antigravity'")
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0])
-                    storage = data.get("antigravity-storage", {})
-                    if isinstance(storage, dict):
-                        candidates = [
-                            storage.get("agy.onboarding.lastLoginUsername"),
-                            storage.get("jetski.onboarding.lastLoginUsername"),
-                            storage.get("onboarding.lastLoginUsername"),
-                            storage.get("lastLoginUsername")
-                        ]
-                        for cand in candidates:
-                            if is_valid_email(cand):
-                                conn.close()
-                                return cand.strip()
-
-                        for val in storage.values():
-                            if is_valid_email(val):
-                                conn.close()
-                                return str(val).strip()
-                except Exception:
-                    pass
-
-            # 1b. antigravityAuthStatus
-            cur.execute("SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus'")
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0])
-                    em = data.get("email")
-                    if is_valid_email(em):
-                        conn.close()
-                        return em.strip()
-                except Exception:
-                    pass
-
-            # 1c. google.geminicodeassist
-            cur.execute("SELECT value FROM ItemTable WHERE key = 'google.geminicodeassist'")
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    data = json.loads(row[0])
-                    threads = data.get("geminiCodeAssist.chatThreads", {})
-                    if isinstance(threads, dict):
-                        for k in threads.keys():
-                            if is_valid_email(k):
-                                conn.close()
-                                return k.strip()
-                except Exception:
-                    pass
-
-            conn.close()
-        except Exception:
-            pass
-
-    # 2. Check token files
     files = get_token_file_paths()
+
+    def has_active_token(obj):
+        if not isinstance(obj, dict):
+            return False
+        inner = obj.get("token") if isinstance(obj.get("token"), dict) else obj
+        acc = inner.get("access_token")
+        ref = inner.get("refresh_token")
+        return bool((acc and isinstance(acc, str) and acc.strip()) or (ref and isinstance(ref, str) and ref.strip()))
+
+    def extract_email(content):
+        if not isinstance(content, dict):
+            return ""
+        # 1. Direct id_token_email
+        em = content.get("id_token_email")
+        if is_valid_email(em):
+            return em.strip()
+        # 2. JWT in token.id_token
+        inner = content.get("token") if isinstance(content.get("token"), dict) else content
+        id_tok = inner.get("id_token")
+        if id_tok:
+            payload = decode_jwt_payload(id_tok)
+            if payload and is_valid_email(payload.get("email")):
+                return payload["email"].strip()
+        # 3. Root id_token
+        root_id = content.get("id_token")
+        if root_id:
+            payload = decode_jwt_payload(root_id)
+            if payload and is_valid_email(payload.get("email")):
+                return payload["email"].strip()
+        return ""
+
+    def get_email_from_dbs():
+        for db_path in get_db_paths():
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus'")
+                row = cur.fetchone()
+                if row and row[0]:
+                    try:
+                        data = json.loads(row[0])
+                        em = data.get("email")
+                        if is_valid_email(em):
+                            conn.close()
+                            return em.strip()
+                    except Exception:
+                        pass
+                conn.close()
+            except Exception:
+                pass
+        return ""
+
+    # 1. CLI token (antigravity-cli/antigravity-oauth-token)
     for p in files["cli_token"]:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    em = data.get("id_token_email")
-                    if is_valid_email(em):
-                        return em.strip()
-                    id_tok = data.get("token", {}).get("id_token")
-                    if id_tok:
-                        payload = decode_jwt_payload(id_tok)
-                        if payload and is_valid_email(payload.get("email")):
-                            return payload["email"].strip()
+                    if has_active_token(data):
+                        em = extract_email(data) or get_email_from_dbs()
+                        if is_valid_email(em):
+                            return {"is_active": True, "email": em.strip(), "source": p}
             except Exception:
                 pass
 
+    # 2. Standalone token (jetski-standalone-oauth-token)
+    for p in files["standalone_token"]:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if has_active_token(data):
+                        em = extract_email(data) or get_email_from_dbs()
+                        if is_valid_email(em):
+                            return {"is_active": True, "email": em.strip(), "source": p}
+            except Exception:
+                pass
+
+    # 3. OAuth creds (oauth_creds.json)
     for p in files["oauth_creds"]:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    id_tok = data.get("id_token")
-                    if id_tok:
-                        payload = decode_jwt_payload(id_tok)
-                        if payload and is_valid_email(payload.get("email")):
-                            return payload["email"].strip()
+                    if has_active_token(data):
+                        em = extract_email(data) or get_email_from_dbs()
+                        if is_valid_email(em):
+                            return {"is_active": True, "email": em.strip(), "source": p}
             except Exception:
                 pass
 
-    return ""
+    # Strictly signed out
+    return {"is_active": False, "email": "", "source": None}
+
+def detect_active_email():
+    return detect_active_session()["email"]
 
 def load_profiles():
     targets = get_profiles_file_paths()
@@ -486,9 +497,7 @@ def cmd_current(as_json=False):
             print("[No Account] (Signed Out)")
     return 0
 
-def cmd_clear():
-    save_profiles({})
-
+def clear_session_tokens():
     auth_keys = [
         "antigravityUnifiedStateSync.oauthToken",
         "antigravityUnifiedStateSync.userStatus",
@@ -511,6 +520,8 @@ def cmd_clear():
                     if "antigravity-storage" in data:
                         data["antigravity-storage"].pop("agy.onboarding.lastLoginUsername", None)
                         data["antigravity-storage"].pop("jetski.onboarding.lastLoginUsername", None)
+                        data["antigravity-storage"].pop("onboarding.lastLoginUsername", None)
+                        data["antigravity-storage"].pop("lastLoginUsername", None)
                         data["antigravity-storage"].pop("agy.onboarding.lastLoginIsGcpTos", None)
                         data["antigravity-storage"].pop("jetski.onboarding.lastLoginIsGcpTos", None)
                         cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('google.google-antigravity', ?)", (json.dumps(data),))
@@ -530,6 +541,14 @@ def cmd_clear():
             except Exception:
                 pass
 
+def cmd_logout():
+    clear_session_tokens()
+    print("Logged out of Antigravity session. Tokens removed.")
+    return 0
+
+def cmd_clear():
+    save_profiles({})
+    clear_session_tokens()
     print("All profiles and active sessions cleared successfully!")
     return 0
 
@@ -565,6 +584,8 @@ def main():
     del_p = subparsers.add_parser("delete", help="Remove an account from vault")
     del_p.add_argument("query", help="Email or label to delete")
 
+    logout_p = subparsers.add_parser("logout", help="Log out active session and clear tokens")
+
     clear_p = subparsers.add_parser("clear", help="Clear all profiles and sessions")
 
     args = parser.parse_args()
@@ -579,6 +600,8 @@ def main():
         sys.exit(cmd_current(as_json=args.json))
     elif args.command == "delete":
         sys.exit(cmd_delete(args.query))
+    elif args.command == "logout":
+        sys.exit(cmd_logout())
     elif args.command == "clear":
         sys.exit(cmd_clear())
     else:

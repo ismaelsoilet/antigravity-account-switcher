@@ -45,6 +45,15 @@ class TestSwitchCLI(unittest.TestCase):
             data = json.load(f)
             self.assertEqual(data.get("id_token_email"), "active.engineer@example.com")
 
+    def test_single_source_of_truth_signed_out(self):
+        from switch import detect_active_session, detect_active_email
+        # With no token files present in the active environment
+        session = detect_active_session()
+        self.assertFalse(session["is_active"])
+        self.assertEqual(session["email"], "")
+        self.assertIsNone(session["source"])
+        self.assertEqual(detect_active_email(), "")
+
     def test_profile_roundtrip(self):
         profiles_file = os.path.join(self.gemini_dir, "antigravity_profiles.json")
         profiles = {

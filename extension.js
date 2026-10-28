@@ -10,18 +10,18 @@ let lastKnownEmail = '';
  * Get active account information for UI and menus
  */
 async function getActiveAccountInfo() {
-    const email = tokenManager.detectActiveEmail();
+    const session = tokenManager.detectActiveSession();
     const profiles = tokenManager.loadProfiles();
 
     let matched = null;
-    if (email && profiles[email]) {
-        matched = profiles[email];
+    if (session.isActive && session.email && profiles[session.email]) {
+        matched = profiles[session.email];
     }
 
     return {
-        isActive: Boolean(email),
-        email: email || '',
-        label: matched ? matched.label : (email ? email.split('@')[0] : 'No Account'),
+        isActive: session.isActive && Boolean(session.email),
+        email: session.email || '',
+        label: matched ? matched.label : (session.email ? session.email.split('@')[0] : 'No Account'),
         isSaved: Boolean(matched)
     };
 }
@@ -55,7 +55,7 @@ async function updateStatusBar() {
         }
         statusBarItem.show();
     } catch {
-        statusBarItem.text = `$(account) [No Account]`;
+        statusBarItem.text = `$(account) [No Account] Sign In`;
         statusBarItem.tooltip = `Click to connect Google account`;
         statusBarItem.show();
     }
