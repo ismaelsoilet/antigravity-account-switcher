@@ -1,0 +1,36 @@
+{
+  "name": "antigravity-account-switcher",
+  "displayName": "Antigravity Account Switcher",
+  "description": "Visual account switcher and profile manager embedded directly in Antigravity IDE and synchronized with Antigravity 2.0 & CLI.",
+  "version": "1.0.0",
+  "publisher": "antigravity-community",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravity-account-switcher.switch",
+        "title": "Antigravity: Switch Account / Profile",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-account-switcher.save",
+        "title": "Antigravity: Save Current Account as Profile",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-account-switcher.login",
+        "title": "Antigravity: Log In to Another Google Account",
+        "category": "Antigravity"
+      }
+    ]
+  }
+}
