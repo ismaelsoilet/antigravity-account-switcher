@@ -3,7 +3,7 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.7.0-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
 
 An embedded extension and CLI utility that allows developers to seamlessly save, manage, and toggle between multiple Google accounts on the same computer without continuous browser re-authentication or session conflicts.
@@ -30,10 +30,22 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
   When adding a new Google account:
   1. Displays an explanatory confirmation dialog.
   2. Opens Google OAuth in your default browser.
-  3. Detects authentication completion automatically, prompts you to label the profile, and reloads Antigravity IDE with the new session active.
+  3. Waits for authentication, offers **Save Profile & Reload**, and reloads only after the new token is detected.
 
 * **Strict Session Gating (Zero Phantom Accounts):**  
-  Accurately validates active OAuth tokens before extracting account identities. Never displays stale or historical accounts when logged out.
+  Validates that a token is usable (a non-expired access token or a refresh token) and never infers a session from historical SQLite onboarding keys. Manual registration only works while a real OAuth token exists and the email matches the token owner.
+
+* **Deterministic Switching (No Stale Sessions):**  
+  Before restoring a profile, the switcher clears auth keys and token files that are not part of that profile, so the IDE, Desktop and CLI cannot keep authenticating as the previous account.
+
+* **Canonical Vault Format:**  
+  Profiles saved by the CLI (`switch.py`) and the extension (`tokenManager.js`) use the same normalized format. Legacy `cli_token` / `standalone_token` / `oauth_creds` keys are migrated automatically.
+
+* **Local Vault Hardening:**  
+  The vault and token files are written atomically with `0600` permissions. The previous vault is preserved as `antigravity_profiles.json.bak`, and corrupt vaults are preserved as `.corrupt-<timestamp>.json` instead of being silently discarded.
+
+* **Built-in Diagnostics:**  
+  Run **Antigravity: Show Account Switcher Diagnostics** or `agy-switch diagnostics` to print detected database paths, token paths, runtime support and vault warnings.
 
 * **Dual-Host Support (Windows & WSL Remote Workspaces):**  
   Configured with `"extensionKind": ["ui", "workspace"]` to function smoothly whether working on local Windows folders or remote WSL (`wsl+ubuntu`) workspaces.
@@ -55,7 +67,7 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
 Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedStateSync`) across its desktop surfaces:
 1. **Unified Authentication:** Credentials, model quotas (`antigravityUnifiedStateSync.modelCredits`), and preferences are stored in the application's global storage database (`state.vscdb`).
 2. **Shared Local Daemon:** Antigravity IDE, Antigravity 2.0 Desktop, and the CLI share a local language server daemon.
-3. **Session Vault:** The switcher maintains an isolated, encrypted profile vault (`antigravity_profiles.json`) containing token sets keyed strictly by Google email. When switching, it atomically updates the local SQLite storage tables and notifies the language server client.
+3. **Session Vault:** The switcher stores profiles in `antigravity_profiles.json`, keyed by Google email and protected by owner-only permissions (`0600`). Writes are atomic and keep a `.bak` of the previous vault. The vault is **not encrypted**; it relies on filesystem permissions. When switching, the extension replaces the SQLite auth keys and OAuth token files, removes any stale store that does not belong to the target profile, and then reloads the window.
 
 ### Conversation & Chat Sync
 * Conversation history is stored in local SQLite databases (`conversation_summaries.db`).
@@ -90,8 +102,11 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 5. **Logging Out:**
    * Click **`Log Out Current Account...`** to disconnect the session without deleting your saved profiles.
 
-6. **Resetting Data:**
+6. **Resetting Data:**  
    * Click **`Reset / Clear All Switcher Data...`** to perform a clean factory reset of the vault and session data.
+
+7. **Diagnostics:**  
+   * Click **`Show Diagnostics`** to print paths, runtime support and vault warnings to the "Antigravity Account Switcher" output channel.
 
 ---
 
@@ -117,7 +132,15 @@ agy-switch delete "OldProfile"
 
 # Factory reset: clear all profiles and active session tokens
 agy-switch clear
+
+# Inspect paths, runtime support and vault warnings
+agy-switch diagnostics
+
+# Print the CLI version
+agy-switch --version
 ```
+
+`agy-switch save` only snapshots a real active session. If the token has no embedded email, pass `--email user@example.com`; an email that does not match the active token is rejected.
 
 ---
 
@@ -131,10 +154,15 @@ From the cloned repository directory:
 ./install.sh
 ```
 
-This automatically:
-1. Copies the extension to Windows Antigravity IDE (`.antigravity-ide/extensions`).
-2. Copies the extension to the WSL Remote Server (`.antigravity-server/extensions`).
-3. Sets up the `agy-switch` executable shortcut in `~/.local/bin`.
+The installer auto-detects the Windows home (or honours `ANTIGRAVITY_WIN_HOME`), installs into the Windows IDE and WSL server extension folders, removes duplicate/older copies of this extension, and installs the CLI as a real file in `~/.local/bin/agy-switch`.
+
+Preview every action first:
+
+```bash
+./install.sh --dry-run
+```
+
+The directory copy is the actual installation. If you also want the server CLI to register the VSIX, add `--register-vsix` (some Antigravity server builds crash after registering; the copy still works).
 
 Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
@@ -142,8 +170,44 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.4.0.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.7.0.vsix` located in the repository folder.
 4. Reload the window when prompted.
+
+To rebuild the VSIX from source:
+
+```bash
+npm run package
+```
+
+---
+
+## 🔐 Security & Data
+
+* The vault is **not encrypted**. It is protected by filesystem permissions (`0600`) and must never be committed to Git; the repository `.gitignore` already excludes it.
+* The vault stores OAuth access and refresh tokens for every saved account, plus the Antigravity auth status. Treat `~/.gemini/antigravity_profiles.json` as a secret.
+* Before each save, the previous vault is copied to `antigravity_profiles.json.bak`. A corrupt vault is preserved as `antigravity_profiles.json.corrupt-<timestamp>.json` instead of being silently discarded.
+* Switching accounts removes token files and database auth keys that are not present in the target profile. This prevents a stale session from surviving a switch.
+* On Windows/WSL, permission enforcement is best-effort. Do not share the Windows user profile with untrusted local users.
+
+---
+
+## 🧪 Testing
+
+```bash
+npm test
+```
+
+The suite is hermetic: it uses temporary homes and temporary SQLite databases, and never touches your real Antigravity session. The Node tests require `node:sqlite` (Node 22.13+ or Antigravity's bundled runtime); the Python tests use the standard library only.
+
+---
+
+## 🩺 Troubleshooting
+
+* **Status bar says "Email not detected":** a token exists but has no email claim. Use **Register Email for Active Session** (only accepted when it matches the active token) or sign in again.
+* **Database sync unavailable:** the host does not expose `node:sqlite`. Antigravity 1.107+ does; older or embedded hosts may not. Use **Show Diagnostics** to confirm.
+* **A switch reports a failure:** the extension does not reload silently on errors. Check the "Antigravity Account Switcher" output channel; when a write fails, the previous session is left intact.
+* **Recovering a profile:** if a vault was corrupt, inspect the generated `.corrupt-*.json` backup before importing it manually.
+* **The CLI cannot find the databases:** run `agy-switch diagnostics`. On non-WSL Linux/macOS, database paths are discovered only where Antigravity actually stores `state.vscdb`; file-token switching still works.
 
 ---
 

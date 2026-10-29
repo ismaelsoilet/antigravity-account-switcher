@@ -2,7 +2,8 @@
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
   "description": "Visual multi-account switcher and profile manager embedded directly in Antigravity IDE, synchronized across Antigravity 2.0 Desktop and the CLI.",
-  "version": "1.5.0",
+  "version": "1.7.0",
+  "license": "MIT",
   "extensionKind": [
     "workspace",
     "ui"
@@ -13,7 +14,7 @@
     "url": "https://github.com/ismaelsoilet/antigravity-account-switcher.git"
   },
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.100.0"
   },
   "categories": [
     "Other",
@@ -30,9 +31,13 @@
     "auth"
   ],
   "activationEvents": [
-    "*"
+    "onStartupFinished"
   ],
   "main": "./extension.js",
+  "scripts": {
+    "test": "node tests/test_token_manager.js && python3 -m unittest discover -s tests -v",
+    "package": "npx @vscode/vsce package"
+  },
   "contributes": {
     "commands": [
       {
@@ -48,6 +53,11 @@
       {
         "command": "antigravity-account-switcher.login",
         "title": "Antigravity: Sign In to New Google Account",
+        "category": "Antigravity"
+      },
+      {
+        "command": "antigravity-account-switcher.diagnostics",
+        "title": "Antigravity: Show Account Switcher Diagnostics",
         "category": "Antigravity"
       }
     ]

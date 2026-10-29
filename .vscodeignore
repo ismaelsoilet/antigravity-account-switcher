@@ -1,0 +1,9 @@
+.git/**
+.gitignore
+.commandcode/**
+tests/**
+__pycache__/**
+**/*.pyc
+*.vsix
+install.sh
+**/.DS_Store
