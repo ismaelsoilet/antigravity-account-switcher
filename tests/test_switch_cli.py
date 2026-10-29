@@ -102,6 +102,27 @@ class TestSwitchCLI(unittest.TestCase):
         self.assertEqual(session["email"], "mixed.case@example.com")
         self.assertEqual(session["category"], "cliToken")
 
+    def test_prefers_standalone_token_over_conflicting_cli_token(self):
+        self.write_token("cliToken", make_token("stale-cli@example.com", "cli-access", "cli-refresh"))
+        self.write_token("standaloneToken", make_token("ide@example.com", "ide-access", "ide-refresh"))
+        session = switch.detect_active_session()
+        self.assertTrue(session["is_active"])
+        self.assertEqual(session["email"], "ide@example.com")
+        self.assertEqual(session["category"], "standaloneToken")
+
+    def test_snapshot_drops_tokens_from_other_accounts(self):
+        self.write_token("cliToken", make_token("stale-cli@example.com", "cli-access", "cli-refresh"))
+        self.write_token("standaloneToken", make_token("ide@example.com", "ide-access", "ide-refresh"))
+        entry = switch.snapshot_active_account("IDE")
+        self.assertEqual(entry["email"], "ide@example.com")
+        self.assertEqual(entry["file_tokens"]["cliToken"]["token"]["access_token"], "ide-access")
+        self.assertEqual(entry["file_tokens"]["standaloneToken"]["token"]["access_token"], "ide-access")
+        profiles = switch.load_profiles()
+        self.assertEqual(
+            profiles["ide@example.com"]["file_tokens"]["cliToken"]["token"]["access_token"],
+            "ide-access",
+        )
+
     def test_expired_access_token_requires_refresh_token(self):
         self.write_token("cliToken", make_token("expired@example.com", "expired", "", "2020-01-01T00:00:00Z"))
         self.assertFalse(switch.detect_active_session()["is_active"])

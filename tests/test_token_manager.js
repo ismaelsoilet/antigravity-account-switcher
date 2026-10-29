@@ -127,6 +127,29 @@ test('detectActiveSession falls back to the standalone token', async () => {
     assert.strictEqual(session.category, 'standaloneToken');
 });
 
+test('detectActiveSession prefers the IDE standalone token over a conflicting CLI token', async () => {
+    resetState();
+    writeToken('cliToken', makeToken('stale-cli@example.com', 'cli-access', 'cli-refresh'));
+    writeToken('standaloneToken', makeToken('ide@example.com', 'ide-access', 'ide-refresh'));
+    const session = tokenManager.detectActiveSession();
+    assert.strictEqual(session.isActive, true);
+    assert.strictEqual(session.email, 'ide@example.com');
+    assert.strictEqual(session.category, 'standaloneToken');
+});
+
+test('snapshotActiveAccount drops file tokens that belong to another account', async () => {
+    resetState();
+    writeToken('cliToken', makeToken('stale-cli@example.com', 'cli-access', 'cli-refresh'));
+    writeToken('standaloneToken', makeToken('ide@example.com', 'ide-access', 'ide-refresh'));
+
+    const entry = tokenManager.snapshotActiveAccount('IDE');
+    assert.strictEqual(entry.email, 'ide@example.com');
+    assert.strictEqual(entry.file_tokens.cliToken.token.access_token, 'ide-access');
+    assert.strictEqual(entry.file_tokens.standaloneToken.token.access_token, 'ide-access');
+    assert.strictEqual(entry.file_tokens.cliToken.id_token_email, 'ide@example.com');
+    assert.strictEqual(entry.file_tokens.standaloneToken.id_token_email, 'ide@example.com');
+});
+
 test('detectActiveSession understands root-level oauth_creds.json tokens', async () => {
     resetState();
     writeToken('oauthCreds', {

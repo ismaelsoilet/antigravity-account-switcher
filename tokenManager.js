@@ -21,7 +21,7 @@ const DB_AUTH_KEYS = [
 ];
 
 const DB_SESSION_KEYS = DB_AUTH_KEYS.filter(key => key !== 'google.google-antigravity');
-const FILE_CATEGORIES = ['cliToken', 'standaloneToken', 'oauthCreds'];
+const FILE_CATEGORIES = ['standaloneToken', 'cliToken', 'oauthCreds'];
 const FILE_KEY_ALIASES = {
     cliToken: 'cliToken',
     cli_token: 'cliToken',
@@ -578,19 +578,21 @@ function readCurrentDbTokens() {
     return tokens;
 }
 
-function readCurrentFileTokens() {
+function readCurrentFileTokens(activeEmail) {
     const paths = getTokenFilePaths();
     const result = { cliToken: null, standaloneToken: null, oauthCreds: null };
+    const wantedEmail = activeEmail ? normalizeEmail(activeEmail) : '';
 
     for (const category of FILE_CATEGORIES) {
         for (const tokenPath of paths[category]) {
             try {
                 if (!fs.existsSync(tokenPath)) continue;
                 const parsed = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
-                if (parsed && typeof parsed === 'object' && hasTokenStrings(parsed)) {
-                    result[category] = parsed;
-                    break;
-                }
+                if (!parsed || typeof parsed !== 'object' || !hasTokenStrings(parsed)) continue;
+                const tokenEmail = extractEmailFromToken(parsed);
+                if (wantedEmail && tokenEmail && tokenEmail !== wantedEmail) continue;
+                result[category] = parsed;
+                break;
             } catch {
                 // Try the next candidate.
             }
@@ -792,7 +794,7 @@ function snapshotActiveAccount(customLabel, manualEmail) {
     const dbTokens = readCurrentDbTokens();
     if (Object.keys(dbTokens).length > 0) patchDbIdentity(dbTokens, email);
 
-    const fileTokens = readCurrentFileTokens();
+    const fileTokens = readCurrentFileTokens(email);
     if (!fileTokens.cliToken && !fileTokens.standaloneToken && !fileTokens.oauthCreds) {
         throw new Error('No OAuth token files were found for the active session.');
     }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.7.0)
+Antigravity Account Switcher - CLI Core Engine (v1.7.1)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -23,9 +23,9 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
-FILE_CATEGORIES = ("cliToken", "standaloneToken", "oauthCreds")
+FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {
     "cliToken": "cliToken",
     "cli_token": "cliToken",
@@ -564,9 +564,10 @@ def read_current_db_tokens():
     return tokens
 
 
-def read_current_file_tokens():
+def read_current_file_tokens(active_email=None):
     paths = get_token_file_paths()
     result = {category: None for category in FILE_CATEGORIES}
+    wanted_email = normalize_email(active_email) if active_email else ""
 
     for category in FILE_CATEGORIES:
         for token_path in paths[category]:
@@ -575,9 +576,13 @@ def read_current_file_tokens():
             try:
                 with open(token_path, "r", encoding="utf-8") as handle:
                     parsed = json.load(handle)
-                if isinstance(parsed, dict) and _has_token_strings(parsed):
-                    result[category] = parsed
-                    break
+                if not isinstance(parsed, dict) or not _has_token_strings(parsed):
+                    continue
+                token_email = _extract_email(parsed)
+                if wanted_email and token_email and token_email != wanted_email:
+                    continue
+                result[category] = parsed
+                break
             except (OSError, ValueError):
                 continue
 
@@ -760,7 +765,7 @@ def snapshot_active_account(custom_label=None, manual_email=None):
     else:
         warn("No authentication keys were found in the Antigravity database; saving file tokens only.")
 
-    file_tokens = read_current_file_tokens()
+    file_tokens = read_current_file_tokens(email)
     if not any(file_tokens.values()):
         raise RuntimeError("No OAuth token files were found for the active session.")
     _patch_token_email(file_tokens, email)
