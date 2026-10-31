@@ -4,6 +4,26 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.4 — 2026-10-31
+
+### Added
+
+- **Localized reset dates:** the dashboard and status-bar tooltip format dates
+  with the system locale. `pt-BR` uses `dd/mm/yyyy`; `en-US` uses `mm/dd/yyyy`;
+  other locales follow `Intl.DateTimeFormat`.
+- Locale detection order: Windows culture (`Get-Culture`), `LC_ALL`/`LC_TIME`/
+  `LANG`/`LANGUAGE`, Node/Intl, VS Code language, fallback `en-US`.
+
+### Fixed
+
+- Quota header no longer labels a past `updatedAt` as “reset due”; it shows
+  “updated just now / Xm ago / date”.
+
+### Tests
+
+- Dashboard HTML tests cover `pt-BR` (`03/11/2027`) and `en-US`
+  (`11/03/2027`). 58 JavaScript + 60 Python tests passing.
+
 ## 1.8.3 — 2026-10-31
 
 ### Fixed

@@ -4,6 +4,7 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 const tokenManager = require('./tokenManager');
 const { renderDashboardHtml, escapeHtml } = require('./dashboardHtml');
 
@@ -68,6 +69,73 @@ function getProfileEntry(profiles, email) {
     return Object.values(profiles).find(
         profile => profile.email && tokenManager.canonicalEmail(profile.email) === wanted
     ) || null;
+}
+
+let cachedLocale = null;
+let cachedLocaleAt = 0;
+
+function normalizeLocale(value) {
+    const text = String(value || '').trim().replace(/_/g, '-');
+    if (!text) return '';
+    const match = text.match(/^([a-z]{2,3})(?:-([a-z0-9]{2,8}))?/i);
+    if (!match) return '';
+    const language = match[1].toLowerCase();
+    const region = match[2] ? `-${match[2].toUpperCase()}` : '';
+    return `${language}${region}`;
+}
+
+function validateLocale(value) {
+    const locale = normalizeLocale(value);
+    if (!locale) return '';
+    try {
+        return Intl.DateTimeFormat.supportedLocalesOf([locale]).length > 0 ? locale : '';
+    } catch {
+        return '';
+    }
+}
+
+function getLocalizationLocale() {
+    if (cachedLocale !== null && Date.now() - cachedLocaleAt < 60 * 60 * 1000) {
+        return cachedLocale;
+    }
+    const candidates = [];
+    if (process.platform === 'win32' || process.platform === 'linux') {
+        try {
+            candidates.push(execFileSync('powershell.exe', [
+                '-NoProfile',
+                '-Command',
+                '(Get-Culture).Name'
+            ], {
+                encoding: 'utf-8',
+                timeout: 3000,
+                stdio: ['ignore', 'pipe', 'ignore']
+            }));
+        } catch {}
+    }
+    candidates.push(
+        process.env.LC_ALL,
+        process.env.LC_TIME,
+        process.env.LANG,
+        process.env.LANGUAGE
+    );
+    try {
+        candidates.push(Intl.DateTimeFormat().resolvedOptions().locale);
+    } catch {}
+    try {
+        candidates.push(vscode.env.language);
+    } catch {}
+    for (const candidate of candidates) {
+        const first = String(candidate || '').split(':')[0].split('.')[0];
+        const locale = validateLocale(first);
+        if (locale) {
+            cachedLocale = locale;
+            cachedLocaleAt = Date.now();
+            return locale;
+        }
+    }
+    cachedLocale = 'en-US';
+    cachedLocaleAt = Date.now();
+    return cachedLocale;
 }
 
 function getPreferredStore() {
@@ -933,6 +1001,7 @@ class DashboardViewProvider {
             : (session.email ? session.email.split('@')[0] : '');
         return {
             version: tokenManager.VERSION,
+            locale: getLocalizationLocale(),
             active: {
                 email: session.email || '',
                 label: activeLabel,
@@ -1036,9 +1105,17 @@ async function updateQuotaStatusBar() {
         if (geminiFive) parts.push(`5h ${Math.round(geminiFive.remainingPercent)}%`);
         quotaStatusBarItem.text = `${quota.rateLimited ? '$(warning)' : '$(pulse)'} ${parts.join(' · ') || 'Quota'}`;
         const tooltip = new vscode.MarkdownString();
+        const locale = getLocalizationLocale();
         tooltip.appendMarkdown('**Antigravity quota**\n\n');
         for (const model of quota.models) {
-            tooltip.appendMarkdown(`- ${model.label}: ${model.remainingPercent}%${model.exhausted ? ' (exhausted)' : ''}\n`);
+            const reset = model.resetAt
+                ? new Intl.DateTimeFormat(locale, { dateStyle: 'short' }).format(new Date(model.resetAt))
+                : '';
+            tooltip.appendMarkdown(
+                `- ${model.label}: ${model.remainingPercent}%`
+                + `${model.exhausted ? ' (exhausted)' : ''}`
+                + `${reset ? ` · reset ${reset}` : ''}\n`
+            );
         }
         if (quota.rateLimited) {
             tooltip.appendMarkdown('\nA recent 429 / quota signal was found in local logs. This is informational only.\n');

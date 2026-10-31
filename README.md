@@ -7,7 +7,7 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.3-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.8.4-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
 [![CI](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml/badge.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml)
 
@@ -15,11 +15,13 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-### What's new in 1.8.3
+### What's new in 1.8.4
 
-- **Quota bars are now unambiguous:** the empty part of the bar is a neutral track, not the theme's blue progress accent. Green/amber/red only represent the remaining quota.
-- **Status bar and dashboard unchanged:** still read-only and manual.
-- Previous 1.8.2: rich Accounts webview, status-bar quota and onboarding.
+- **Localized dates:** quota reset dates use the system locale. In Brazil (`pt-BR`) they render as `dd/mm/yyyy`; in the US as `mm/dd/yyyy`; other regions follow `Intl.DateTimeFormat`. Detection uses Windows culture (PowerShell), `LC_*`/`LANG`, Node/Intl and the VS Code language, in that order.
+- **Neutral quota track:** the empty part of the bar is not blue; only the remaining quota is green/amber/red.
+- Previous 1.8.3: neutral quota track.
+
+Previous 1.8.2: rich Accounts webview, status-bar quota and onboarding.
 
 ### Product direction
 
@@ -103,7 +105,7 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 
 The switcher is designed for **one account at a time** across all surfaces. With the IDE, Desktop 2.0 and the CLI open at the same time, each process keeps its own copy of the OAuth token and may refresh it independently (the CLI refreshes roughly every hour). The switcher cannot force three running processes to keep three different accounts; any tool that writes the shared token files will win the last write.
 
-What v1.8.3 does instead:
+What v1.8.4 does instead:
 
 * runs a cross-process lock (`~/.gemini/.antigravity-switch.lock`) so two switches cannot interleave;
 * records the expected identity and hashes in `~/.gemini/antigravity_switch_state.json`;
@@ -113,7 +115,7 @@ What v1.8.3 does instead:
 
 The status bar prefers the surface selected by `antigravityAccountSwitcher.preferredStore` (`standaloneToken` by default, or `cliToken`), and always prefers the account most recently applied by the switcher while that store still exists. It never chooses a winner by modification time.
 
-### Identity rules (v1.8.3)
+### Identity rules (v1.8.4)
 
 * Gmail aliases are canonicalized for comparisons: `user+tag@gmail.com` and `u.ser@gmail.com` collapse to the same canonical address. The original email is still used when writing tokens.
 * Each profile stores an `account_id` and a refresh-token fingerprint per token category. Profiles that share a canonical email or a fingerprint are **merged into one** (with `aliases`) instead of creating a second entry.
@@ -125,7 +127,7 @@ The status bar prefers the surface selected by `antigravityAccountSwitcher.prefe
 
 When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Connect / Sign In to Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
 
-To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.3; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
+To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.4; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
 
 ### Reliability Doctor
 
@@ -285,7 +287,7 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.8.3.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.8.4.vsix` located in the repository folder.
 4. Reload the window when prompted.
 
 To rebuild the VSIX from source:

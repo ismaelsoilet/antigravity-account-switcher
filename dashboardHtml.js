@@ -15,7 +15,17 @@ function formatPercent(value) {
     return `${Math.round(number * 10) / 10}%`;
 }
 
-function formatReset(value) {
+function formatDate(value, locale) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return new Intl.DateTimeFormat(locale || undefined, {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(date);
+}
+
+function formatReset(value, locale) {
     if (!value) return '';
     const timestamp = Date.parse(value);
     if (!Number.isFinite(timestamp)) return '';
@@ -26,7 +36,18 @@ function formatReset(value) {
     const hours = Math.floor(minutes / 60);
     const rest = minutes % 60;
     if (hours < 48) return `in ${hours}h${rest ? ` ${rest}m` : ''}`;
-    return `on ${new Date(timestamp).toLocaleDateString()}`;
+    return `on ${formatDate(timestamp, locale)}`;
+}
+
+function formatUpdated(value, locale) {
+    if (!value) return '';
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp)) return '';
+    const elapsed = Math.max(0, Date.now() - timestamp);
+    if (elapsed < 60000) return 'updated just now';
+    if (elapsed < 3600000) return `updated ${Math.round(elapsed / 60000)}m ago`;
+    if (elapsed < 86400000) return `updated ${Math.round(elapsed / 3600000)}h ago`;
+    return `updated ${formatDate(timestamp, locale)}`;
 }
 
 function quotaClass(model) {
@@ -72,7 +93,7 @@ function renderQuota(snapshot) {
             ${models.map(model => {
                 const percent = Math.max(0, Math.min(100, Number(model.remainingPercent) || 0));
                 const klass = quotaClass(model);
-                const reset = model.resetAt ? formatReset(model.resetAt) : '';
+                const reset = model.resetAt ? formatReset(model.resetAt, snapshot.locale) : '';
                 return `
                     <div class="quota-row">
                         <div class="quota-top">
@@ -101,7 +122,7 @@ function renderQuota(snapshot) {
             <div class="section-head">
                 <div>
                     <h2>Quota</h2>
-                    <p class="muted">${quota.live ? 'Live from the official /usage' : 'Cached local quota'}${quota.updatedAt ? ` · ${escapeHtml(formatReset(quota.updatedAt) || 'now')}` : ''}</p>
+                    <p class="muted">${quota.live ? 'Live from the official /usage' : 'Cached local quota'}${quota.updatedAt ? ` · ${escapeHtml(formatUpdated(quota.updatedAt, snapshot.locale))}` : ''}</p>
                 </div>
                 <div class="head-actions">
                     <span class="badge ${quota.live ? 'live' : 'muted'}">${quota.live ? 'LIVE' : 'CACHED'}</span>
