@@ -1,175 +1,268 @@
-# Master Development Plan — Antigravity Account Switcher
+# Master Development Plan — Secure, TOS-Safe Account Switcher
 
-Status: proposed, started 2026-10-31
-Current release: 1.8.0-alpha.1 (icon + read-only keyring detection; keyring write is next)
+Status: active, 2026-10-31
+Current build: `1.8.0-alpha.1` (icon + read-only keyring detection)
+Next code milestone: `1.8.0` (keyring-aware switching)
 
-## TL;DR
+## 1. Product principles
 
-1. **Per-instance isolation is not worth building as a core feature.** Google is
-   unifying the Antigravity *surfaces* (IDE, 2.0 app, CLI, SDK), not the *account
-   model*. Native multi-account is still a requested feature. `--user-data-dir`
-   isolates workspace/window state, but authentication remains machine-wide in
-   the OS keyring (`gemini:antigravity`) and `~/.gemini`. Full isolation requires
-   environment/keyring hacks; Google staff explicitly said that orchestrating
-   several AI Pro accounts through the official CLI violates the Terms of
-   Service. The safe path for parallel work is Gemini API keys/Vertex AI, not
-   account multiplexing.
-2. **The real missing store is the OS keyring.** On this machine the Windows
-   Credential Manager contains `gemini:antigravity` with a live refresh token
-   and the active email. The 1.7.x switcher reads/writes file tokens and
-   `state.vscdb` only. A switch can therefore leave the Windows CLI/app on the
-   old account, which can rewrite the file tokens later. This is a correctness
-   bug and the top priority.
-3. **Next releases:**
-   - `1.8.0-alpha.1` — custom icon + **keyring read-only detection** (this
-     change).
-   - `1.8.0` — keyring snapshot/restore/verify, first-class store, Doctor and
-     rollback coverage.
-   - `1.8.1` — quota/429 read-only + status bar/Activity Bar dashboard.
-   - `1.9.0` — keyring encryption, Open VSX, screenshots, Windows CI hardening.
-   - `2.0-lab` — optional Windows-only isolation proof of concept, feature-flagged,
-     with an explicit ToS warning and a go/no-go gate.
+1. **One active account at a time.** The user chooses an account; the switcher
+   applies it manually. It never runs two subscription accounts in parallel.
+2. **No TOS workarounds.** No account multiplexing, no quota pooling, no proxy,
+   no automatic failover, no auto-approval, no rate-limit bypass. Quota is shown
+   read-only; the user decides when to switch.
+3. **The OS keyring is the source of truth.** File tokens and the IDE database
+   are mirrors. A switch is only complete when every store agrees.
+4. **Security before convenience.** No token material in logs, diagnostics,
+   errors, command lines or analytics. The vault is encrypted or protected by
+   OS facilities; raw tokens exist only in memory and the protected vault.
+5. **Fast and deterministic.** A warm switch should be under 2 seconds on
+   Windows and under 1 second when only files/databases are involved. No
+   process scans on the watcher; no hidden network calls.
 
-## Evidence
+## 2. Scope
 
-### Google direction and account model
+### In scope
 
-- I/O 2026 announced a **unified ecosystem** of Antigravity surfaces: 2.0 app,
-  CLI, SDK, managed agents. It did **not** announce multi-account or per-instance
-  account isolation.
-- Official forum, Feb 2026: Antigravity supports **one active login**; a
-  multi-account feature request was filed with the internal team. No delivery
-  date. A follow-up in May 2026 still asked for news.
-- Official forum, Apr 2026: `--user-data-dir` is for **total isolation of the
-  data directory** (workspace/window state); `--profile` manages profiles inside
-  one data directory. It does not isolate the OS keyring or the machine-wide
-  `~/.gemini` auth.
-- Official support, Oct 2026: manually switching between two independently paid
-  AI Pro accounts is allowed; alternatives are credits or a larger plan.
-- Official staff, Sep 2026: using an orchestrator to multiplex several AI Pro
-  accounts through the official `agy` CLI **violates the Terms of Service**;
-  use the Gemini Developer API or Vertex AI for high-capacity needs.
-- Official changelog through 2.28.2 (Oct 29, 2026): no native multi-account or
-  profile-switching feature. The roadmap is agents, plugins, browser, enterprise.
+- Manual switching between Google accounts the user legitimately owns.
+- Windows Credential Manager, WSL/Windows file tokens and IDE database identity.
+- Secure profile vault, snapshot/restore, verification, rollback and diagnostics.
+- Read-only quota/reset display and a clear "quota exhausted" warning.
+- A fast dashboard/status bar for profiles, conflicts and Doctor results.
+- Distribution, CI, regression tests and Windows/WSL reliability.
 
-### Technical reality
+### Explicit non-goals
 
-- Antigravity CLI: one keyring entry per machine, service `gemini`, account
-  `antigravity`; no `--profile`, `--data-dir`, or `--auth-store`. Issues asking
-  for a `CLAUDE_CONFIG_DIR`/`CODEX_HOME` equivalent are open.
-- Windows: `language_server.exe` uses the Credential Manager entry
-  `gemini:antigravity`, and has `shouldBypassKeyring`/`SSH_CONNECTION` logic to
-  fall back to file storage. `--user-data-dir` alone does not change that.
-- Local confirmation (2026-10-31): `cmdkey /list` shows
-  `LegacyGeneric:target=gemini:antigravity`; the credential contains
-  `access_token`, `refresh_token`, `id_token_email`,
-  `id_token_email=onlinedistribuidora.servicos@gmail.com` and a refresh token.
-  The checker never prints token values.
-- Existing isolation projects confirm the difficulty:
-  - MultiGravity (Windows, 8 stars): `--user-data-dir` + `USERPROFILE` override
-    + `SSH_CONNECTION` keyring bypass + NTFS junctions for shared chats.
-  - Antigravity Cluster (Linux, 3 stars): bubblewrap, DBus keyring proxy,
-    `xdg-open` wrapper, `language_server` wrapper rewriting `--app_data_dir`,
-    migration resets and a CDP auto-approval injector. High maintenance, high
-    blast radius.
-- The CLI's one genuinely per-process credential is a **Gemini API key** from
-  the environment; that is the supported way to run agents concurrently.
+- Running three accounts simultaneously.
+- Per-instance isolation, `--user-data-dir` launchers or keyring bypass.
+- Quota pooling, automatic rotation, failover or "unlimited quota" behavior.
+- Proxy/gateway interception of model traffic.
+- Auto-approving agent permissions or "turbo mode" injection.
+- Modifying Antigravity binaries or bypassing its authentication UI.
+- Using an account the user does not own or control.
 
-## Decision: isolation
+## 3. Architecture
 
-**No-go for core per-instance isolation.** It is technically possible on
-Windows with environment and keyring tricks, but it is fragile, machine-wide,
-against the stated ToS when used to multiplex subscriptions, and not a durable
-product moat. The ecosystem is moving toward unified surfaces, which makes
-single-account assumptions stronger, not weaker.
+### 3.1 Auth stores
 
-**Conditional lab spike only (2.0-lab):** Windows-only, opt-in, no quota
-pooling, no proxy, no auto-approval, explicit warning that Google may change
-the behavior and that multiplexing subscriptions through the CLI is not
-supported. Gate: two weeks of real use across Antigravity updates, no auth
-corruption, no terms issue. Otherwise archive it.
+| Store | Location | Role |
+|---|---|---|
+| Windows keyring | Credential Manager `gemini:antigravity` | Authoritative on Windows |
+| Linux keyring | Secret Service `gemini`/`antigravity` | Authoritative on Linux |
+| macOS keyring | Keychain `gemini`/`antigravity` | Authoritative on macOS |
+| Standalone token | `~/.gemini/jetski-standalone-oauth-token` (WSL + Windows) | IDE/Desktop mirror |
+| CLI token | `~/.gemini/antigravity-cli/antigravity-oauth-token` | CLI mirror |
+| IDE database | `state.vscdb` (`antigravityAuthStatus`, onboarding identity) | UI identity |
+| Desktop database | `state.vscdb` (same keys) | UI identity |
 
-## Decision: keyring-aware switching (1.8.0)
+The keyring is read/written through a small provider abstraction. A switch
+writes all available stores, then verifies them. If any store fails, the
+transaction rolls back all stores.
 
-Make the OS keyring a first-class auth store:
+### 3.2 Profile schema (v2)
 
-- Providers:
-  - Windows Credential Manager: `gemini:antigravity` (read/write/delete/verify).
-  - Linux Secret Service: same service/account (read first; write behind a
-    capability check).
-  - macOS Keychain: future.
-- Store record: provider, target, username, email, account id, refresh-token
-  fingerprint, raw JSON (memory/vault only, never logs).
-- Profile schema v2: `keyring`, `keyringFingerprint`, `keyringProvider`,
-  `keyringAvailable`.
-- Switch transaction: back up the current keyring, write files + databases +
-  keyring, verify every store, roll back all three on failure, keep the lock.
-- Detection/diagnostics: include the keyring in `stores`; report
-  `keyring-mismatch`; never print tokens. Doctor warns if the keyring email
-  differs from the active account.
-- `clear`/`reset` removes the keyring entry only after explicit confirmation.
-- Tests: fake provider; Windows CI; integration against a test credential target
-  (`gemini:antigravity.test`), never the real entry.
+```json
+{
+  "email": "user@example.com",
+  "label": "Work",
+  "account_id": "sha256...",
+  "aliases": [],
+  "complete": true,
+  "saved_at": "2026-10-31T...",
+  "fingerprints": {
+    "standaloneToken": "sha256...",
+    "cliToken": "sha256...",
+    "keyring": "sha256..."
+  },
+  "tokens": { "...": "..." },
+  "db_tokens_by_path": { "...": "..." },
+  "keyring": {
+    "provider": "windows-credential-manager",
+    "target": "gemini:antigravity",
+    "username": "antigravity",
+    "email": "user@example.com",
+    "refreshFingerprint": "sha256...",
+    "raw": "{...}"
+  }
+}
+```
 
-## Roadmap
+`raw` is the exact JSON blob accepted by the OS keyring. It is never returned by
+diagnostics or logs; only the redacted metadata is shown.
 
-### 1.8.0-alpha.1 — started
+### 3.3 Switch transaction
 
-- Custom icon (assets/icon.png) and installer asset parity.
-- Read-only keyring detection in diagnostics and Doctor.
-- No keyring writes yet; no profile schema change.
-- Acceptance: `agy-switch diagnostics --json` shows `keyring` with email and
-  token-presence booleans; Doctor warns on a keyring/active mismatch; tests pass.
+1. Acquire the cross-process lock.
+2. Validate the profile: identity, completeness, keyring presence (strict mode).
+3. Back up the current files, database auth keys and keyring blob.
+4. Write files and database identity in a deterministic order.
+5. Write the keyring credential.
+6. Re-read every store and verify email + refresh-token fingerprint.
+7. On any failure, restore files, database and keyring from the backup.
+8. Persist the desired state and release the lock.
+
+The transaction is idempotent: writing the same profile twice is safe.
+
+### 3.4 Security model
+
+- **Vault:** Windows DPAPI (`CryptProtectData`) in 1.9.0; Linux Secret
+  Service/macOS Keychain or encrypted file; until then, `0600` plus a Doctor
+  warning. No plaintext tokens in logs.
+- **Keyring:** OS-protected; the switcher reads/writes only the known target.
+- **Diagnostics:** email, fingerprint prefix (optional), booleans and blob length
+  only. No access/refresh/id token values.
+- **Arguments:** keyring payloads go through stdin, never the command line.
+- **Errors:** redact token-like strings; no stack traces with secrets.
+- **Files:** atomic replace, `0600`, backups, no world-readable permissions.
+
+### 3.5 Performance model
+
+- Warm switch target: **p95 < 2.0 s** on Windows (including one keyring write
+  and verification).
+- File/DB-only switch: **p95 < 1.0 s**.
+- Status bar refresh: < 150 ms; no keyring read on the 5-second watcher poll.
+- Keyring reads cached for 30 s for diagnostics; invalidated after a switch.
+- No process enumeration on switch; running surfaces are only inspected by the
+  explicit Doctor.
+- Independent reads (standalone token, CLI token, database) run in parallel; DB
+  writes remain sequential to preserve SQLite safety.
+- No network calls in the switch path.
+
+## 4. Features
+
+### F1 — Keyring-aware switching (1.8.0, critical)
+
+Read, snapshot, restore, verify and delete the OS keyring credential. This is the
+missing store that explains why a file/DB switch can be undone by the Windows
+app or CLI. Detailed spec: [SPEC-1.8.0-KEYRING.md](SPEC-1.8.0-KEYRING.md).
+
+Acceptance: switching changes the keyring email; a restarted Windows CLI/app
+starts on the target account; all stores verify; a forced failure rolls back.
+
+### F2 — Secure vault and token handling (1.9.0)
+
+Encrypt the profile vault at rest with OS facilities (DPAPI/Keychain/Secret
+Service), migrate the existing JSON, and keep a rollback copy. Redact all
+diagnostics. Add a `vault` Doctor check for permissions and encryption status.
+
+### F3 — Fast, verified switch (1.8.0)
+
+Reduce the switch to the minimum writes: skip unchanged stores, use a single
+keyring read/write, avoid `getRunningSurfaces`, cache profile metadata and
+invalidate after the switch. Add a benchmark test with a fake keyring and a
+Windows integration test with a test credential target.
+
+### F4 — Read-only quota and reset display (1.8.1)
+
+Show remaining quota, reset countdown and exhausted models from the official
+local data/API. A quota warning is informational only; it never switches accounts
+automatically. No proxy, no rotation, no failover.
+
+### F5 — Activity Bar dashboard (1.8.1)
+
+A sidebar view with the active account, profile list, one-click manual switch,
+conflicts, Doctor summary and quota. The custom icon is already present. The
+dashboard reads cached data; it does not poll the keyring every few seconds.
+
+### F6 — Doctor and diagnostics (maintained)
+
+Keep the read-only Doctor: running surfaces that predate the last switch,
+duplicate main surfaces, store conflicts, keyring mismatch, permission warnings.
+It never kills processes or changes state.
+
+### F7 — Profiles and UX (maintained)
+
+Canonical Gmail aliases, refresh-token fingerprints, duplicate merge, profile
+self-heal, login/adopt, conflict-aware menu, backup/restore. No silent
+auto-switching.
+
+### F8 — Distribution and quality (continuous)
+
+Ubuntu/Windows CI, fault-injection tests, performance benchmark, Open VSX,
+screenshots/GIF, release notes, reproducible VSIX, prerelease tags.
+
+## 5. Roadmap
+
+### 1.8.0-alpha.1 — done
+
+- Custom icon.
+- Read-only keyring detection in diagnostics/Doctor.
+- `keyring-mismatch` warning.
+- Master plan and test coverage.
 
 ### 1.8.0 — keyring-aware switching
 
-- Keyring provider read/write/delete + verification.
-- Snapshot/detect/restore include the keyring; profiles store it.
-- Atomic multi-store switch with rollback; conflict/Doctor UX.
-- Acceptance: switching accounts changes the Windows Credential Manager email;
-  a subsequent Windows CLI/app start uses the new account; all stores verify;
-  a forced failure rolls back files, DB and keyring.
-- Tests: fake provider + Windows integration test target; no real credential in
-  CI.
+- Keyring provider read/write/delete/verify.
+- Profile schema v2; snapshot/restore/detect/diff include the keyring.
+- Atomic rollback across files + databases + keyring.
+- Strict migration: profiles without keyring are blocked until re-saved.
+- Windows integration test with `gemini:antigravity.test`; no real credential.
+- Acceptance: F1 + F3 targets.
 
-### 1.8.1 — quota/429 + dashboard
+### 1.8.1 — quota and dashboard
 
-- Read-only quota/reset display from the local quota data/API.
-- Detect 429/quota errors and show a clear status; no automatic account
-  switching by default.
-- Activity Bar view with current account, profiles, conflicts, Doctor and quota.
-- Optional opt-in failover later, only after a separate review.
+- Read-only quota/reset display.
+- Activity Bar dashboard and status bar improvements.
+- No automatic switching.
 
-### 1.9.0 — hardening and distribution
+### 1.9.0 — security and distribution
 
-- Keyring/vault encryption (DPAPI/Keychain/Secret Service) and migration.
-- Open VSX, screenshots/GIF, marketplace metadata, Windows CI.
-- Larger integration suite; release notes.
+- DPAPI/Keychain/Secret Service vault encryption and migration.
+- Open VSX, screenshots, docs, performance hardening.
+- Expanded Windows/WSL integration tests.
 
-### 2.0-lab — optional isolation POC
+### 2.0.0 — polish
 
-- Windows-only launcher with `--user-data-dir`, isolated `USERPROFILE`, keyring
-  bypass, shared-project junctions.
-- Feature flag, explicit ToS warning, no quota pooling, no auto-approval.
-- Go/no-go gate; if no-go, document and remove.
+- Stable API/UX, localization, import/export of encrypted profiles, release
+  automation. No isolation, no quota pooling.
 
-## Non-goals
+## 6. Acceptance criteria
 
-- Proxy/gateway to pool quotas.
-- Auto-approving permissions or "turbo" injection.
-- Bypassing Google rate limits or terms.
-- Full Linux keyring/DBus proxy as a supported feature.
-- Storing raw tokens in logs, diagnostics or the README.
+- Switching accounts updates the OS keyring, all file tokens and both databases.
+- `agy-switch diagnostics` reports the keyring email and `managed: true`.
+- A restarted Windows CLI/app reads the target account.
+- A forced keyring/files/DB failure leaves every store unchanged.
+- No token values appear in logs, diagnostics, errors or command lines.
+- Warm switch p95 < 2 s on Windows; file/DB-only p95 < 1 s.
+- Existing 45 JS + 48 Python tests stay green; new keyring tests pass on
+  Ubuntu and Windows CI.
 
-## Success metrics
+## 7. Test strategy
 
-- Zero auth-store conflicts after a switch + restart.
-- Keyring email equals target account in diagnostics.
-- No token material in logs.
-- Switch rollback passes a fault-injection test.
-- CI green on Ubuntu and Windows; release artifact reproducible.
+- Unit: identity, canonical email, fingerprints, profile merge, conflict
+  classification, redaction, keyring report parsing.
+- Fake provider: snapshot/restore/detect/diff/rollback without touching a real
+  credential.
+- Windows integration: create/read/verify/delete `gemini:antigravity.test`;
+  never the real target.
+- Fault injection: fail keyring write, DB write, file write; assert rollback.
+- Performance: measure the fake-provider transaction and a real Windows keyring
+  round-trip; publish p50/p95.
+- CI: Ubuntu + Windows, syntax, JS, Python; release workflow on tags.
 
-## Sources
+## 8. Migration
+
+Existing profiles do not contain the keyring. In strict mode they are
+incomplete for switching. The user must:
+
+1. Sign in to the account (or keep it active).
+2. Run `agy-switch save` / **Snapshot Current Session**.
+3. Repeat for each account.
+
+This is a one-time migration. The active profile can be captured immediately;
+others require a manual login. The CLI/extension shows the exact instruction.
+
+## 9. Risks
+
+- Keyring API differences across Windows/Linux/macOS.
+- PowerShell startup latency; mitigate with one read/write per switch and a
+  cached read for diagnostics.
+- Token expiry during a switch; verify identity/fingerprint, not only presence.
+- Antigravity updates can change paths/schema; Doctor and tests catch drift.
+- Vault plaintext until 1.9.0; documented and warned in the Doctor.
+- Strict keyring migration adds friction; documented and one-time.
+
+## 10. Sources and evidence
 
 - [Google Antigravity @ I/O 2026](https://antigravity.google/blog/google-io-2026)
 - [Antigravity changelog](https://antigravity.google/docs/changelog)
@@ -177,7 +270,5 @@ Make the OS keyring a first-class auth store:
 - [How do --user-data-dir and --profile work?](https://discuss.ai.google.dev/t/how-do-user-data-dir-and-profile-work/137054)
 - [Feature Request: Multi-Account Support](https://discuss.ai.google.dev/t/feature-request-multi-account-support-work-personal/127162)
 - [Using multiple paid accounts in Antigravity IDE](https://discuss.ai.google.dev/t/using-multiple-paid-accounts-in-antigravity-ide/138027)
-- [One person, several paid accounts: may an orchestrator use agy?](https://discuss.ai.google.dev/t/one-person-several-paid-google-ai-pro-accounts-may-a-local-orchestrator-use-them-with-the-official-agy-cli/185460)
-- [Antigravity CLI keeps one Google login per machine](https://agentsroom.dev/blog/multiple-accounts-antigravity-cli)
-- [MultiGravity](https://github.com/rodolford1112/MultiGravity-Multi-Profile-Manager-for-Antigravity)
-- [Antigravity Cluster](https://github.com/ypatil2006-coder/antigravity-cluster)
+- [Orchestrator + agy CLI ToS answer](https://discuss.ai.google.dev/t/one-person-several-paid-google-ai-pro-accounts-may-a-local-orchestrator-use-them-with-the-official-agy-cli/185460)
+- [Antigravity CLI one login per machine](https://agentsroom.dev/blog/multiple-accounts-antigravity-cli)

@@ -19,10 +19,18 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 - **Custom extension icon:** an original 128×128 PNG (`assets/icon.png`) now identifies the extension in the Antigravity/VS Code Extensions view and the VSIX.
 - **Keyring read-only detection:** diagnostics and the Doctor now read the Windows Credential Manager entry `gemini:antigravity` and show its email/token-presence metadata without printing token material. The keyring is **not written yet**; that is the next 1.8.0 milestone.
-- **Master plan:** see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for the isolation verdict, keyring architecture and roadmap.
+- **Master plan and keyring spec:** see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) and [docs/SPEC-1.8.0-KEYRING.md](docs/SPEC-1.8.0-KEYRING.md) for the TOS-safe roadmap, keyring architecture and acceptance criteria.
 - **Installer parity:** `install.sh` copies `assets/`, `README.md` and `CHANGELOG.md` into directory installs.
 
 Previous 1.7.4: the read-only **Reliability Doctor**, helper-process filtering, Ubuntu/Windows CI and tagged VSIX releases.
+
+### Product direction
+
+The switcher is for **manual switching between accounts you own**, one active
+account at a time. It does **not** run accounts in parallel, pool quotas, proxy
+model traffic, auto-rotate on 429, auto-approve permissions or isolate
+Antigravity instances. Quota display is read-only; the next action is always
+yours. See [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md).
 
 ---
 
@@ -137,8 +145,8 @@ It lists the main Antigravity surfaces (`desktop-wsl`, `ide-wsl`, `desktop-win`,
 whose process started **before** the last switch. A surface that predates the
 switch is still holding the previous refresh token in memory; restart/reload that
 surface (or sign in again) before applying the profile again. The Doctor also
-reports duplicate main surfaces, store conflicts and group/other-readable files
-in the WSL home. It never modifies state.
+reports duplicate main surfaces, store conflicts, keyring/active mismatches and
+group/other-readable files in the WSL home. It never modifies state.
 
 ### Conversation & Chat Sync
 * Conversation history is stored in local SQLite databases (`conversation_summaries.db`).
