@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.7.4)
+Antigravity Account Switcher - CLI Core Engine (v1.8.0-alpha.1)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -26,7 +26,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.7.4"
+VERSION = "1.8.0-alpha.1"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
 FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {
@@ -2158,7 +2158,158 @@ def get_permission_warnings():
     return warnings
 
 
-def get_doctor_report(surfaces=None, preferred_store=None):
+def _is_wsl_environment():
+    if os.name != "posix" or sys.platform != "linux":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="replace") as handle:
+            return "microsoft" in handle.read().lower()
+    except OSError:
+        return False
+
+
+_WINDOWS_KEYRING_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class AgyCredReader {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredRead(string target, uint type, uint flags, out IntPtr credential);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern void CredFree(IntPtr credential);
+}
+"@
+$ptr = [IntPtr]::Zero
+if (-not [AgyCredReader]::CredRead('gemini:antigravity', 1, 0, [ref]$ptr)) {
+    [pscustomobject]@{ Found = $false } | ConvertTo-Json -Compress
+    exit 0
+}
+try {
+    $cred = [Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][AgyCredReader+CREDENTIAL])
+    $bytes = New-Object byte[] $cred.CredentialBlobSize
+    if ($cred.CredentialBlobSize -gt 0 -and $cred.CredentialBlob -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $bytes.Length)
+    }
+    $utf8 = [Text.Encoding]::UTF8.GetString($bytes)
+    $unicode = [Text.Encoding]::Unicode.GetString($bytes)
+    $combined = $utf8 + "\n" + $unicode
+    $emails = [regex]::Matches($combined, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}') |
+        ForEach-Object { $_.Value } | Sort-Object -Unique
+    [pscustomobject]@{
+        Found = $true
+        TargetName = $cred.TargetName
+        UserName = $cred.UserName
+        BlobLength = $cred.CredentialBlobSize
+        Emails = @($emails)
+        HasRefresh = ($combined -match 'refresh')
+        HasAccess = ($combined -match 'access')
+        HasIdToken = ($combined -match 'id_token')
+    } | ConvertTo-Json -Depth 4 -Compress
+}
+finally {
+    [AgyCredReader]::CredFree($ptr)
+}
+'''
+
+
+def parse_keyring_report(payload):
+    found = bool(payload and payload.get("Found"))
+    raw_emails = payload.get("Emails") if payload else None
+    if isinstance(raw_emails, list):
+        emails = raw_emails
+    elif raw_emails:
+        emails = [raw_emails]
+    else:
+        emails = []
+    email = next((value for value in emails if isinstance(value, str) and "@" in value), "")
+    return {
+        "available": found,
+        "provider": "windows-credential-manager",
+        "target": "gemini:antigravity",
+        "username": str(payload.get("UserName") or "antigravity") if payload else "antigravity",
+        "email": email,
+        "emails": emails,
+        "hasRefreshToken": bool(payload and payload.get("HasRefresh")),
+        "hasAccessToken": bool(payload and payload.get("HasAccess")),
+        "hasIdToken": bool(payload and payload.get("HasIdToken")),
+        "blobLength": int(payload.get("BlobLength") or 0) if payload else 0,
+        "managed": False,
+    }
+
+
+def read_windows_keyring():
+    if os.name != "nt" and not _is_wsl_environment():
+        return {
+            "available": False,
+            "provider": "none",
+            "target": "gemini:antigravity",
+            "managed": False,
+            "reason": "unsupported-platform",
+        }
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                _WINDOWS_KEYRING_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {
+                "available": False,
+                "provider": "windows-credential-manager",
+                "target": "gemini:antigravity",
+                "managed": False,
+                "reason": "read-failed",
+            }
+        return parse_keyring_report(json.loads(result.stdout))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {
+            "available": False,
+            "provider": "windows-credential-manager",
+            "target": "gemini:antigravity",
+            "managed": False,
+            "reason": "read-failed",
+        }
+
+
+_KEYRING_CACHE = {"at": 0.0, "value": None}
+
+
+def get_keyring_report(refresh=False):
+    if not refresh and _KEYRING_CACHE["value"] and time.monotonic() - _KEYRING_CACHE["at"] < 30:
+        return json.loads(json.dumps(_KEYRING_CACHE["value"]))
+    report = read_windows_keyring()
+    _KEYRING_CACHE["at"] = time.monotonic()
+    _KEYRING_CACHE["value"] = report
+    return json.loads(json.dumps(report))
+
+
+def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
     session = detect_sessions(preferred_store or _preferred_store())
     state = read_switch_state()
     surface_report = evaluate_surfaces(
@@ -2166,7 +2317,23 @@ def get_doctor_report(surfaces=None, preferred_store=None):
         state.get("appliedAt", "") if isinstance(state, dict) else "",
     )
     permissions = get_permission_warnings()
+    keyring = get_keyring_report() if keyring is None else keyring
     warnings = []
+
+    if (
+        keyring
+        and keyring.get("available")
+        and keyring.get("email")
+        and session.get("email")
+        and canonical_email(keyring["email"]) != canonical_email(session["email"])
+    ):
+        warnings.append({
+            "code": "keyring-mismatch",
+            "severity": "error",
+            "message": f"Windows Credential Manager {keyring.get('target')} is {keyring['email']}, "
+                       f"but the active account is {session['email']}; this build detects the keyring "
+                       "but does not write it yet.",
+        })
 
     for conflict in session.get("conflicts", []):
         if conflict["type"] == "multiple-emails":
@@ -2232,6 +2399,7 @@ def get_doctor_report(surfaces=None, preferred_store=None):
         },
         "surfaces": surface_report,
         "permissions": permissions,
+        "keyring": keyring,
         "warnings": warnings,
     }
 
@@ -2245,6 +2413,11 @@ def cmd_doctor(as_json=False):
         print(f"Active account: {report['activeSession']['email'] or '(none)'}")
         print(f"Desired account: {report['activeSession']['targetEmail'] or '(none)'}")
         print(f"Switch applied at: {report['switchState']['appliedAt'] or '(none)'}")
+        keyring = report.get("keyring") or {}
+        if keyring.get("available"):
+            print(f"Keyring: {keyring.get('target')} -> {keyring.get('email') or '(no email)'} (read-only)")
+        else:
+            print(f"Keyring: not available ({keyring.get('reason') or 'unknown'})")
         print("Running surfaces:")
         if not report["surfaces"]["surfaces"]:
             print("  (none detected)")
@@ -2277,6 +2450,7 @@ def get_diagnostics():
         "conflicts": session.get("conflicts", []),
         "switchState": state,
         "storeDiff": diff_against_switch_state(state),
+        "keyring": get_keyring_report(),
         "doctor": get_doctor_report(),
         "savedProfiles": sorted(profiles.keys()),
         "profileCompleteness": {

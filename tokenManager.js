@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.7.4';
+const VERSION = '1.8.0-alpha.1';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;
@@ -2246,6 +2246,150 @@ function getPermissionWarnings() {
     return warnings;
 }
 
+function isWslEnvironment() {
+    if (process.platform !== 'linux') return false;
+    if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+    try {
+        return /microsoft/i.test(fs.readFileSync('/proc/version', 'utf-8'));
+    } catch {
+        return false;
+    }
+}
+
+const WINDOWS_KEYRING_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class AgyCredReader {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredRead(string target, uint type, uint flags, out IntPtr credential);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern void CredFree(IntPtr credential);
+}
+"@
+$ptr = [IntPtr]::Zero
+if (-not [AgyCredReader]::CredRead('gemini:antigravity', 1, 0, [ref]$ptr)) {
+    [pscustomobject]@{ Found = $false } | ConvertTo-Json -Compress
+    exit 0
+}
+try {
+    $cred = [Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][AgyCredReader+CREDENTIAL])
+    $bytes = New-Object byte[] $cred.CredentialBlobSize
+    if ($cred.CredentialBlobSize -gt 0 -and $cred.CredentialBlob -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $bytes.Length)
+    }
+    $utf8 = [Text.Encoding]::UTF8.GetString($bytes)
+    $unicode = [Text.Encoding]::Unicode.GetString($bytes)
+    $combined = $utf8 + "\n" + $unicode
+    $emails = [regex]::Matches($combined, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}') |
+        ForEach-Object { $_.Value } | Sort-Object -Unique
+    [pscustomobject]@{
+        Found = $true
+        TargetName = $cred.TargetName
+        UserName = $cred.UserName
+        BlobLength = $cred.CredentialBlobSize
+        Emails = @($emails)
+        HasRefresh = ($combined -match 'refresh')
+        HasAccess = ($combined -match 'access')
+        HasIdToken = ($combined -match 'id_token')
+    } | ConvertTo-Json -Depth 4 -Compress
+}
+finally {
+    [AgyCredReader]::CredFree($ptr)
+}
+`;
+
+function parseKeyringReport(payload) {
+    const found = Boolean(payload && payload.Found);
+    const rawEmails = payload && payload.Emails;
+    const emails = Array.isArray(rawEmails) ? rawEmails : (rawEmails ? [rawEmails] : []);
+    const email = emails.find(value => typeof value === 'string' && value.includes('@')) || '';
+    return {
+        available: found,
+        provider: 'windows-credential-manager',
+        target: 'gemini:antigravity',
+        username: payload && payload.UserName ? String(payload.UserName) : 'antigravity',
+        email,
+        emails,
+        hasRefreshToken: Boolean(payload && payload.HasRefresh),
+        hasAccessToken: Boolean(payload && payload.HasAccess),
+        hasIdToken: Boolean(payload && payload.HasIdToken),
+        blobLength: Number(payload && payload.BlobLength) || 0,
+        managed: false
+    };
+}
+
+function readWindowsKeyring(options = {}) {
+    if (process.platform !== 'win32' && !options.force && !isWslEnvironment()) {
+        return {
+            available: false,
+            provider: 'none',
+            target: 'gemini:antigravity',
+            managed: false,
+            reason: 'unsupported-platform'
+        };
+    }
+    try {
+        const raw = execFileSync('powershell.exe', [
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            WINDOWS_KEYRING_SCRIPT
+        ], {
+            encoding: 'utf-8',
+            timeout: options.timeout || 8000,
+            stdio: ['ignore', 'pipe', 'ignore']
+        });
+        const trimmed = raw.trim();
+        if (!trimmed) {
+            return {
+                available: false,
+                provider: 'windows-credential-manager',
+                target: 'gemini:antigravity',
+                managed: false,
+                reason: 'empty-response'
+            };
+        }
+        return parseKeyringReport(JSON.parse(trimmed));
+    } catch {
+        return {
+            available: false,
+            provider: 'windows-credential-manager',
+            target: 'gemini:antigravity',
+            managed: false,
+            reason: 'read-failed'
+        };
+    }
+}
+
+let keyringCache = { at: 0, value: null };
+
+function getKeyringReport(options = {}) {
+    if (!options.refresh && keyringCache.value && Date.now() - keyringCache.at < 30000) {
+        return clone(keyringCache.value);
+    }
+    const report = readWindowsKeyring(options);
+    keyringCache = { at: Date.now(), value: report };
+    return clone(report);
+}
+
 function getDoctorReport(options = {}) {
     const session = detectSessions({ preferredStore: options.preferredStore || 'standaloneToken' });
     const state = readSwitchState();
@@ -2254,7 +2398,22 @@ function getDoctorReport(options = {}) {
         state.appliedAt || ''
     );
     const permissions = getPermissionWarnings();
+    const keyring = options.keyring === undefined ? getKeyringReport() : options.keyring;
     const warnings = [];
+
+    if (
+        keyring
+        && keyring.available
+        && keyring.email
+        && session.email
+        && canonicalEmail(keyring.email) !== canonicalEmail(session.email)
+    ) {
+        warnings.push({
+            code: 'keyring-mismatch',
+            severity: 'error',
+            message: `Windows Credential Manager ${keyring.target} is ${keyring.email}, but the active account is ${session.email}; this build detects the keyring but does not write it yet.`
+        });
+    }
 
     for (const conflict of session.conflicts || []) {
         if (conflict.type === 'multiple-emails') {
@@ -2322,6 +2481,7 @@ function getDoctorReport(options = {}) {
         },
         surfaces: surfaceReport,
         permissions,
+        keyring,
         warnings
     };
 }
@@ -2344,6 +2504,7 @@ function getDiagnostics() {
         conflicts: session.conflicts,
         switchState: state,
         storeDiff: diffAgainstSwitchState(state),
+        keyring: getKeyringReport(),
         doctor: getDoctorReport(),
         savedProfiles: Object.keys(profiles),
         profileCompleteness: Object.fromEntries(Object.entries(profiles).map(([email, profile]) => [
@@ -2412,6 +2573,9 @@ module.exports = {
     evaluateSurfaces,
     getRunningSurfaces,
     getPermissionWarnings,
+    parseKeyringReport,
+    readWindowsKeyring,
+    getKeyringReport,
     getDoctorReport,
     acquireSwitchLock,
     snapshotActiveAccount,

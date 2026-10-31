@@ -920,6 +920,7 @@ test('getDoctorReport flags a stale surface during a conflict', async () => {
 
     const report = tokenManager.getDoctorReport({
         preferredStore: 'standaloneToken',
+        keyring: { available: false },
         surfaces: [{
             pid: 123,
             kind: 'desktop-wsl',
@@ -932,6 +933,45 @@ test('getDoctorReport flags a stale surface during a conflict', async () => {
     assert.strictEqual(report.ok, false);
     assert.ok(report.warnings.some(warning => warning.code === 'stale-surface'));
     assert.ok(report.warnings.some(warning => warning.code === 'store-conflict'));
+});
+
+test('parseKeyringReport keeps only redacted metadata', async () => {
+    const report = tokenManager.parseKeyringReport({
+        Found: true,
+        TargetName: 'gemini:antigravity',
+        UserName: 'antigravity',
+        BlobLength: 579,
+        Emails: ['other@example.com'],
+        HasRefresh: true,
+        HasAccess: true,
+        HasIdToken: true
+    });
+
+    assert.strictEqual(report.available, true);
+    assert.strictEqual(report.email, 'other@example.com');
+    assert.strictEqual(report.hasRefreshToken, true);
+    assert.strictEqual(report.managed, false);
+    assert.ok(!('raw' in report));
+    assert.ok(!JSON.stringify(report).includes('refresh_token'));
+});
+
+test('getDoctorReport flags a keyring mismatch', async () => {
+    resetState();
+    writeToken('standaloneToken', makeToken('ide@example.com'));
+
+    const report = tokenManager.getDoctorReport({
+        preferredStore: 'standaloneToken',
+        surfaces: [],
+        keyring: {
+            available: true,
+            provider: 'windows-credential-manager',
+            target: 'gemini:antigravity',
+            email: 'other@example.com'
+        }
+    });
+
+    assert.strictEqual(report.ok, false);
+    assert.ok(report.warnings.some(warning => warning.code === 'keyring-mismatch'));
 });
 
 test('getPermissionWarnings flags group-readable token files', async () => {

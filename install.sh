@@ -183,6 +183,15 @@ install_extension() {
         if [ -f "$REPO_DIR/LICENSE" ]; then
             install -m 0644 "$REPO_DIR/LICENSE" "$target/LICENSE"
         fi
+        for extra in README.md CHANGELOG.md; do
+            if [ -f "$REPO_DIR/$extra" ]; then
+                install -m 0644 "$REPO_DIR/$extra" "$target/$extra"
+            fi
+        done
+        if [ -d "$REPO_DIR/assets" ]; then
+            run mkdir -p "$target/assets"
+            run cp -R "$REPO_DIR/assets/." "$target/assets/"
+        fi
         note "Installed extension -> $target"
     fi
     cleanup_duplicates "$root" "$target"

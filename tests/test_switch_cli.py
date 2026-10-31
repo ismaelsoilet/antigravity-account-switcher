@@ -821,11 +821,48 @@ class TestSwitchCLI(unittest.TestCase):
                 "source": "test",
             }],
             preferred_store="standaloneToken",
+            keyring={"available": False},
         )
 
         self.assertFalse(report["ok"])
         self.assertTrue(any(warning["code"] == "stale-surface" for warning in report["warnings"]))
         self.assertTrue(any(warning["code"] == "store-conflict" for warning in report["warnings"]))
+
+    def test_parse_keyring_report_redacts_tokens(self):
+        report = switch.parse_keyring_report({
+            "Found": True,
+            "TargetName": "gemini:antigravity",
+            "UserName": "antigravity",
+            "BlobLength": 579,
+            "Emails": ["other@example.com"],
+            "HasRefresh": True,
+            "HasAccess": True,
+            "HasIdToken": True,
+        })
+
+        self.assertTrue(report["available"])
+        self.assertEqual(report["email"], "other@example.com")
+        self.assertTrue(report["hasRefreshToken"])
+        self.assertFalse(report["managed"])
+        self.assertNotIn("raw", report)
+        self.assertNotIn("refresh_token", json.dumps(report))
+
+    def test_get_doctor_report_flags_keyring_mismatch(self):
+        self.write_token("standaloneToken", make_token("ide@example.com"))
+
+        report = switch.get_doctor_report(
+            surfaces=[],
+            preferred_store="standaloneToken",
+            keyring={
+                "available": True,
+                "provider": "windows-credential-manager",
+                "target": "gemini:antigravity",
+                "email": "other@example.com",
+            },
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any(warning["code"] == "keyring-mismatch" for warning in report["warnings"]))
 
     def test_get_permission_warnings_flags_group_readable_token(self):
         if os.name == "nt":

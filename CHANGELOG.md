@@ -4,6 +4,37 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.0-alpha.1 — 2026-10-31
+
+### Added
+
+- Custom 128×128 extension icon (`assets/icon.png`), declared through the
+  `icon` field in `package.json` and included in the VSIX.
+- **Read-only keyring detection:** `agy-switch diagnostics` and the Doctor now
+  read the Windows Credential Manager entry `gemini:antigravity` (service
+  `gemini`, account `antigravity`) and report email, token-presence booleans and
+  blob length. Token values are never printed.
+- Doctor warning `keyring-mismatch` when the keyring email differs from the
+  active file/database account.
+- [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md): isolation verdict, evidence,
+  keyring architecture and the 1.8/1.9 roadmap.
+
+### Changed
+
+- `install.sh` copies `assets/`, `README.md` and `CHANGELOG.md` into directory
+  installs, matching the VSIX contents.
+- README shows the icon and documents the keyring limitation.
+
+### Known limitation
+
+- This alpha **detects** the keyring but does **not write** it yet. A switch can
+  still leave the Windows CLI/app on the old keyring account. Keyring
+  snapshot/restore/verify is the next 1.8.0 milestone.
+
+### Tests
+
+- 45 JavaScript tests and 48 Python tests passing.
+
 ## 1.7.4 — 2026-10-31
 
 ### Added
