@@ -1,8 +1,8 @@
 # Master Development Plan — Secure, TOS-Safe Account Switcher
 
 Status: active, 2026-10-31
-Current build: `1.8.0` (keyring-aware switching implemented)
-Next code milestone: `1.8.1` (read-only quota/429 + dashboard)
+Current build: `1.8.1` (keyring-aware switching + read-only quota/dashboard)
+Next code milestone: `1.9.0` (vault encryption, Open VSX, hardening)
 
 ## 1. Product principles
 
@@ -199,11 +199,11 @@ screenshots/GIF, release notes, reproducible VSIX, prerelease tags.
 - Windows integration test with `gemini:antigravity.test`; no real credential.
 - Acceptance: F1 + F3 targets. Implemented and verified on the live account.
 
-### 1.8.1 — quota and dashboard
+### 1.8.1 — quota and dashboard (done)
 
-- Read-only quota/reset display.
-- Activity Bar dashboard and status bar improvements.
-- No automatic switching.
+- Read-only official `/usage` quota/reset display with local fallback.
+- Activity Bar dashboard and 429 log signals.
+- No automatic switching. Implemented and verified live.
 
 ### 1.9.0 — security and distribution
 

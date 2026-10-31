@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.8.0)
+Antigravity Account Switcher - CLI Core Engine (v1.8.1)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -26,7 +26,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
 FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {
@@ -2786,7 +2786,390 @@ def get_keyring_report(refresh=False):
     return json.loads(json.dumps(report))
 
 
-def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
+def parse_quota_date(value):
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (int, float)):
+        ms = value if value > 1e12 else value * 1000
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            numeric = float(text)
+            return parse_quota_date(numeric)
+        except ValueError:
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def _quota_number(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        match = re.search(r"-?\d+(?:[.,]\d+)?", value)
+        if match:
+            return float(match.group(0).replace(",", "."))
+    return None
+
+
+def _quota_string(value):
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def parse_quota_model(raw, now=None):
+    if not isinstance(raw, dict):
+        return None
+    now = now or time.time()
+    label = (
+        _quota_string(raw.get("label"))
+        or _quota_string(raw.get("name"))
+        or _quota_string(raw.get("model"))
+        or _quota_string(raw.get("modelName"))
+        or _quota_string(raw.get("id"))
+    )
+    if not label:
+        return None
+    remaining_raw = _quota_number(
+        raw.get("remainingPercentage")
+        if raw.get("remainingPercentage") is not None
+        else raw.get("remaining_percentage")
+        if raw.get("remaining_percentage") is not None
+        else raw.get("remainingPct")
+        if raw.get("remainingPct") is not None
+        else raw.get("remaining_pct")
+        if raw.get("remaining_pct") is not None
+        else raw.get("remaining")
+        if raw.get("remaining") is not None
+        else raw.get("remainingFraction")
+    )
+    if remaining_raw is None:
+        return None
+    fraction = remaining_raw / 100 if remaining_raw > 1 else remaining_raw
+    fraction = max(0.0, min(1.0, fraction))
+    until_reset = _quota_number(
+        raw.get("timeUntilResetMs")
+        if raw.get("timeUntilResetMs") is not None
+        else raw.get("time_until_reset_ms")
+    )
+    reset_at = parse_quota_date(
+        raw.get("resetTime")
+        if raw.get("resetTime") is not None
+        else raw.get("reset_time")
+        if raw.get("reset_time") is not None
+        else raw.get("resetAt")
+        if raw.get("resetAt") is not None
+        else raw.get("reset_at")
+        if raw.get("reset_at") is not None
+        else raw.get("quotaResetTime")
+    )
+    if not reset_at and until_reset is not None:
+        reset_at = datetime.fromtimestamp(now + until_reset / 1000, timezone.utc).isoformat()
+    exhausted = bool(
+        raw.get("isExhausted")
+        or raw.get("exhausted")
+        or raw.get("is_exhausted")
+        or (isinstance(raw.get("status"), str) and raw["status"].lower() == "exhausted")
+    ) or fraction <= 0
+    return {
+        "label": label,
+        "remainingPercent": round(fraction * 1000) / 10,
+        "exhausted": exhausted,
+        "resetAt": reset_at,
+    }
+
+
+def parse_quota_payload(payload, now=None):
+    if not payload:
+        return []
+    now = now or time.time()
+    candidates = []
+    if isinstance(payload, list):
+        candidates = payload
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("models"), list):
+            candidates = payload["models"]
+        elif isinstance(payload.get("quota"), dict) and isinstance(payload["quota"].get("models"), list):
+            candidates = payload["quota"]["models"]
+        elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("models"), list):
+            candidates = payload["data"]["models"]
+        elif any(
+            payload.get(key) is not None
+            for key in ("remainingPercentage", "remaining_percentage", "remaining")
+        ):
+            candidates = [payload]
+    models = []
+    for item in candidates:
+        model = parse_quota_model(item, now=now)
+        if model:
+            models.append(model)
+    return models
+
+
+def _discover_quota_paths():
+    paths = []
+    for gemini_dir in get_gemini_dirs():
+        for sub in ("", "antigravity", "antigravity-cli", "antigravity-ide", "cache", "antigravity-cli/cache", "antigravity-ide/cache"):
+            directory = os.path.join(gemini_dir, sub)
+            try:
+                entries = os.listdir(directory)
+            except OSError:
+                continue
+            for name in entries:
+                if re.search(r"(quota|usage).*\.json$", name, re.IGNORECASE):
+                    candidate = os.path.join(directory, name)
+                    if os.path.isfile(candidate):
+                        paths.append(candidate)
+    return _dedupe(paths)
+
+
+def _read_quota_from_files(options=None):
+    options = options or {}
+    paths = options["quota_paths"] if "quota_paths" in options else _discover_quota_paths()
+    candidates = []
+    for file_path in paths:
+        try:
+            stat_result = os.stat(file_path)
+        except OSError:
+            continue
+        candidates.append((file_path, stat_result))
+    candidates.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    for file_path, stat_result in candidates[:8]:
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        models = parse_quota_payload(payload)
+        if models:
+            return {
+                "models": models,
+                "source": file_path,
+                "updatedAt": datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).isoformat(),
+            }
+    return {"models": [], "source": "", "updatedAt": ""}
+
+
+def _read_file_tail(file_path, max_bytes=200000):
+    try:
+        stat_result = os.stat(file_path)
+    except OSError:
+        return ""
+    length = min(stat_result.st_size, max_bytes)
+    if length <= 0:
+        return ""
+    try:
+        with open(file_path, "rb") as handle:
+            handle.seek(stat_result.st_size - length)
+            return handle.read(length).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _discover_quota_log_dirs():
+    dirs = []
+    for gemini_dir in get_gemini_dirs():
+        for sub in ("antigravity-cli/log", "antigravity/log", "antigravity-ide/log", "log"):
+            dirs.append(os.path.join(gemini_dir, sub))
+    return _dedupe(dirs)
+
+
+def _read_quota_from_logs(options=None):
+    options = options or {}
+    directories = options["log_dirs"] if "log_dirs" in options else _discover_quota_log_dirs()
+    files = []
+    for directory in directories:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            if not re.search(r"\.log$", name, re.IGNORECASE):
+                continue
+            file_path = os.path.join(directory, name)
+            try:
+                stat_result = os.stat(file_path)
+            except OSError:
+                continue
+            if time.time() - stat_result.st_mtime < 24 * 60 * 60:
+                files.append((file_path, stat_result))
+    files.sort(key=lambda item: item[1].st_mtime, reverse=True)
+
+    signals = []
+    models = []
+    source = ""
+    for file_path, stat_result in files[:4]:
+        text = _read_file_tail(file_path)
+        if not text:
+            continue
+        for line in text.splitlines():
+            if len(signals) < 5 and re.search(r"\b429\b|RESOURCE_EXHAUSTED|quota exhausted|rate limit", line, re.IGNORECASE):
+                model_match = re.search(r"(?:model|models?)[=:\s\"']+([A-Za-z0-9._-]+)", line, re.IGNORECASE)
+                signals.append({
+                    "kind": "rate-limit",
+                    "at": datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).isoformat(),
+                    "model": model_match.group(1) if model_match else "",
+                })
+            if re.search(r"remainingPercentage|remaining_percentage|remainingPct", line) and "{" in line:
+                start = line.find("{")
+                end = line.rfind("}")
+                if start >= 0 and end > start:
+                    payload = _safe_json(line[start:end + 1])
+                    parsed = parse_quota_payload(payload)
+                    if parsed:
+                        models = parsed
+                        source = file_path
+                        break
+        if models:
+            break
+    return {
+        "models": models,
+        "rateLimited": bool(signals),
+        "signals": signals,
+        "source": source,
+        "updatedAt": datetime.fromtimestamp(files[0][1].st_mtime, timezone.utc).isoformat() if files else "",
+    }
+
+
+def parse_usage_text(text):
+    models = []
+    for line in str(text or "").splitlines():
+        parts = [part.strip() for part in line.split("\t") if part.strip()]
+        if len(parts) < 4:
+            continue
+        percent = _quota_number(parts[2])
+        if percent is None:
+            continue
+        model = parse_quota_model({
+            "label": f"{parts[0]} — {parts[1]}",
+            "remainingPercentage": percent,
+            "resetTime": parts[3],
+        })
+        if model:
+            models.append(model)
+    return models
+
+
+def parse_usage_output(output):
+    if not output:
+        return {"models": [], "source": "agy /usage"}
+    parsed = output
+    if isinstance(output, str):
+        try:
+            parsed = json.loads(output)
+        except ValueError:
+            return {"models": parse_usage_text(output), "source": "agy /usage"}
+    data = parsed
+    if isinstance(parsed, dict):
+        data = (parsed.get("command") or {}).get("data") or parsed.get("data") or parsed
+    models = []
+    if isinstance(data, dict) and isinstance(data.get("groups"), list):
+        for group in data["groups"]:
+            group_name = _quota_string(group.get("name")) or "Quota"
+            for bucket in group.get("buckets", []):
+                fraction = _quota_number(
+                    bucket.get("remaining_fraction")
+                    if bucket.get("remaining_fraction") is not None
+                    else bucket.get("remainingFraction")
+                    if bucket.get("remainingFraction") is not None
+                    else bucket.get("remaining")
+                )
+                if fraction is None:
+                    continue
+                model = parse_quota_model({
+                    "label": f"{group_name} — {_quota_string(bucket.get('name')) or _quota_string(bucket.get('window')) or 'limit'}",
+                    "remainingPercentage": fraction,
+                    "resetTime": bucket.get("reset_time", bucket.get("resetTime")),
+                    "isExhausted": fraction <= 0,
+                })
+                if model:
+                    models.append(model)
+    if not models and isinstance(parsed, dict) and isinstance(parsed.get("response"), str):
+        models.extend(parse_usage_text(parsed["response"]))
+    return {"models": models, "source": "agy /usage"}
+
+
+def run_usage_command(options=None):
+    options = options or {}
+    candidates = [
+        options.get("cli_path"),
+        os.environ.get("AGY_CLI_PATH"),
+        os.path.join(os.path.expanduser("~"), ".gemini", "bin", "agy"),
+        "agy",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if candidate != "agy" and not os.path.exists(candidate):
+            continue
+        try:
+            result = subprocess.run(
+                [candidate, "--print", "/usage", "--output-format", "json"],
+                capture_output=True,
+                text=True,
+                timeout=options.get("usage_timeout", 20),
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                continue
+            parsed = parse_usage_output(result.stdout)
+            if parsed["models"]:
+                return parsed
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return {"models": [], "source": "agy /usage"}
+
+
+_QUOTA_CACHE = {"at": 0.0, "value": None}
+
+
+def get_quota_report(options=None, refresh=False):
+    options = options or {}
+    wants_live = bool(options.get("live") or options.get("usage_runner") or options.get("usage_output"))
+    if (
+        not refresh
+        and _QUOTA_CACHE["value"]
+        and time.monotonic() - _QUOTA_CACHE["at"] < 60
+        and (not wants_live or _QUOTA_CACHE["value"].get("live"))
+    ):
+        return json.loads(json.dumps(_QUOTA_CACHE["value"]))
+    files = _read_quota_from_files(options)
+    logs = _read_quota_from_logs(options)
+    live = None
+    if options.get("usage_output"):
+        live = parse_usage_output(options["usage_output"])
+    elif callable(options.get("usage_runner")):
+        live = options["usage_runner"](options)
+    elif options.get("live"):
+        live = run_usage_command(options)
+    live_models = live["models"] if live and isinstance(live.get("models"), list) else []
+    seen = set()
+    models = []
+    for model in [*live_models, *files["models"], *logs["models"]]:
+        key = model["label"].lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        models.append(model)
+    report = {
+        "available": bool(models),
+        "live": bool(live_models),
+        "source": "agy /usage" if live_models else (files["source"] or logs["source"]),
+        "updatedAt": datetime.now(timezone.utc).isoformat() if live_models else (files["updatedAt"] or logs["updatedAt"]),
+        "models": models,
+        "rateLimited": bool(logs["rateLimited"]),
+        "signals": logs["signals"],
+        "reason": "" if models else ("usage-unavailable" if wants_live else "no-local-quota-cache"),
+    }
+    _QUOTA_CACHE["at"] = time.monotonic()
+    _QUOTA_CACHE["value"] = report
+    return json.loads(json.dumps(report))
+
+
+def get_doctor_report(surfaces=None, preferred_store=None, keyring=None, quota=None):
     session = detect_sessions(preferred_store or _preferred_store(), include_keyring=True)
     state = read_switch_state()
     surface_report = evaluate_surfaces(
@@ -2795,6 +3178,7 @@ def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
     )
     permissions = get_permission_warnings()
     keyring = get_keyring_report() if keyring is None else keyring
+    quota = get_quota_report() if quota is None else quota
     warnings = []
 
     if (
@@ -2827,6 +3211,25 @@ def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
                            + ", ".join(missing_keyring)
                            + ". Sign in to each account and run agy-switch save before switching.",
             })
+
+    if quota and quota.get("rateLimited"):
+        warnings.append({
+            "code": "quota-rate-limit",
+            "severity": "warning",
+            "message": "A recent 429 / RESOURCE_EXHAUSTED / quota signal was found in the local logs. "
+                       "This is informational; the switcher will not change accounts automatically.",
+        })
+    exhausted_models = [
+        model.get("label") for model in (quota or {}).get("models", []) if model.get("exhausted")
+    ]
+    if exhausted_models:
+        warnings.append({
+            "code": "quota-exhausted",
+            "severity": "warning",
+            "message": "Local quota data marks these models as exhausted: "
+                       + ", ".join(exhausted_models)
+                       + ".",
+        })
 
     for conflict in session.get("conflicts", []):
         if conflict["type"] == "multiple-emails":
@@ -2893,6 +3296,7 @@ def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
         "surfaces": surface_report,
         "permissions": permissions,
         "keyring": keyring,
+        "quota": quota,
         "warnings": warnings,
     }
 
@@ -2911,6 +3315,17 @@ def cmd_doctor(as_json=False):
             print(f"Keyring: {keyring.get('target')} -> {keyring.get('email') or '(no email)'} (managed)")
         else:
             print(f"Keyring: not available ({keyring.get('reason') or 'unknown'})")
+        quota = report.get("quota") or {}
+        if quota.get("available"):
+            print("Quota: " + ", ".join(
+                f"{model.get('label')}={model.get('remainingPercent')}%"
+                + (" (exhausted)" if model.get("exhausted") else "")
+                for model in quota.get("models", [])
+            ))
+        else:
+            print("Quota: not available locally")
+        if quota.get("rateLimited"):
+            print("Quota: recent 429 / RESOURCE_EXHAUSTED signal in logs")
         print("Running surfaces:")
         if not report["surfaces"]["surfaces"]:
             print("  (none detected)")
@@ -2945,6 +3360,7 @@ def get_diagnostics():
         "switchState": state,
         "storeDiff": diff_against_switch_state(state),
         "keyring": keyring,
+        "quota": get_quota_report(),
         "doctor": get_doctor_report(),
         "savedProfiles": sorted(profiles.keys()),
         "profileCompleteness": {
@@ -3198,6 +3614,25 @@ def cmd_clear():
     return 0
 
 
+def cmd_quota(as_json=False, live=True):
+    report = get_quota_report({"live": live}, refresh=True)
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        if report["available"]:
+            print(f"Quota source: {report['source']} ({report['updatedAt']})")
+            for model in report["models"]:
+                status = "EXHAUSTED" if model.get("exhausted") else "ok"
+                reset = f" reset={model['resetAt']}" if model.get("resetAt") else ""
+                print(f"  {model['label']}: {model['remainingPercent']}% remaining [{status}]{reset}")
+        else:
+            print("Quota cache is not available locally.")
+            print("Open Antigravity Settings > View Usage for the official quota panel.")
+        if report["rateLimited"]:
+            print("Recent 429 / RESOURCE_EXHAUSTED signal found in local logs.")
+    return 0
+
+
 def cmd_diagnostics(as_json=False):
     diagnostics = get_diagnostics()
     if as_json:
@@ -3255,6 +3690,10 @@ def main():
     diagnostics_parser = subparsers.add_parser("diagnostics", help="Show token and database paths")
     diagnostics_parser.add_argument("--json", action="store_true", help="Output JSON")
 
+    quota_parser = subparsers.add_parser("quota", help="Show quota from the official /usage and local 429 signals")
+    quota_parser.add_argument("--json", action="store_true", help="Output JSON")
+    quota_parser.add_argument("--local", action="store_true", help="Skip the official /usage call and use only local cache/logs")
+
     doctor_parser = subparsers.add_parser("doctor", help="Diagnose conflicts, stale surfaces and permissions")
     doctor_parser.add_argument("--json", action="store_true", help="Output JSON")
 
@@ -3280,6 +3719,8 @@ def main():
         sys.exit(cmd_reset(args.yes))
     if args.command == "diagnostics":
         sys.exit(cmd_diagnostics(as_json=args.json))
+    if args.command == "quota":
+        sys.exit(cmd_quota(as_json=args.json, live=not args.local))
     if args.command == "doctor":
         sys.exit(cmd_doctor(as_json=args.json))
 

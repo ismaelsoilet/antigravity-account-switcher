@@ -2,7 +2,7 @@
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
   "description": "Visual multi-account switcher and profile manager embedded directly in Antigravity IDE, synchronized across Antigravity 2.0 Desktop and the CLI.",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "license": "MIT",
   "icon": "assets/icon.png",
   "extensionKind": [
@@ -88,8 +88,75 @@
       {
         "command": "antigravity-account-switcher.doctor",
         "title": "Antigravity: Run Account Switcher Doctor",
+        "category": "Antigravity",
+        "icon": "$(heart)"
+      },
+      {
+        "command": "antigravity-account-switcher.refreshDashboard",
+        "title": "Antigravity: Refresh Accounts Dashboard",
+        "category": "Antigravity",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "antigravity-account-switcher.showQuota",
+        "title": "Antigravity: Show Quota",
+        "category": "Antigravity",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "antigravity-account-switcher.switchToProfile",
+        "title": "Antigravity: Switch to Profile",
         "category": "Antigravity"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antigravityAccountSwitcher",
+          "title": "Antigravity Accounts",
+          "icon": "assets/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "antigravityAccountSwitcher": [
+        {
+          "id": "antigravityAccountSwitcher.dashboard",
+          "name": "Accounts",
+          "contextualTitle": "Antigravity Accounts"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "antigravityAccountSwitcher.dashboard",
+        "contents": "No saved accounts yet.\n[Sign In](command:antigravity-account-switcher.login)\n[Save Current Session](command:antigravity-account-switcher.save)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "antigravity-account-switcher.refreshDashboard",
+          "when": "view == antigravityAccountSwitcher.dashboard",
+          "group": "navigation"
+        },
+        {
+          "command": "antigravity-account-switcher.showQuota",
+          "when": "view == antigravityAccountSwitcher.dashboard",
+          "group": "navigation"
+        },
+        {
+          "command": "antigravity-account-switcher.doctor",
+          "when": "view == antigravityAccountSwitcher.dashboard",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "antigravity-account-switcher.switchToProfile",
+          "when": "false"
+        }
+      ]
+    }
   }
 }

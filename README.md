@@ -7,7 +7,7 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.8.1-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
 [![CI](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml/badge.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml)
 
@@ -15,14 +15,15 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-### What's new in 1.8.0
+### What's new in 1.8.1
 
-- **Keyring-aware switching:** the Windows Credential Manager entry `gemini:antigravity` is now a first-class store. Profiles capture it; `restoreProfile` writes it, verifies email + refresh fingerprint and rolls it back with the files/databases if anything fails.
-- **Strict migration:** profiles saved before 1.8.0 do not contain the keyring and are blocked with a clear message. Sign in to each account once and run `agy-switch save` (or use **Snapshot Current Session**) to capture it.
-- **Safer diagnostics:** the keyring is shown as managed in diagnostics/Doctor; token values are never printed; the real provider is tested against `gemini:antigravity.test`, never the production entry.
-- **Custom icon, master plan and spec:** [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) and [docs/SPEC-1.8.0-KEYRING.md](docs/SPEC-1.8.0-KEYRING.md).
+- **Official quota, read-only:** `agy-switch quota` calls `agy --print /usage --output-format json` and shows weekly + 5-hour remaining percentages and reset times. It never switches accounts or pools quota.
+- **Activity Bar dashboard:** an **Antigravity Accounts** view with the active account, keyring status, saved profiles (click to switch manually), live quota, 429 signals and Doctor/diagnostics shortcuts.
+- **429 signal detection:** recent `429` / `RESOURCE_EXHAUSTED` / quota messages in local logs are shown as informational warnings. No auto-rotation, failover or proxy.
+- **Local fallback:** if the CLI is not available, the dashboard reads a local quota cache/log if present and otherwise shows **Open Settings > View Usage**.
+- Spec: [docs/SPEC-1.8.1-QUOTA-DASHBOARD.md](docs/SPEC-1.8.1-QUOTA-DASHBOARD.md).
 
-Previous 1.7.4: the read-only **Reliability Doctor**, helper-process filtering, Ubuntu/Windows CI and tagged VSIX releases.
+Previous 1.8.0: keyring-aware switching and the strict keyring migration.
 
 ### Product direction
 
@@ -106,7 +107,7 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 
 The switcher is designed for **one account at a time** across all surfaces. With the IDE, Desktop 2.0 and the CLI open at the same time, each process keeps its own copy of the OAuth token and may refresh it independently (the CLI refreshes roughly every hour). The switcher cannot force three running processes to keep three different accounts; any tool that writes the shared token files will win the last write.
 
-What v1.8.0 does instead:
+What v1.8.1 does instead:
 
 * runs a cross-process lock (`~/.gemini/.antigravity-switch.lock`) so two switches cannot interleave;
 * records the expected identity and hashes in `~/.gemini/antigravity_switch_state.json`;
@@ -116,7 +117,7 @@ What v1.8.0 does instead:
 
 The status bar prefers the surface selected by `antigravityAccountSwitcher.preferredStore` (`standaloneToken` by default, or `cliToken`), and always prefers the account most recently applied by the switcher while that store still exists. It never chooses a winner by modification time.
 
-### Identity rules (v1.8.0)
+### Identity rules (v1.8.1)
 
 * Gmail aliases are canonicalized for comparisons: `user+tag@gmail.com` and `u.ser@gmail.com` collapse to the same canonical address. The original email is still used when writing tokens.
 * Each profile stores an `account_id` and a refresh-token fingerprint per token category. Profiles that share a canonical email or a fingerprint are **merged into one** (with `aliases`) instead of creating a second entry.
@@ -128,7 +129,7 @@ The status bar prefers the surface selected by `antigravityAccountSwitcher.prefe
 
 When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Connect / Sign In to Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
 
-To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.0; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
+To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.1; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
 
 ### Reliability Doctor
 
@@ -147,6 +148,19 @@ switch is still holding the previous refresh token in memory; restart/reload tha
 surface (or sign in again) before applying the profile again. The Doctor also
 reports duplicate main surfaces, store conflicts, keyring/active mismatches and
 group/other-readable files in the WSL home. It never modifies state.
+
+### Quota & Dashboard
+
+Open the **Antigravity Accounts** view in the Activity Bar for the active
+account, keyring status, saved profiles, live quota and Doctor shortcuts.
+Clicking a profile opens the normal manual switch confirmation; nothing switches
+automatically.
+
+`agy-switch quota` reads the official CLI `/usage` output (weekly and 5-hour
+buckets). It is **read-only**: no rotation, failover, pooling or proxy. Recent
+`429` / `RESOURCE_EXHAUSTED` messages in local logs are informational warnings.
+If the CLI is unavailable, the view falls back to a local quota cache/log; if
+neither exists, it shows **Open Settings > View Usage**.
 
 ### Conversation & Chat Sync
 * Conversation history is stored in local SQLite databases (`conversation_summaries.db`).
@@ -233,6 +247,11 @@ agy-switch diagnostics
 agy-switch doctor
 agy-switch doctor --json
 
+# Official read-only quota (weekly + 5-hour) and local 429 signals
+agy-switch quota
+agy-switch quota --json
+agy-switch quota --local
+
 # Print the CLI version
 agy-switch --version
 ```
@@ -269,7 +288,7 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.8.0.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.8.1.vsix` located in the repository folder.
 4. Reload the window when prompted.
 
 To rebuild the VSIX from source:

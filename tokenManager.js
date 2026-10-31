@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.8.0';
+const VERSION = '1.8.1';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;
@@ -2826,6 +2826,337 @@ function getKeyringReport(options = {}) {
     return clone(report);
 }
 
+function parseQuotaDate(value) {
+    if (value === null || value === undefined || value === '') return '';
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        const ms = value > 1e12 ? value : value * 1000;
+        const date = new Date(ms);
+        return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+    }
+    if (typeof value === 'string') {
+        const numeric = Number(value.trim());
+        if (Number.isFinite(numeric)) return parseQuotaDate(numeric);
+        const parsed = Date.parse(value);
+        return Number.isNaN(parsed) ? '' : new Date(parsed).toISOString();
+    }
+    return '';
+}
+
+function quotaNumber(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+        const match = value.replace(',', '.').match(/-?\d+(?:\.\d+)?/);
+        if (match) return Number(match[0]);
+    }
+    return null;
+}
+
+function quotaString(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function parseQuotaModel(raw, now = Date.now()) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const label = quotaString(raw.label)
+        || quotaString(raw.name)
+        || quotaString(raw.model)
+        || quotaString(raw.modelName)
+        || quotaString(raw.id);
+    if (!label) return null;
+    const remainingRaw = quotaNumber(
+        raw.remainingPercentage
+        ?? raw.remaining_percentage
+        ?? raw.remainingPct
+        ?? raw.remaining_pct
+        ?? raw.remaining
+        ?? raw.remainingFraction
+    );
+    if (remainingRaw === null) return null;
+    let fraction = remainingRaw > 1 ? remainingRaw / 100 : remainingRaw;
+    fraction = Math.max(0, Math.min(1, fraction));
+    const timeUntilResetMs = quotaNumber(raw.timeUntilResetMs ?? raw.time_until_reset_ms);
+    const resetAt = parseQuotaDate(
+        raw.resetTime
+        ?? raw.reset_time
+        ?? raw.resetAt
+        ?? raw.reset_at
+        ?? raw.quotaResetTime
+    ) || (timeUntilResetMs !== null ? new Date(now + timeUntilResetMs).toISOString() : '');
+    const exhausted = Boolean(
+        raw.isExhausted
+        ?? raw.exhausted
+        ?? raw.is_exhausted
+        ?? (typeof raw.status === 'string' && raw.status.toLowerCase() === 'exhausted')
+    ) || fraction <= 0;
+    return {
+        label,
+        remainingPercent: Math.round(fraction * 1000) / 10,
+        exhausted,
+        resetAt
+    };
+}
+
+function parseQuotaPayload(payload, now = Date.now()) {
+    if (!payload) return [];
+    let candidates = [];
+    if (Array.isArray(payload)) {
+        candidates = payload;
+    } else if (Array.isArray(payload.models)) {
+        candidates = payload.models;
+    } else if (payload.quota && Array.isArray(payload.quota.models)) {
+        candidates = payload.quota.models;
+    } else if (payload.data && Array.isArray(payload.data.models)) {
+        candidates = payload.data.models;
+    } else if (
+        payload.remainingPercentage !== undefined
+        || payload.remaining_percentage !== undefined
+        || payload.remaining !== undefined
+    ) {
+        candidates = [payload];
+    }
+    return candidates.map(item => parseQuotaModel(item, now)).filter(Boolean);
+}
+
+function discoverQuotaPaths() {
+    const paths = [];
+    for (const geminiDir of getGeminiDirs()) {
+        for (const sub of ['', 'antigravity', 'antigravity-cli', 'antigravity-ide', 'cache', 'antigravity-cli/cache', 'antigravity-ide/cache']) {
+            const directory = path.join(geminiDir, sub);
+            for (const entry of readdirSafe(directory)) {
+                if (entry.isFile() && /(quota|usage).*\.json$/i.test(entry.name)) {
+                    paths.push(path.join(directory, entry.name));
+                }
+            }
+        }
+    }
+    return [...new Set(paths)];
+}
+
+function readQuotaFromFiles(options = {}) {
+    const candidates = (options.quotaPaths || discoverQuotaPaths())
+        .map(filePath => ({ filePath, stat: statSafe(filePath) }))
+        .filter(item => item.stat && item.stat.isFile())
+        .sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)
+        .slice(0, 8);
+    for (const { filePath, stat } of candidates) {
+        try {
+            const payload = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            const models = parseQuotaPayload(payload);
+            if (models.length > 0) {
+                return {
+                    models,
+                    source: filePath,
+                    updatedAt: new Date(stat.mtimeMs).toISOString()
+                };
+            }
+        } catch {}
+    }
+    return { models: [], source: '', updatedAt: '' };
+}
+
+function readFileTail(filePath, maxBytes = 200000) {
+    const stat = statSafe(filePath);
+    if (!stat || !stat.isFile()) return '';
+    const length = Math.min(stat.size, maxBytes);
+    if (length <= 0) return '';
+    const buffer = Buffer.alloc(length);
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        fs.readSync(fd, buffer, 0, length, stat.size - length);
+    } finally {
+        fs.closeSync(fd);
+    }
+    return buffer.toString('utf-8');
+}
+
+function discoverQuotaLogDirs() {
+    const dirs = [];
+    for (const geminiDir of getGeminiDirs()) {
+        for (const sub of ['antigravity-cli/log', 'antigravity/log', 'antigravity-ide/log', 'log']) {
+            dirs.push(path.join(geminiDir, sub));
+        }
+    }
+    return [...new Set(dirs)];
+}
+
+function readQuotaFromLogs(options = {}) {
+    const directories = options.logDirs || discoverQuotaLogDirs();
+    const files = [];
+    for (const directory of directories) {
+        for (const entry of readdirSafe(directory)) {
+            if (!entry.isFile() || !/\.log$/i.test(entry.name)) continue;
+            const filePath = path.join(directory, entry.name);
+            const stat = statSafe(filePath);
+            if (stat && Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000) {
+                files.push({ filePath, stat });
+            }
+        }
+    }
+    files.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs);
+
+    const signals = [];
+    let models = [];
+    let source = '';
+    for (const { filePath, stat } of files.slice(0, 4)) {
+        const text = readFileTail(filePath);
+        if (!text) continue;
+        for (const line of text.split(/\r?\n/)) {
+            if (signals.length < 5 && /\b429\b|RESOURCE_EXHAUSTED|quota exhausted|rate limit/i.test(line)) {
+                const modelMatch = line.match(/(?:model|models?)[=:\s"']+([A-Za-z0-9._-]+)/i);
+                signals.push({
+                    kind: 'rate-limit',
+                    at: new Date(stat.mtimeMs).toISOString(),
+                    model: modelMatch ? modelMatch[1] : ''
+                });
+            }
+            if (/remainingPercentage|remaining_percentage|remainingPct/i.test(line) && line.includes('{')) {
+                const start = line.indexOf('{');
+                const end = line.lastIndexOf('}');
+                if (start >= 0 && end > start) {
+                    const payload = safeJsonParse(line.slice(start, end + 1));
+                    const parsed = parseQuotaPayload(payload);
+                    if (parsed.length > 0) {
+                        models = parsed;
+                        source = filePath;
+                        break;
+                    }
+                }
+            }
+        }
+        if (models.length > 0) break;
+    }
+    return {
+        models,
+        rateLimited: signals.length > 0,
+        signals,
+        source,
+        updatedAt: files[0] ? new Date(files[0].stat.mtimeMs).toISOString() : ''
+    };
+}
+
+function parseUsageText(text) {
+    const models = [];
+    for (const line of String(text || '').split(/\r?\n/)) {
+        const parts = line.split('\t').map(part => part.trim()).filter(Boolean);
+        if (parts.length < 4) continue;
+        const percent = quotaNumber(parts[2]);
+        if (percent === null) continue;
+        const model = parseQuotaModel({
+            label: `${parts[0]} — ${parts[1]}`,
+            remainingPercentage: percent,
+            resetTime: parts[3]
+        });
+        if (model) models.push(model);
+    }
+    return models;
+}
+
+function parseUsageOutput(output) {
+    if (!output) return { models: [], source: 'agy /usage' };
+    let parsed = output;
+    if (typeof output === 'string') {
+        parsed = safeJsonParse(output);
+        if (!parsed) {
+            return { models: parseUsageText(output), source: 'agy /usage' };
+        }
+    }
+    const data = (parsed && parsed.command && parsed.command.data)
+        || (parsed && parsed.data)
+        || parsed;
+    const models = [];
+    if (data && Array.isArray(data.groups)) {
+        for (const group of data.groups) {
+            const groupName = quotaString(group.name) || 'Quota';
+            for (const bucket of Array.isArray(group.buckets) ? group.buckets : []) {
+                const fraction = quotaNumber(
+                    bucket.remaining_fraction
+                    ?? bucket.remainingFraction
+                    ?? bucket.remaining
+                );
+                if (fraction === null) continue;
+                const model = parseQuotaModel({
+                    label: `${groupName} — ${quotaString(bucket.name) || quotaString(bucket.window) || 'limit'}`,
+                    remainingPercentage: fraction,
+                    resetTime: bucket.reset_time ?? bucket.resetTime,
+                    isExhausted: fraction <= 0
+                });
+                if (model) models.push(model);
+            }
+        }
+    }
+    if (models.length === 0 && parsed && typeof parsed.response === 'string') {
+        models.push(...parseUsageText(parsed.response));
+    }
+    return { models, source: 'agy /usage' };
+}
+
+function runUsageCommand(options = {}) {
+    const candidates = [
+        options.cliPath,
+        process.env.AGY_CLI_PATH,
+        path.join(os.homedir(), '.gemini', 'bin', 'agy'),
+        'agy'
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+        if (candidate !== 'agy' && !fs.existsSync(candidate)) continue;
+        try {
+            const output = execFileSync(candidate, ['--print', '/usage', '--output-format', 'json'], {
+                encoding: 'utf-8',
+                timeout: options.usageTimeout || 20000,
+                stdio: ['ignore', 'pipe', 'ignore']
+            });
+            const parsed = parseUsageOutput(output);
+            if (parsed.models.length > 0) return parsed;
+        } catch {}
+    }
+    return { models: [], source: 'agy /usage' };
+}
+
+let quotaCache = { at: 0, value: null };
+
+function getQuotaReport(options = {}) {
+    const wantsLive = Boolean(options.live || options.usageRunner || options.usageOutput);
+    if (
+        !options.refresh
+        && quotaCache.value
+        && Date.now() - quotaCache.at < 60000
+        && (!wantsLive || quotaCache.value.live)
+    ) {
+        return clone(quotaCache.value);
+    }
+    const files = readQuotaFromFiles(options);
+    const logs = readQuotaFromLogs(options);
+    let live = null;
+    if (options.usageOutput) {
+        live = parseUsageOutput(options.usageOutput);
+    } else if (typeof options.usageRunner === 'function') {
+        live = options.usageRunner(options);
+    } else if (options.live) {
+        live = runUsageCommand(options);
+    }
+    const liveModels = live && Array.isArray(live.models) ? live.models : [];
+    const seen = new Set();
+    const models = [];
+    for (const model of [...liveModels, ...files.models, ...logs.models]) {
+        const key = String(model.label || '').toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        models.push(model);
+    }
+    const report = {
+        available: models.length > 0,
+        live: liveModels.length > 0,
+        source: liveModels.length > 0 ? 'agy /usage' : (files.source || logs.source || ''),
+        updatedAt: liveModels.length > 0 ? new Date().toISOString() : (files.updatedAt || logs.updatedAt || ''),
+        models,
+        rateLimited: Boolean(logs.rateLimited),
+        signals: logs.signals || [],
+        reason: models.length > 0 ? '' : (wantsLive ? 'usage-unavailable' : 'no-local-quota-cache')
+    };
+    quotaCache = { at: Date.now(), value: report };
+    return clone(report);
+}
+
 function getDoctorReport(options = {}) {
     const session = detectSessions({
         preferredStore: options.preferredStore || 'standaloneToken',
@@ -2838,6 +3169,7 @@ function getDoctorReport(options = {}) {
     );
     const permissions = getPermissionWarnings();
     const keyring = options.keyring === undefined ? getKeyringReport() : options.keyring;
+    const quota = options.quota === undefined ? getQuotaReport() : options.quota;
     const warnings = [];
 
     if (
@@ -2866,6 +3198,24 @@ function getDoctorReport(options = {}) {
                 message: `Profiles without a captured keyring: ${missingKeyring.join(', ')}. Sign in to each account and run agy-switch save before switching.`
             });
         }
+    }
+
+    if (quota && quota.rateLimited) {
+        warnings.push({
+            code: 'quota-rate-limit',
+            severity: 'warning',
+            message: 'A recent 429 / RESOURCE_EXHAUSTED / quota signal was found in the local logs. This is informational; the switcher will not change accounts automatically.'
+        });
+    }
+    const exhaustedModels = (quota && Array.isArray(quota.models) ? quota.models : [])
+        .filter(model => model.exhausted)
+        .map(model => model.label);
+    if (exhaustedModels.length > 0) {
+        warnings.push({
+            code: 'quota-exhausted',
+            severity: 'warning',
+            message: `Local quota data marks these models as exhausted: ${exhaustedModels.join(', ')}.`
+        });
     }
 
     for (const conflict of session.conflicts || []) {
@@ -2935,6 +3285,7 @@ function getDoctorReport(options = {}) {
         surfaces: surfaceReport,
         permissions,
         keyring,
+        quota,
         warnings
     };
 }
@@ -2959,6 +3310,7 @@ function getDiagnostics() {
         switchState: state,
         storeDiff: diffAgainstSwitchState(state),
         keyring,
+        quota: getQuotaReport(),
         doctor: getDoctorReport(),
         savedProfiles: Object.keys(profiles),
         profileCompleteness: Object.fromEntries(Object.entries(profiles).map(([email, profile]) => [
@@ -3044,6 +3396,11 @@ module.exports = {
     getKeyringCredential,
     verifyKeyringRecord,
     getKeyringReport,
+    parseQuotaModel,
+    parseQuotaPayload,
+    parseUsageOutput,
+    runUsageCommand,
+    getQuotaReport,
     getDoctorReport,
     acquireSwitchLock,
     snapshotActiveAccount,

@@ -864,6 +864,7 @@ class TestSwitchCLI(unittest.TestCase):
             }],
             preferred_store="standaloneToken",
             keyring={"available": False},
+            quota={"available": False, "models": [], "signals": []},
         )
 
         self.assertFalse(report["ok"])
@@ -901,6 +902,7 @@ class TestSwitchCLI(unittest.TestCase):
                 "target": "gemini:antigravity",
                 "email": "other@example.com",
             },
+            quota={"available": False, "models": [], "signals": []},
         )
 
         self.assertFalse(report["ok"])
@@ -968,6 +970,119 @@ class TestSwitchCLI(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "stores disagree|keyring belongs"):
             switch.snapshot_active_account("Key", "key@example.com")
+
+    def test_parse_quota_payload_normalizes_values(self):
+        models = switch.parse_quota_payload({
+            "models": [
+                {"label": "Gemini 3.5 Pro", "remainingPercentage": 72, "resetTime": "2026-10-31T23:00:00Z"},
+                {"label": "Claude", "remainingPercentage": 0, "isExhausted": True},
+            ]
+        })
+
+        self.assertEqual(len(models), 2)
+        self.assertEqual(models[0]["remainingPercent"], 72.0)
+        self.assertFalse(models[0]["exhausted"])
+        self.assertTrue(models[0]["resetAt"].startswith("2026-10-31"))
+        self.assertTrue(models[1]["exhausted"])
+        self.assertEqual(models[1]["remainingPercent"], 0.0)
+
+    def test_parse_usage_output_reads_official_json(self):
+        parsed = switch.parse_usage_output(json.dumps({
+            "command": {
+                "data": {
+                    "groups": [{
+                        "name": "Gemini Models",
+                        "buckets": [{
+                            "name": "Weekly Limit Remaining",
+                            "remaining_fraction": 0.51,
+                            "reset_time": "2026-11-04T01:13:45Z",
+                        }],
+                    }]
+                }
+            }
+        }))
+
+        self.assertEqual(len(parsed["models"]), 1)
+        self.assertEqual(parsed["models"][0]["remainingPercent"], 51.0)
+        self.assertIn("Gemini Models", parsed["models"][0]["label"])
+
+    def test_get_quota_report_uses_live_payload(self):
+        report = switch.get_quota_report({
+            "live": True,
+            "usage_output": json.dumps({
+                "command": {
+                    "data": {
+                        "groups": [{
+                            "name": "Gemini Models",
+                            "buckets": [{
+                                "name": "Five Hour Limit Remaining",
+                                "remaining_fraction": 0.82,
+                                "reset_time": "2026-10-31T22:20:18Z",
+                            }],
+                        }]
+                    }
+                }
+            }),
+            "quota_paths": [],
+            "log_dirs": [],
+        }, refresh=True)
+
+        self.assertTrue(report["available"])
+        self.assertTrue(report["live"])
+        self.assertEqual(report["source"], "agy /usage")
+        self.assertEqual(report["models"][0]["remainingPercent"], 82.0)
+
+    def test_get_quota_report_reads_local_cache(self):
+        quota_path = os.path.join(self.root, "quota.json")
+        with open(quota_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "models": [
+                    {"label": "Gemini 3.5 Pro", "remainingPercentage": 42, "resetTime": "2026-10-31T23:00:00Z"}
+                ]
+            }, handle)
+
+        report = switch.get_quota_report({
+            "quota_paths": [quota_path],
+            "log_dirs": [],
+        }, refresh=True)
+
+        self.assertTrue(report["available"])
+        self.assertEqual(report["models"][0]["remainingPercent"], 42.0)
+        self.assertEqual(report["source"], quota_path)
+
+    def test_get_quota_report_detects_429_log_signal(self):
+        log_dir = os.path.join(self.root, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "cli-test.log"), "w", encoding="utf-8") as handle:
+            handle.write("E1031 20:00:00 RESOURCE_EXHAUSTED model=gemini-3.5-flash\n")
+
+        report = switch.get_quota_report({
+            "quota_paths": [],
+            "log_dirs": [log_dir],
+        }, refresh=True)
+
+        self.assertFalse(report["available"])
+        self.assertTrue(report["rateLimited"])
+        self.assertEqual(report["signals"][0]["kind"], "rate-limit")
+        self.assertNotIn("RESOURCE_EXHAUSTED", json.dumps(report["signals"]))
+
+    def test_get_doctor_report_flags_quota_rate_limit(self):
+        report = switch.get_doctor_report(
+            surfaces=[],
+            preferred_store="standaloneToken",
+            keyring={"available": False},
+            quota={
+                "available": True,
+                "rateLimited": True,
+                "models": [
+                    {"label": "Gemini 3.5 Pro", "remainingPercent": 0, "exhausted": True}
+                ],
+                "signals": [{"kind": "rate-limit"}],
+            },
+        )
+
+        self.assertTrue(any(warning["code"] == "quota-rate-limit" for warning in report["warnings"]))
+        self.assertTrue(any(warning["code"] == "quota-exhausted" for warning in report["warnings"]))
 
     def test_keyring_provider_refuses_unknown_targets(self):
         with self.assertRaisesRegex(RuntimeError, "unknown keyring target"):

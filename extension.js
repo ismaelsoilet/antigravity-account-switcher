@@ -7,6 +7,8 @@ const tokenManager = require('./tokenManager');
 
 let statusBarItem;
 let outputChannel;
+let dashboardProvider = null;
+let dashboardView = null;
 let lastKnownEmail = '';
 const promptedSessions = new Set();
 const lastPromptAt = new Map();
@@ -385,15 +387,25 @@ async function switchAccount(email, label) {
         return;
     }
 
+    const keyringProvider = typeof tokenManager.getKeyringProvider === 'function'
+        ? tokenManager.getKeyringProvider()
+        : null;
+    if (keyringProvider && keyringProvider.available && !profile.keyring) {
+        vscode.window.showErrorMessage(
+            `Profile "[${label}] ${profile.email}" has no captured Windows keyring. Sign in to this account and save the profile again before switching.`
+        );
+        return;
+    }
+
     const hasDbTokens = Object.keys(profile.db_tokens || {}).length > 0;
     const hasFileTokens = Boolean(profile.file_tokens && (
         profile.file_tokens.cliToken || profile.file_tokens.standaloneToken || profile.file_tokens.oauthCreds
     ));
 
     const details = [
-        'Antigravity IDE will reload to apply this account to the IDE, Antigravity Desktop and the CLI.',
+        'Antigravity IDE will reload to apply this account to the IDE, Antigravity Desktop, the CLI and the Windows keyring.',
         'Please save all open files before continuing.',
-        'If another Antigravity surface is still signed into a different account, reload/restart it after this switch; otherwise it may write its account back.'
+        'The Windows keyring is written and verified; if another surface is still signed into a different account, reload/restart it after this switch.'
     ];
     if (!hasDbTokens) details.push('This profile has no database tokens; the IDE database will be left unchanged.');
     if (!hasFileTokens) details.push('This profile has no OAuth token files; local token files will be cleared and you may need to sign in again.');
@@ -422,6 +434,7 @@ async function switchAccount(email, label) {
             vscode.window.showWarningMessage(`Account files were switched, but the database was not updated (${reason}).`);
         }
         await updateStatusBar();
+        refreshDashboard();
         void vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (error) {
         logError(`Failed to switch to ${profile.email}`, error);
@@ -480,6 +493,7 @@ async function saveOrRenameAccount(email, currentLabel) {
         const entry = tokenManager.snapshotActiveAccount(newLabel.trim(), session.email);
         conflictLogKeys.clear();
         await updateStatusBar();
+        refreshDashboard();
         const suffix = entry.complete ? '' : ' (incomplete: no database identity captured — sign in live and save again)';
         const merged = tokenManager.canonicalEmail(entry.email) !== tokenManager.canonicalEmail(session.email)
             ? ` (merged into existing profile ${entry.email})`
@@ -539,6 +553,7 @@ async function manualRegisterAccount() {
         const entry = tokenManager.snapshotActiveAccount(cleanLabel, cleanEmail);
         conflictLogKeys.clear();
         await updateStatusBar();
+        refreshDashboard();
         const suffix = entry.complete ? '' : ' (incomplete: no database identity captured — sign in live and save again)';
         const merged = tokenManager.canonicalEmail(entry.email) !== tokenManager.canonicalEmail(cleanEmail)
             ? ` (merged into existing profile ${entry.email})`
@@ -582,6 +597,7 @@ async function applyLoginCandidate(candidate, suggestedLabel) {
         const { entry } = tokenManager.switchToLoginSession(candidate, label.trim());
         conflictLogKeys.clear();
         await updateStatusBar();
+        refreshDashboard();
         vscode.window.showInformationMessage(`All surfaces switched to ${entry.email} as "[${entry.label}]".`);
         void vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (error) {
@@ -700,6 +716,7 @@ async function logoutAccount() {
             await vscode.commands.executeCommand('antigravity.internal.logout');
         } catch {}
         await updateStatusBar();
+        refreshDashboard();
         void vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (error) {
         logError('Logout failed', error);
@@ -736,6 +753,7 @@ async function clearAllData() {
         promptedSessions.clear();
         lastPromptAt.clear();
         await updateStatusBar();
+        refreshDashboard();
         void vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (error) {
         logError('Failed to clear switcher data', error);
@@ -775,6 +793,7 @@ async function deleteAccount(savedList) {
         delete profiles[entry.email];
         tokenManager.saveProfiles(profiles);
         await updateStatusBar();
+        refreshDashboard();
         vscode.window.showInformationMessage(`Account ${entry.email} removed.`);
     } catch (error) {
         logError('Failed to remove the account', error);
@@ -824,6 +843,234 @@ async function showDoctor() {
         logError('Doctor failed', error);
         vscode.window.showErrorMessage(`Doctor failed: ${error.message || error}`);
     }
+}
+
+function formatQuotaReset(value) {
+    if (!value) return '';
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp)) return '';
+    const remaining = timestamp - Date.now();
+    if (remaining <= 0) return 'reset due';
+    const minutes = Math.round(remaining / 60000);
+    if (minutes < 60) return `reset in ${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    if (hours < 48) return `reset in ${hours}h${rest ? ` ${rest}m` : ''}`;
+    return `resets ${new Date(timestamp).toLocaleDateString()}`;
+}
+
+class DashboardProvider {
+    constructor() {
+        this.emitter = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this.emitter.event;
+        this.context = null;
+    }
+
+    refresh(forceQuota = false) {
+        this.forceQuota = Boolean(forceQuota);
+        this.context = null;
+        this.emitter.fire();
+    }
+
+    getTreeItem(item) {
+        return item;
+    }
+
+    getContext() {
+        if (this.context) return this.context;
+        const session = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
+        const profiles = tokenManager.loadProfiles();
+        const keyring = tokenManager.getKeyringReport();
+        let quota;
+        try {
+            quota = tokenManager.getQuotaReport({
+                live: true,
+                refresh: Boolean(this.forceQuota),
+                usageTimeout: 8000
+            });
+        } catch {
+            quota = { available: false, models: [], signals: [], reason: 'usage-unavailable' };
+        }
+        this.forceQuota = false;
+        this.context = { session, profiles, keyring, quota };
+        return this.context;
+    }
+
+    getChildren(element) {
+        const context = this.getContext();
+        if (!element) return this.rootItems(context);
+        if (element.kind === 'profiles') return this.profileItems(context);
+        if (element.kind === 'quota') return this.quotaItems(context);
+        return [];
+    }
+
+    rootItems(context) {
+        const { session, profiles, keyring, quota } = context;
+        const matched = getProfileEntry(profiles, session.email);
+        const active = new vscode.TreeItem(
+            session.email || 'No Account',
+            vscode.TreeItemCollapsibleState.None
+        );
+        active.iconPath = new vscode.ThemeIcon(session.email ? 'account' : 'sign-in');
+        active.description = session.email
+            ? `${matched ? matched.label : 'not saved'}${session.conflicts.length ? ` · ${session.conflicts.length} conflict(s)` : ''}`
+            : 'signed out';
+        active.tooltip = session.email
+            ? `${session.email}${session.targetEmail ? `\nDesired: ${session.targetEmail}` : ''}`
+            : 'Use the menu to sign in or save the current session.';
+        active.command = { command: 'antigravity-account-switcher.switch', title: 'Switch Account' };
+
+        const keyringItem = new vscode.TreeItem('Keyring', vscode.TreeItemCollapsibleState.None);
+        keyringItem.iconPath = new vscode.ThemeIcon('key');
+        keyringItem.description = keyring.available
+            ? `${keyring.email || 'no email'} (managed)`
+            : (keyring.managed ? 'not found' : 'unavailable');
+        keyringItem.tooltip = keyring.available
+            ? `Windows Credential Manager ${keyring.target}`
+            : `Keyring provider: ${keyring.provider || 'none'} (${keyring.reason || 'unavailable'})`;
+        keyringItem.command = { command: 'antigravity-account-switcher.diagnostics', title: 'Show Diagnostics' };
+
+        const profilesItem = new vscode.TreeItem('Profiles', vscode.TreeItemCollapsibleState.Expanded);
+        profilesItem.kind = 'profiles';
+        profilesItem.iconPath = new vscode.ThemeIcon('person');
+        profilesItem.description = `${Object.keys(profiles).length}`;
+
+        const quotaItem = new vscode.TreeItem('Quota', vscode.TreeItemCollapsibleState.Expanded);
+        quotaItem.kind = 'quota';
+        quotaItem.iconPath = new vscode.ThemeIcon('pulse');
+        quotaItem.description = quota.available
+            ? `${quota.live ? 'live' : 'cached'}${quota.rateLimited ? ' · 429 signal' : ''}`
+            : 'not available locally';
+
+        const doctorItem = new vscode.TreeItem('Doctor', vscode.TreeItemCollapsibleState.None);
+        doctorItem.iconPath = new vscode.ThemeIcon('heart');
+        doctorItem.description = session.conflicts.length ? `${session.conflicts.length} issue(s)` : 'health check';
+        doctorItem.command = { command: 'antigravity-account-switcher.doctor', title: 'Run Doctor' };
+
+        const diagnosticsItem = new vscode.TreeItem('Diagnostics', vscode.TreeItemCollapsibleState.None);
+        diagnosticsItem.iconPath = new vscode.ThemeIcon('info');
+        diagnosticsItem.command = { command: 'antigravity-account-switcher.diagnostics', title: 'Show Diagnostics' };
+
+        return [active, keyringItem, profilesItem, quotaItem, doctorItem, diagnosticsItem];
+    }
+
+    profileItems(context) {
+        const { session, profiles, keyring } = context;
+        const keyringRequired = Boolean(keyring && keyring.managed);
+        const entries = Object.values(profiles).sort((left, right) => (
+            String(left.label || left.email).localeCompare(String(right.label || right.email))
+        ));
+        if (entries.length === 0) {
+            const empty = new vscode.TreeItem('No saved profiles', vscode.TreeItemCollapsibleState.None);
+            empty.iconPath = new vscode.ThemeIcon('info');
+            empty.description = 'Sign in and save the current session';
+            empty.command = { command: 'antigravity-account-switcher.login', title: 'Sign In' };
+            return [empty];
+        }
+        return entries.map(profile => {
+            const isActive = session.email
+                && tokenManager.canonicalEmail(profile.email) === tokenManager.canonicalEmail(session.email);
+            const missingKeyring = keyringRequired && !profile.keyring;
+            const item = new vscode.TreeItem(
+                profile.label || profile.email,
+                vscode.TreeItemCollapsibleState.None
+            );
+            item.iconPath = new vscode.ThemeIcon(
+                isActive ? 'check' : (missingKeyring ? 'warning' : 'person')
+            );
+            item.description = [
+                isActive ? 'active' : '',
+                profile.email,
+                missingKeyring ? 'keyring missing — re-save' : ''
+            ].filter(Boolean).join(' · ');
+            item.tooltip = `${profile.email}\nClick to switch manually.`;
+            item.command = {
+                command: 'antigravity-account-switcher.switchToProfile',
+                title: 'Switch to Profile',
+                arguments: [profile.email, profile.label || profile.email]
+            };
+            return item;
+        });
+    }
+
+    quotaItems(context) {
+        const quota = context.quota;
+        if (!quota.available) {
+            const unavailable = new vscode.TreeItem('Quota not cached', vscode.TreeItemCollapsibleState.None);
+            unavailable.iconPath = new vscode.ThemeIcon('info');
+            unavailable.description = 'Open Settings > View Usage';
+            unavailable.tooltip = quota.reason === 'usage-unavailable'
+                ? 'The official /usage call did not return data. Check that the CLI is signed in.'
+                : 'No local quota cache or usage data was found.';
+            unavailable.command = { command: 'antigravity-account-switcher.showQuota', title: 'Show Quota' };
+            return [unavailable];
+        }
+        const items = quota.models.map(model => {
+            const item = new vscode.TreeItem(model.label, vscode.TreeItemCollapsibleState.None);
+            const low = model.exhausted || model.remainingPercent <= 10;
+            item.iconPath = new vscode.ThemeIcon(low ? 'warning' : 'pulse');
+            item.description = model.exhausted
+                ? 'exhausted'
+                : `${model.remainingPercent}% left${model.resetAt ? ` · ${formatQuotaReset(model.resetAt)}` : ''}`;
+            item.tooltip = `${model.label}\n${model.remainingPercent}% remaining${model.resetAt ? `\nReset: ${model.resetAt}` : ''}`;
+            item.command = { command: 'antigravity-account-switcher.showQuota', title: 'Show Quota' };
+            return item;
+        });
+        if (quota.rateLimited) {
+            const signal = new vscode.TreeItem('Recent 429 signal', vscode.TreeItemCollapsibleState.None);
+            signal.iconPath = new vscode.ThemeIcon('warning');
+            signal.description = 'local logs · informational';
+            signal.tooltip = 'A recent 429 / RESOURCE_EXHAUSTED / quota signal was found. The switcher will not change accounts automatically.';
+            signal.command = { command: 'antigravity-account-switcher.showQuota', title: 'Show Quota' };
+            items.push(signal);
+        }
+        return items;
+    }
+}
+
+function refreshDashboard() {
+    if (!dashboardProvider) return;
+    if (dashboardView && !dashboardView.visible) return;
+    dashboardProvider.refresh();
+}
+
+async function switchToProfile(email, label) {
+    await switchAccount(email, label);
+    refreshDashboard();
+}
+
+async function showQuota() {
+    try {
+        const quota = tokenManager.getQuotaReport({ live: true, refresh: true, usageTimeout: 10000 });
+        if (outputChannel) {
+            outputChannel.appendLine(JSON.stringify(quota, null, 2));
+            outputChannel.show(true);
+        }
+        if (!quota.available) {
+            vscode.window.showInformationMessage(
+                'Quota is not available locally. Open Antigravity Settings > View Usage for the official panel.'
+            );
+            return;
+        }
+        const summary = quota.models
+            .map(model => `${model.label}: ${model.remainingPercent}%`)
+            .join(' · ');
+        const choice = await vscode.window.showInformationMessage(
+            `Quota: ${summary}`,
+            'Show Details'
+        );
+        if (choice === 'Show Details' && outputChannel) outputChannel.show(true);
+        refreshDashboard();
+    } catch (error) {
+        logError('Quota lookup failed', error);
+        vscode.window.showErrorMessage(`Quota lookup failed: ${error.message || error}`);
+    }
+}
+
+async function refreshDashboardCommand() {
+    if (!dashboardProvider) return;
+    if (dashboardView && !dashboardView.visible) return;
+    dashboardProvider.refresh(true);
 }
 
 async function checkAndPromptNewAccountOnStartup() {
@@ -974,12 +1221,27 @@ function activate(context) {
     statusBarItem.command = 'antigravity-account-switcher.switch';
     context.subscriptions.push(statusBarItem);
 
+    dashboardProvider = new DashboardProvider();
+    dashboardView = vscode.window.createTreeView('antigravityAccountSwitcher.dashboard', {
+        treeDataProvider: dashboardProvider,
+        showCollapseAll: true
+    });
+    context.subscriptions.push(dashboardView);
+    context.subscriptions.push(
+        dashboardView.onDidChangeVisibility(event => {
+            if (event.visible) refreshDashboard();
+        })
+    );
+
     context.subscriptions.push(
         vscode.commands.registerCommand('antigravity-account-switcher.switch', showAccountSwitcherMenu),
         vscode.commands.registerCommand('antigravity-account-switcher.save', () => saveOrRenameAccount('', '')),
         vscode.commands.registerCommand('antigravity-account-switcher.login', loginNewAccount),
         vscode.commands.registerCommand('antigravity-account-switcher.diagnostics', showDiagnostics),
-        vscode.commands.registerCommand('antigravity-account-switcher.doctor', showDoctor)
+        vscode.commands.registerCommand('antigravity-account-switcher.doctor', showDoctor),
+        vscode.commands.registerCommand('antigravity-account-switcher.refreshDashboard', refreshDashboardCommand),
+        vscode.commands.registerCommand('antigravity-account-switcher.showQuota', showQuota),
+        vscode.commands.registerCommand('antigravity-account-switcher.switchToProfile', switchToProfile)
     );
 
     activationTime = Date.now();

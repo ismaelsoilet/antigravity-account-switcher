@@ -971,6 +971,7 @@ test('getDoctorReport flags a stale surface during a conflict', async () => {
     const report = tokenManager.getDoctorReport({
         preferredStore: 'standaloneToken',
         keyring: { available: false },
+        quota: { available: false, models: [], signals: [] },
         surfaces: [{
             pid: 123,
             kind: 'desktop-wsl',
@@ -1098,11 +1099,118 @@ test('getDoctorReport flags a keyring mismatch', async () => {
             provider: 'windows-credential-manager',
             target: 'gemini:antigravity',
             email: 'other@example.com'
-        }
+        },
+        quota: { available: false, models: [], signals: [] }
     });
 
     assert.strictEqual(report.ok, false);
     assert.ok(report.warnings.some(warning => warning.code === 'keyring-mismatch'));
+});
+
+test('parseQuotaPayload normalizes percentages and reset times', async () => {
+    const models = tokenManager.parseQuotaPayload({
+        models: [
+            { label: 'Gemini 3.5 Pro', remainingPercentage: 72, resetTime: '2026-10-31T23:00:00Z' },
+            { label: 'Claude', remainingPercentage: 0, isExhausted: true }
+        ]
+    });
+
+    assert.strictEqual(models.length, 2);
+    assert.strictEqual(models[0].remainingPercent, 72);
+    assert.strictEqual(models[0].exhausted, false);
+    assert.ok(models[0].resetAt.startsWith('2026-10-31'));
+    assert.strictEqual(models[1].remainingPercent, 0);
+    assert.strictEqual(models[1].exhausted, true);
+});
+
+test('parseUsageOutput understands the official /usage JSON', async () => {
+    const parsed = tokenManager.parseUsageOutput(JSON.stringify({
+        command: {
+            data: {
+                groups: [{
+                    name: 'Gemini Models',
+                    buckets: [
+                        { name: 'Weekly Limit Remaining', remaining_fraction: 0.51, reset_time: '2026-11-04T01:13:45Z' },
+                        { name: 'Five Hour Limit Remaining', remaining_fraction: 0.82, reset_time: '2026-10-31T22:20:18Z' }
+                    ]
+                }]
+            }
+        }
+    }));
+
+    assert.strictEqual(parsed.models.length, 2);
+    assert.strictEqual(parsed.models[0].remainingPercent, 51);
+    assert.strictEqual(parsed.models[0].exhausted, false);
+    assert.ok(parsed.models[0].label.includes('Gemini Models'));
+});
+
+test('getQuotaReport can use a live usage payload', async () => {
+    const report = tokenManager.getQuotaReport({
+        live: true,
+        usageOutput: JSON.stringify({
+            command: {
+                data: {
+                    groups: [{
+                        name: 'Gemini Models',
+                        buckets: [{ name: 'Weekly Limit Remaining', remaining_fraction: 0.4, reset_time: '2026-11-04T01:13:45Z' }]
+                    }]
+                }
+            }
+        }),
+        quotaPaths: [],
+        logDirs: [],
+        refresh: true
+    });
+
+    assert.strictEqual(report.available, true);
+    assert.strictEqual(report.live, true);
+    assert.strictEqual(report.source, 'agy /usage');
+    assert.strictEqual(report.models[0].remainingPercent, 40);
+});
+
+test('getQuotaReport reads local quota cache and detects 429 logs', async () => {
+    const quotaPath = path.join(root, 'quota-test.json');
+    fs.writeFileSync(quotaPath, JSON.stringify({
+        models: [{ label: 'Gemini 3.5 Pro', remainingPercentage: 42, resetTime: '2026-10-31T23:00:00Z' }]
+    }), 'utf-8');
+    const fromFile = tokenManager.getQuotaReport({
+        quotaPaths: [quotaPath],
+        logDirs: [],
+        refresh: true
+    });
+    assert.strictEqual(fromFile.available, true);
+    assert.strictEqual(fromFile.models[0].remainingPercent, 42);
+    assert.strictEqual(fromFile.source, quotaPath);
+
+    const logDir = path.join(root, 'quota-logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(path.join(logDir, 'cli-test.log'), 'E1031 20:00:00 RESOURCE_EXHAUSTED model=gemini-3.5-flash\n', 'utf-8');
+    const fromLog = tokenManager.getQuotaReport({
+        quotaPaths: [],
+        logDirs: [logDir],
+        refresh: true
+    });
+    assert.strictEqual(fromLog.available, false);
+    assert.strictEqual(fromLog.rateLimited, true);
+    assert.strictEqual(fromLog.signals[0].kind, 'rate-limit');
+    assert.ok(!JSON.stringify(fromLog.signals).includes('RESOURCE_EXHAUSTED'));
+});
+
+test('getDoctorReport flags quota rate-limit and exhausted models', async () => {
+    const report = tokenManager.getDoctorReport({
+        preferredStore: 'standaloneToken',
+        surfaces: [],
+        keyring: { available: false },
+        quota: {
+            available: true,
+            rateLimited: true,
+            models: [{ label: 'Gemini 3.5 Pro', remainingPercent: 0, exhausted: true }],
+            signals: [{ kind: 'rate-limit' }]
+        }
+    });
+
+    assert.ok(report.warnings.some(warning => warning.code === 'quota-rate-limit'));
+    assert.ok(report.warnings.some(warning => warning.code === 'quota-exhausted'));
 });
 
 test('keyring provider refuses unknown targets', async () => {

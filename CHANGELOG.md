@@ -4,6 +4,31 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.1 — 2026-10-31
+
+### Added
+
+- **Official read-only quota:** `agy-switch quota` / `quota --json` runs
+  `agy --print /usage --output-format json` and shows weekly + 5-hour remaining
+  percentages and reset times. `--local` skips the CLI call.
+- **Activity Bar dashboard:** active account, keyring status, saved profiles,
+  live quota, 429 signals and Doctor/diagnostics shortcuts. Profile clicks use
+  the existing manual switch confirmation.
+- **429 signal detection:** recent 429 / RESOURCE_EXHAUSTED / quota messages in
+  local logs are shown as informational warnings. No auto-rotation or failover.
+- Local quota cache/log fallback when the CLI is unavailable.
+
+### Changed
+
+- New Activity Bar SVG icon (`assets/activity.svg`) and view-title commands
+  (refresh, quota, Doctor).
+- Manual-only switching remains the rule; no account is changed automatically.
+
+### Tests
+
+- 57 JavaScript tests and 60 Python tests passing (1 opt-in real keyring test
+  skipped by default; it passes separately).
+
 ## 1.8.0 — 2026-10-31
 
 ### Added
