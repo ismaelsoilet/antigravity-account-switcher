@@ -204,7 +204,7 @@ function renderDashboardHtml(snapshot, nonce) {
         --good: var(--vscode-testing-iconPassed, #3fb950);
         --warn: var(--vscode-editorWarning-foreground, #d29922);
         --bad: var(--vscode-errorForeground, #f85149);
-        --bar-bg: var(--vscode-progressBar-background, rgba(127,127,127,.25));
+        --bar-bg: rgba(127,127,127,.18);
     }
     * { box-sizing: border-box; }
     body {

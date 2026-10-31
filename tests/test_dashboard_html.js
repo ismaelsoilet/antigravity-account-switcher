@@ -50,6 +50,8 @@ assert.ok(html.includes('Keyring managed'));
 assert.ok(html.includes('data-action="switch"'));
 assert.ok(html.includes('data-action="openSettings"'));
 assert.ok(html.includes("script-src 'nonce-abc123'"));
+assert.ok(html.includes('--bar-bg: rgba(127,127,127,.18)'));
+assert.ok(!html.includes('--bar-bg: var(--vscode-progressBar-background'));
 assert.ok(!html.includes('<script>alert(1)</script>'));
 assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
 assert.ok(!html.includes('refresh_token'));

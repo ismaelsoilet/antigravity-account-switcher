@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.8.2)
+Antigravity Account Switcher - CLI Core Engine (v1.8.3)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -26,7 +26,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
 FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {

@@ -4,6 +4,19 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.3 — 2026-10-31
+
+### Fixed
+
+- Quota progress bars no longer use the theme's blue progress accent for the
+  empty track. The unfilled part is neutral; only the remaining-quota fill is
+  green/amber/red, so it no longer looks like extra quota.
+
+### Tests
+
+- Dashboard HTML test asserts the neutral track and rejects the blue
+  `progressBar-background` track. 58 JavaScript + 60 Python tests passing.
+
 ## 1.8.2 — 2026-10-31
 
 ### Added
