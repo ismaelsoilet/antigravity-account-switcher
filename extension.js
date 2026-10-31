@@ -3,12 +3,14 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const tokenManager = require('./tokenManager');
+const { renderDashboardHtml, escapeHtml } = require('./dashboardHtml');
 
 let statusBarItem;
+let quotaStatusBarItem;
 let outputChannel;
 let dashboardProvider = null;
-let dashboardView = null;
 let lastKnownEmail = '';
 const promptedSessions = new Set();
 const lastPromptAt = new Map();
@@ -859,25 +861,53 @@ function formatQuotaReset(value) {
     return `resets ${new Date(timestamp).toLocaleDateString()}`;
 }
 
-class DashboardProvider {
-    constructor() {
-        this.emitter = new vscode.EventEmitter();
-        this.onDidChangeTreeData = this.emitter.event;
-        this.context = null;
+class DashboardViewProvider {
+    constructor(context) {
+        this.context = context;
+        this.view = null;
+        this.pendingForceQuota = false;
     }
 
-    refresh(forceQuota = false) {
-        this.forceQuota = Boolean(forceQuota);
-        this.context = null;
-        this.emitter.fire();
+    resolveWebviewView(view) {
+        this.view = view;
+        view.webview.options = {
+            enableScripts: true,
+            localResourceRoots: []
+        };
+        view.webview.onDidReceiveMessage(async message => {
+            if (!message || typeof message.command !== 'string') return;
+            try {
+                if (message.command === 'switch') {
+                    await switchAccount(message.email, message.label);
+                } else if (message.command === 'save') {
+                    await saveOrRenameAccount('', '');
+                } else if (message.command === 'login') {
+                    await loginNewAccount();
+                } else if (message.command === 'doctor') {
+                    await showDoctor();
+                } else if (message.command === 'diagnostics') {
+                    await showDiagnostics();
+                } else if (message.command === 'openSettings') {
+                    await vscode.commands.executeCommand(
+                        'workbench.action.openSettings',
+                        'antigravityAccountSwitcher'
+                    );
+                } else if (message.command === 'refresh') {
+                    await this.update(true);
+                }
+            } catch (error) {
+                logError(`Dashboard action ${message.command} failed`, error);
+                vscode.window.showErrorMessage(`Dashboard action failed: ${error.message || error}`);
+            }
+        });
+        view.onDidChangeVisibility(() => {
+            if (view.visible) void this.update(false);
+        });
+        void this.update(this.pendingForceQuota);
+        this.pendingForceQuota = false;
     }
 
-    getTreeItem(item) {
-        return item;
-    }
-
-    getContext() {
-        if (this.context) return this.context;
+    buildSnapshot(forceQuota) {
         const session = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
         const profiles = tokenManager.loadProfiles();
         const keyring = tokenManager.getKeyringReport();
@@ -885,153 +915,76 @@ class DashboardProvider {
         try {
             quota = tokenManager.getQuotaReport({
                 live: true,
-                refresh: Boolean(this.forceQuota),
+                refresh: Boolean(forceQuota),
                 usageTimeout: 8000
             });
         } catch {
-            quota = { available: false, models: [], signals: [], reason: 'usage-unavailable' };
-        }
-        this.forceQuota = false;
-        this.context = { session, profiles, keyring, quota };
-        return this.context;
-    }
-
-    getChildren(element) {
-        const context = this.getContext();
-        if (!element) return this.rootItems(context);
-        if (element.kind === 'profiles') return this.profileItems(context);
-        if (element.kind === 'quota') return this.quotaItems(context);
-        return [];
-    }
-
-    rootItems(context) {
-        const { session, profiles, keyring, quota } = context;
-        const matched = getProfileEntry(profiles, session.email);
-        const active = new vscode.TreeItem(
-            session.email || 'No Account',
-            vscode.TreeItemCollapsibleState.None
-        );
-        active.iconPath = new vscode.ThemeIcon(session.email ? 'account' : 'sign-in');
-        active.description = session.email
-            ? `${matched ? matched.label : 'not saved'}${session.conflicts.length ? ` · ${session.conflicts.length} conflict(s)` : ''}`
-            : 'signed out';
-        active.tooltip = session.email
-            ? `${session.email}${session.targetEmail ? `\nDesired: ${session.targetEmail}` : ''}`
-            : 'Use the menu to sign in or save the current session.';
-        active.command = { command: 'antigravity-account-switcher.switch', title: 'Switch Account' };
-
-        const keyringItem = new vscode.TreeItem('Keyring', vscode.TreeItemCollapsibleState.None);
-        keyringItem.iconPath = new vscode.ThemeIcon('key');
-        keyringItem.description = keyring.available
-            ? `${keyring.email || 'no email'} (managed)`
-            : (keyring.managed ? 'not found' : 'unavailable');
-        keyringItem.tooltip = keyring.available
-            ? `Windows Credential Manager ${keyring.target}`
-            : `Keyring provider: ${keyring.provider || 'none'} (${keyring.reason || 'unavailable'})`;
-        keyringItem.command = { command: 'antigravity-account-switcher.diagnostics', title: 'Show Diagnostics' };
-
-        const profilesItem = new vscode.TreeItem('Profiles', vscode.TreeItemCollapsibleState.Expanded);
-        profilesItem.kind = 'profiles';
-        profilesItem.iconPath = new vscode.ThemeIcon('person');
-        profilesItem.description = `${Object.keys(profiles).length}`;
-
-        const quotaItem = new vscode.TreeItem('Quota', vscode.TreeItemCollapsibleState.Expanded);
-        quotaItem.kind = 'quota';
-        quotaItem.iconPath = new vscode.ThemeIcon('pulse');
-        quotaItem.description = quota.available
-            ? `${quota.live ? 'live' : 'cached'}${quota.rateLimited ? ' · 429 signal' : ''}`
-            : 'not available locally';
-
-        const doctorItem = new vscode.TreeItem('Doctor', vscode.TreeItemCollapsibleState.None);
-        doctorItem.iconPath = new vscode.ThemeIcon('heart');
-        doctorItem.description = session.conflicts.length ? `${session.conflicts.length} issue(s)` : 'health check';
-        doctorItem.command = { command: 'antigravity-account-switcher.doctor', title: 'Run Doctor' };
-
-        const diagnosticsItem = new vscode.TreeItem('Diagnostics', vscode.TreeItemCollapsibleState.None);
-        diagnosticsItem.iconPath = new vscode.ThemeIcon('info');
-        diagnosticsItem.command = { command: 'antigravity-account-switcher.diagnostics', title: 'Show Diagnostics' };
-
-        return [active, keyringItem, profilesItem, quotaItem, doctorItem, diagnosticsItem];
-    }
-
-    profileItems(context) {
-        const { session, profiles, keyring } = context;
-        const keyringRequired = Boolean(keyring && keyring.managed);
-        const entries = Object.values(profiles).sort((left, right) => (
-            String(left.label || left.email).localeCompare(String(right.label || right.email))
-        ));
-        if (entries.length === 0) {
-            const empty = new vscode.TreeItem('No saved profiles', vscode.TreeItemCollapsibleState.None);
-            empty.iconPath = new vscode.ThemeIcon('info');
-            empty.description = 'Sign in and save the current session';
-            empty.command = { command: 'antigravity-account-switcher.login', title: 'Sign In' };
-            return [empty];
-        }
-        return entries.map(profile => {
-            const isActive = session.email
-                && tokenManager.canonicalEmail(profile.email) === tokenManager.canonicalEmail(session.email);
-            const missingKeyring = keyringRequired && !profile.keyring;
-            const item = new vscode.TreeItem(
-                profile.label || profile.email,
-                vscode.TreeItemCollapsibleState.None
-            );
-            item.iconPath = new vscode.ThemeIcon(
-                isActive ? 'check' : (missingKeyring ? 'warning' : 'person')
-            );
-            item.description = [
-                isActive ? 'active' : '',
-                profile.email,
-                missingKeyring ? 'keyring missing — re-save' : ''
-            ].filter(Boolean).join(' · ');
-            item.tooltip = `${profile.email}\nClick to switch manually.`;
-            item.command = {
-                command: 'antigravity-account-switcher.switchToProfile',
-                title: 'Switch to Profile',
-                arguments: [profile.email, profile.label || profile.email]
+            quota = {
+                available: false,
+                models: [],
+                signals: [],
+                rateLimited: false,
+                reason: 'usage-unavailable'
             };
-            return item;
-        });
+        }
+        const matched = getProfileEntry(profiles, session.email);
+        const activeLabel = matched
+            ? matched.label
+            : (session.email ? session.email.split('@')[0] : '');
+        return {
+            version: tokenManager.VERSION,
+            active: {
+                email: session.email || '',
+                label: activeLabel,
+                targetEmail: session.targetEmail || '',
+                conflicts: (session.conflicts || []).length,
+                conflictDetails: (session.conflicts || []).length
+                    ? describeSessionConflicts(session)
+                    : ''
+            },
+            keyring,
+            quota,
+            profiles: Object.values(profiles).map(profile => ({
+                email: profile.email,
+                label: profile.label || profile.email,
+                complete: profile.complete !== false,
+                keyring: Boolean(profile.keyring),
+                active: Boolean(
+                    session.email
+                    && tokenManager.canonicalEmail(profile.email) === tokenManager.canonicalEmail(session.email)
+                )
+            })).sort((left, right) => String(left.label).localeCompare(String(right.label)))
+        };
     }
 
-    quotaItems(context) {
-        const quota = context.quota;
-        if (!quota.available) {
-            const unavailable = new vscode.TreeItem('Quota not cached', vscode.TreeItemCollapsibleState.None);
-            unavailable.iconPath = new vscode.ThemeIcon('info');
-            unavailable.description = 'Open Settings > View Usage';
-            unavailable.tooltip = quota.reason === 'usage-unavailable'
-                ? 'The official /usage call did not return data. Check that the CLI is signed in.'
-                : 'No local quota cache or usage data was found.';
-            unavailable.command = { command: 'antigravity-account-switcher.showQuota', title: 'Show Quota' };
-            return [unavailable];
+    async update(forceQuota = false) {
+        if (!this.view) {
+            this.pendingForceQuota = this.pendingForceQuota || Boolean(forceQuota);
+            return;
         }
-        const items = quota.models.map(model => {
-            const item = new vscode.TreeItem(model.label, vscode.TreeItemCollapsibleState.None);
-            const low = model.exhausted || model.remainingPercent <= 10;
-            item.iconPath = new vscode.ThemeIcon(low ? 'warning' : 'pulse');
-            item.description = model.exhausted
-                ? 'exhausted'
-                : `${model.remainingPercent}% left${model.resetAt ? ` · ${formatQuotaReset(model.resetAt)}` : ''}`;
-            item.tooltip = `${model.label}\n${model.remainingPercent}% remaining${model.resetAt ? `\nReset: ${model.resetAt}` : ''}`;
-            item.command = { command: 'antigravity-account-switcher.showQuota', title: 'Show Quota' };
-            return item;
-        });
-        if (quota.rateLimited) {
-            const signal = new vscode.TreeItem('Recent 429 signal', vscode.TreeItemCollapsibleState.None);
-            signal.iconPath = new vscode.ThemeIcon('warning');
-            signal.description = 'local logs · informational';
-            signal.tooltip = 'A recent 429 / RESOURCE_EXHAUSTED / quota signal was found. The switcher will not change accounts automatically.';
-            signal.command = { command: 'antigravity-account-switcher.showQuota', title: 'Show Quota' };
-            items.push(signal);
+        try {
+            const snapshot = this.buildSnapshot(forceQuota);
+            const nonce = crypto.randomBytes(16).toString('hex');
+            this.view.webview.html = renderDashboardHtml(snapshot, nonce);
+            void updateQuotaStatusBar();
+        } catch (error) {
+            logError('Dashboard update failed', error);
+            this.view.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:12px;color:var(--vscode-foreground)"><strong>Dashboard unavailable</strong><p>${escapeHtml(error.message || String(error))}</p></body></html>`;
         }
-        return items;
+    }
+
+    refresh(forceQuota = false) {
+        if (!this.view) {
+            this.pendingForceQuota = this.pendingForceQuota || Boolean(forceQuota);
+            return;
+        }
+        void this.update(forceQuota);
     }
 }
 
 function refreshDashboard() {
     if (!dashboardProvider) return;
-    if (dashboardView && !dashboardView.visible) return;
-    dashboardProvider.refresh();
+    dashboardProvider.refresh(false);
 }
 
 async function switchToProfile(email, label) {
@@ -1039,28 +992,16 @@ async function switchToProfile(email, label) {
     refreshDashboard();
 }
 
+async function openDashboard() {
+    await vscode.commands.executeCommand('workbench.view.extension.antigravityAccountSwitcher');
+    if (dashboardProvider && dashboardProvider.view) dashboardProvider.refresh(false);
+    void updateQuotaStatusBar();
+}
+
 async function showQuota() {
     try {
-        const quota = tokenManager.getQuotaReport({ live: true, refresh: true, usageTimeout: 10000 });
-        if (outputChannel) {
-            outputChannel.appendLine(JSON.stringify(quota, null, 2));
-            outputChannel.show(true);
-        }
-        if (!quota.available) {
-            vscode.window.showInformationMessage(
-                'Quota is not available locally. Open Antigravity Settings > View Usage for the official panel.'
-            );
-            return;
-        }
-        const summary = quota.models
-            .map(model => `${model.label}: ${model.remainingPercent}%`)
-            .join(' · ');
-        const choice = await vscode.window.showInformationMessage(
-            `Quota: ${summary}`,
-            'Show Details'
-        );
-        if (choice === 'Show Details' && outputChannel) outputChannel.show(true);
-        refreshDashboard();
+        await openDashboard();
+        if (dashboardProvider) dashboardProvider.refresh(true);
     } catch (error) {
         logError('Quota lookup failed', error);
         vscode.window.showErrorMessage(`Quota lookup failed: ${error.message || error}`);
@@ -1069,8 +1010,45 @@ async function showQuota() {
 
 async function refreshDashboardCommand() {
     if (!dashboardProvider) return;
-    if (dashboardView && !dashboardView.visible) return;
+    if (!dashboardProvider.view) {
+        await openDashboard();
+        return;
+    }
     dashboardProvider.refresh(true);
+}
+
+async function updateQuotaStatusBar() {
+    if (!quotaStatusBarItem) return;
+    try {
+        const quota = tokenManager.getQuotaReport({ live: true, refresh: false, usageTimeout: 8000 });
+        if (!quota.available) {
+            quotaStatusBarItem.text = '$(pulse) Quota';
+            quotaStatusBarItem.tooltip = 'Quota is not available locally. Click to open the Antigravity Accounts dashboard.';
+            quotaStatusBarItem.show();
+            return;
+        }
+        const weekly = quota.models.find(model => /weekly/i.test(model.label));
+        const fiveHour = quota.models.find(model => /five hour|5-hour|5h/i.test(model.label));
+        const geminiWeekly = quota.models.find(model => /gemini/i.test(model.label) && /weekly/i.test(model.label)) || weekly;
+        const geminiFive = quota.models.find(model => /gemini/i.test(model.label) && /five hour|5-hour|5h/i.test(model.label)) || fiveHour;
+        const parts = [];
+        if (geminiWeekly) parts.push(`${Math.round(geminiWeekly.remainingPercent)}%`);
+        if (geminiFive) parts.push(`5h ${Math.round(geminiFive.remainingPercent)}%`);
+        quotaStatusBarItem.text = `${quota.rateLimited ? '$(warning)' : '$(pulse)'} ${parts.join(' · ') || 'Quota'}`;
+        const tooltip = new vscode.MarkdownString();
+        tooltip.appendMarkdown('**Antigravity quota**\n\n');
+        for (const model of quota.models) {
+            tooltip.appendMarkdown(`- ${model.label}: ${model.remainingPercent}%${model.exhausted ? ' (exhausted)' : ''}\n`);
+        }
+        if (quota.rateLimited) {
+            tooltip.appendMarkdown('\nA recent 429 / quota signal was found in local logs. This is informational only.\n');
+        }
+        tooltip.appendMarkdown('\nClick to open the dashboard.');
+        quotaStatusBarItem.tooltip = tooltip;
+        quotaStatusBarItem.show();
+    } catch (error) {
+        logError('Could not update quota status bar', error);
+    }
 }
 
 async function checkAndPromptNewAccountOnStartup() {
@@ -1221,16 +1199,18 @@ function activate(context) {
     statusBarItem.command = 'antigravity-account-switcher.switch';
     context.subscriptions.push(statusBarItem);
 
-    dashboardProvider = new DashboardProvider();
-    dashboardView = vscode.window.createTreeView('antigravityAccountSwitcher.dashboard', {
-        treeDataProvider: dashboardProvider,
-        showCollapseAll: true
-    });
-    context.subscriptions.push(dashboardView);
+    quotaStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+    quotaStatusBarItem.name = 'Antigravity Quota';
+    quotaStatusBarItem.command = 'antigravity-account-switcher.showQuota';
+    context.subscriptions.push(quotaStatusBarItem);
+
+    dashboardProvider = new DashboardViewProvider(context);
     context.subscriptions.push(
-        dashboardView.onDidChangeVisibility(event => {
-            if (event.visible) refreshDashboard();
-        })
+        vscode.window.registerWebviewViewProvider(
+            'antigravityAccountSwitcher.dashboard',
+            dashboardProvider,
+            { webviewOptions: { retainContextWhenHidden: true } }
+        )
     );
 
     context.subscriptions.push(
@@ -1241,6 +1221,7 @@ function activate(context) {
         vscode.commands.registerCommand('antigravity-account-switcher.doctor', showDoctor),
         vscode.commands.registerCommand('antigravity-account-switcher.refreshDashboard', refreshDashboardCommand),
         vscode.commands.registerCommand('antigravity-account-switcher.showQuota', showQuota),
+        vscode.commands.registerCommand('antigravity-account-switcher.openDashboard', openDashboard),
         vscode.commands.registerCommand('antigravity-account-switcher.switchToProfile', switchToProfile)
     );
 
@@ -1260,16 +1241,37 @@ function activate(context) {
     log(`Databases: ${initialized.dbPaths.join(', ') || '(none)'}`);
 
     void updateStatusBar();
+    void updateQuotaStatusBar();
     setupTokenFileWatchers(context);
 
     context.subscriptions.push(
         vscode.window.onDidChangeWindowState(state => {
             if (!state.focused) return;
             void updateStatusBar();
+            void updateQuotaStatusBar();
         })
     );
 
     setTimeout(() => { void checkAndPromptNewAccountOnStartup(); }, 2000);
+
+    const introSeen = context.globalState
+        ? context.globalState.get('antigravityAccountSwitcher.dashboardIntroSeen', false)
+        : false;
+    if (!introSeen) {
+        setTimeout(async () => {
+            try {
+                const choice = await vscode.window.showInformationMessage(
+                    'Antigravity Accounts: quota, profiles and Doctor are in the Activity Bar.',
+                    'Open Dashboard',
+                    'Later'
+                );
+                if (choice === 'Open Dashboard') await openDashboard();
+                if (context.globalState) {
+                    await context.globalState.update('antigravityAccountSwitcher.dashboardIntroSeen', true);
+                }
+            } catch {}
+        }, 2500);
+    }
 
     if (!tokenManager.isDbSupportAvailable()) {
         log('node:sqlite is unavailable in this host. Database synchronization is disabled.');

@@ -4,6 +4,31 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.2 — 2026-10-31
+
+### Added
+
+- **Rich Accounts dashboard:** the Activity Bar view is now a themed webview
+  with quota progress bars, reset countdowns, profile cards, keyring/conflict
+  chips and manual switch buttons.
+- **Status bar quota indicator:** compact Gemini weekly + 5-hour percentages
+  with a detailed tooltip; click to open the dashboard.
+- **Discoverability:** **Antigravity: Open Accounts Dashboard** command,
+  view-title refresh/quota/Doctor buttons, and a one-time onboarding prompt.
+- **Dashboard HTML renderer** (`dashboardHtml.js`) with escaped values, CSP
+  nonce and an empty-state fallback.
+
+### Changed
+
+- Profile actions from the dashboard still use the existing manual switch
+  confirmation and strict keyring migration checks.
+- No automatic switching, rotation, pooling, proxy or isolation was added.
+
+### Tests
+
+- 58 JavaScript tests (including the dashboard HTML renderer) and 60 Python
+  tests passing; 1 opt-in real keyring test skipped by default.
+
 ## 1.8.1 — 2026-10-31
 
 ### Added

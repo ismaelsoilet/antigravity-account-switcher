@@ -36,7 +36,9 @@ jobs:
           python -m py_compile switch.py
 
       - name: JavaScript tests
-        run: node tests/test_token_manager.js
+        run: |
+          node tests/test_token_manager.js
+          node tests/test_dashboard_html.js
 
       - name: Python tests
         run: python -m unittest discover -s tests -v

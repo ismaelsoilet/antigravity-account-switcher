@@ -1,7 +1,7 @@
 # Master Development Plan — Secure, TOS-Safe Account Switcher
 
 Status: active, 2026-10-31
-Current build: `1.8.1` (keyring-aware switching + read-only quota/dashboard)
+Current build: `1.8.2` (rich dashboard + status-bar quota)
 Next code milestone: `1.9.0` (vault encryption, Open VSX, hardening)
 
 ## 1. Product principles
@@ -204,6 +204,13 @@ screenshots/GIF, release notes, reproducible VSIX, prerelease tags.
 - Read-only official `/usage` quota/reset display with local fallback.
 - Activity Bar dashboard and 429 log signals.
 - No automatic switching. Implemented and verified live.
+
+### 1.8.2 — UX/UI overhaul (done)
+
+- Rich Activity Bar webview: quota progress bars, profile cards, keyring and
+  conflict chips, manual actions.
+- Status-bar quota indicator, Open Dashboard command and onboarding prompt.
+- Dashboard renderer tests and CSP-safe HTML.
 
 ### 1.9.0 — security and distribution
 

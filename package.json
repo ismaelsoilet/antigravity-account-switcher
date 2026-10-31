@@ -2,7 +2,7 @@
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
   "description": "Visual multi-account switcher and profile manager embedded directly in Antigravity IDE, synchronized across Antigravity 2.0 Desktop and the CLI.",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "license": "MIT",
   "icon": "assets/icon.png",
   "extensionKind": [
@@ -36,7 +36,7 @@
   ],
   "main": "./extension.js",
   "scripts": {
-    "test": "node tests/test_token_manager.js && python3 -m unittest discover -s tests -v",
+    "test": "node tests/test_token_manager.js && node tests/test_dashboard_html.js && python3 -m unittest discover -s tests -v",
     "package": "npx @vscode/vsce package"
   },
   "contributes": {
@@ -104,6 +104,12 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "antigravity-account-switcher.openDashboard",
+        "title": "Antigravity: Open Accounts Dashboard",
+        "category": "Antigravity",
+        "icon": "$(window)"
+      },
+      {
         "command": "antigravity-account-switcher.switchToProfile",
         "title": "Antigravity: Switch to Profile",
         "category": "Antigravity"
@@ -123,16 +129,11 @@
         {
           "id": "antigravityAccountSwitcher.dashboard",
           "name": "Accounts",
+          "type": "webview",
           "contextualTitle": "Antigravity Accounts"
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "antigravityAccountSwitcher.dashboard",
-        "contents": "No saved accounts yet.\n[Sign In](command:antigravity-account-switcher.login)\n[Save Current Session](command:antigravity-account-switcher.save)"
-      }
-    ],
     "menus": {
       "view/title": [
         {

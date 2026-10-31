@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.8.1';
+const VERSION = '1.8.2';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;

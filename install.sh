@@ -179,6 +179,7 @@ install_extension() {
         mkdir -p "$target"
         install -m 0644 "$REPO_DIR/extension.js" "$target/extension.js"
         install -m 0644 "$REPO_DIR/tokenManager.js" "$target/tokenManager.js"
+        install -m 0644 "$REPO_DIR/dashboardHtml.js" "$target/dashboardHtml.js"
         install -m 0644 "$REPO_DIR/package.json" "$target/package.json"
         if [ -f "$REPO_DIR/LICENSE" ]; then
             install -m 0644 "$REPO_DIR/LICENSE" "$target/LICENSE"
