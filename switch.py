@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.8.0-alpha.1)
+Antigravity Account Switcher - CLI Core Engine (v1.8.0)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -26,7 +26,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.8.0-alpha.1"
+VERSION = "1.8.0"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
 FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {
@@ -564,7 +564,7 @@ def _select_primary_store(stores, target_email, preferred_store):
     return stores[0]
 
 
-def detect_sessions(preferred_store="standaloneToken"):
+def detect_sessions(preferred_store="standaloneToken", include_keyring=False):
     db_stores = read_db_stores()
     db_identity_emails = unique_strings([
         email for store in db_stores for email in store.get("identityEmails", [])
@@ -580,7 +580,29 @@ def detect_sessions(preferred_store="standaloneToken"):
             store["needsEmail"] = False
         file_stores.append(store)
 
-    stores = file_stores + db_stores
+    keyring_store = None
+    if include_keyring:
+        provider = get_keyring_provider()
+        if provider and getattr(provider, "available", False):
+            record = get_keyring_credential({"refresh": False})
+            if record:
+                keyring_store = {
+                    "path": f"keyring://{record['target']}",
+                    "kind": "keyring",
+                    "category": "keyring",
+                    "home": "win",
+                    "email": record["email"],
+                    "canonicalEmail": canonical_email(record["email"]),
+                    "fingerprint": record.get("refreshFingerprint", ""),
+                    "mtimeMs": 0,
+                    "size": record.get("blobLength", 0),
+                    "usable": True,
+                    "hasToken": True,
+                    "hasIdentity": True,
+                    "hasOauthToken": False,
+                    "needsEmail": False,
+                }
+    stores = file_stores + db_stores + ([keyring_store] if keyring_store else [])
     usable = [
         store for store in stores
         if store["usable"] and store["hasToken"] and not store.get("identityConflict")
@@ -672,8 +694,8 @@ def _preferred_store():
     return "cliToken" if value in ("cliToken", "cli") else "standaloneToken"
 
 
-def detect_active_session():
-    return detect_sessions(_preferred_store())
+def detect_active_session(preferred_store=None, include_keyring=False):
+    return detect_sessions(preferred_store or _preferred_store(), include_keyring=include_keyring)
 
 
 def detect_active_email():
@@ -730,12 +752,19 @@ def normalize_profile_entry(raw, fallback_key=None):
         normalize_email(alias) for alias in raw.get("aliases", [])
         if is_valid_email(alias)
     ] if isinstance(raw.get("aliases"), list) else []
+    keyring = normalize_keyring_record(raw.get("keyring"), email)
     fingerprints = {}
     if isinstance(raw.get("fingerprints"), dict):
         for key, value in raw["fingerprints"].items():
+            if key == "keyring":
+                if isinstance(value, str) and value.strip():
+                    fingerprints["keyring"] = value.strip()
+                continue
             canonical = FILE_KEY_ALIASES.get(key)
             if canonical and isinstance(value, str) and value.strip():
                 fingerprints[canonical] = value.strip()
+    if "keyring" not in fingerprints and keyring and keyring.get("refreshFingerprint"):
+        fingerprints["keyring"] = keyring["refreshFingerprint"]
 
     entry = dict(raw)
     entry.update({
@@ -748,6 +777,7 @@ def normalize_profile_entry(raw, fallback_key=None):
         "db_tokens": db_tokens,
         "file_tokens": file_tokens,
         "tokens": db_tokens,
+        "keyring": keyring,
     })
     return entry
 
@@ -806,6 +836,7 @@ def merge_profile_entries(existing, incoming):
         "db_tokens_by_path": newer.get("db_tokens_by_path") or older.get("db_tokens_by_path"),
         "file_tokens": newer.get("file_tokens") or older.get("file_tokens") or {},
         "tokens": newer.get("tokens") or older.get("tokens") or {},
+        "keyring": newer.get("keyring") or older.get("keyring"),
         "complete": newer.get("complete") if "complete" in newer else older.get("complete"),
         "saved_at": newer.get("saved_at") or older.get("saved_at") or "",
     })
@@ -1088,11 +1119,13 @@ def build_switch_state(entry, verification):
         "complete": bool(entry.get("complete")),
         "files": snapshot["files"],
         "databases": snapshot["databases"],
+        "keyring": redacted_keyring_record(entry.get("keyring")),
         "verification": {
             "ok": bool(verification.get("ok")),
             "files": verification.get("files", []),
             "missingFiles": verification.get("missingFiles", []),
             "databases": verification.get("dbs", []),
+            "keyring": verification.get("keyring"),
         },
     }
 
@@ -1334,7 +1367,8 @@ def merge_db_tokens_by_path(by_path):
     return output
 
 
-def capture_current_state():
+def capture_current_state(options=None):
+    options = options or {}
     files = {}
     paths = get_token_file_paths()
     for category in FILE_CATEGORIES:
@@ -1357,7 +1391,14 @@ def capture_current_state():
         store["path"]: {key: store["tokens"].get(key) for key in DB_AUTH_KEYS}
         for store in read_db_stores()
     }
-    return {"files": files, "databases": databases}
+
+    keyring = None
+    if options.get("include_keyring"):
+        provider = get_keyring_provider()
+        if provider and getattr(provider, "available", False):
+            record = get_keyring_credential({"refresh": True})
+            keyring = dict(record) if record else {"absent": True, "target": KEYRING_TARGET}
+    return {"files": files, "databases": databases, "keyring": keyring}
 
 
 def restore_captured_state(captured):
@@ -1375,12 +1416,25 @@ def restore_captured_state(captured):
             write_db_snapshot(db_path, tokens)
         except sqlite3.Error as error:
             failed.append(f"{db_path}: {error}")
+
+    if captured.get("keyring"):
+        provider = get_keyring_provider()
+        if provider and getattr(provider, "available", False):
+            try:
+                if captured["keyring"].get("absent"):
+                    provider.delete(KEYRING_TARGET)
+                else:
+                    provider.write(captured["keyring"])
+            except Exception as error:
+                failed.append(f"keyring: {error}")
+
     if failed:
         warn("Rollback was incomplete: " + " | ".join(failed))
     return {"failed": failed}
 
 
-def verify_restore(entry):
+def verify_restore(entry, options=None):
+    options = options or {}
     email = entry["email"]
     wanted = canonical_email(email)
     files = [
@@ -1414,13 +1468,20 @@ def verify_restore(entry):
                 or (len(identity_emails) == 1 and canonical_email(identity_emails[0]) == wanted),
         })
 
+    keyring = (
+        verify_keyring_record(options.get("keyring") or entry.get("keyring"))
+        if options.get("keyringAvailable")
+        else {"ok": True, "matches": True, "present": False, "email": "", "target": KEYRING_TARGET}
+    )
     files_ok = all((not file["email"]) or file["matches"] for file in files) and not missing_files
     dbs_ok = all(database["matches"] for database in dbs)
+    keyring_ok = not options.get("keyringAvailable") or keyring["matches"]
     return {
-        "ok": files_ok and dbs_ok,
+        "ok": files_ok and dbs_ok and keyring_ok,
         "files": files,
         "missingFiles": missing_files,
         "dbs": dbs,
+        "keyring": keyring,
     }
 
 
@@ -1483,7 +1544,7 @@ def make_unique_label(profiles, email, requested_label):
 
 def snapshot_active_account(custom_label=None, manual_email=None):
     with acquire_switch_lock():
-        session = detect_active_session()
+        session = detect_active_session(include_keyring=True)
         if not session["has_token"]:
             raise RuntimeError("No active Antigravity session was detected. Sign in first.")
 
@@ -1566,7 +1627,21 @@ def snapshot_active_account(custom_label=None, manual_email=None):
         if not any(file_tokens.values()):
             raise RuntimeError("No OAuth token files were found for the active session.")
         _patch_token_email(file_tokens, email)
-        complete = bool(any(file_tokens.values())) and (not db_stores or has_db_identity)
+        keyring_provider = get_keyring_provider()
+        keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
+        keyring = None
+        if keyring_available:
+            keyring = get_keyring_credential({"refresh": True, "email": email})
+            if keyring and canonical_email(keyring["email"]) != canonical_email(email):
+                raise RuntimeError(
+                    f"The Windows keyring belongs to {keyring['email']}, not {email}. "
+                    "Sign in again or resolve the keyring conflict before saving a profile."
+                )
+            if not keyring:
+                warn("Profile saved without the Windows keyring; sign in again and save it before switching.")
+        complete = bool(any(file_tokens.values())) and (not db_stores or has_db_identity) and (
+            not keyring_available or bool(keyring)
+        )
 
         fingerprints = {}
         for category in FILE_CATEGORIES:
@@ -1576,10 +1651,13 @@ def snapshot_active_account(custom_label=None, manual_email=None):
             fingerprint = token_fingerprint(token)
             if fingerprint:
                 fingerprints[category] = fingerprint
+        if keyring and keyring.get("refreshFingerprint"):
+            fingerprints["keyring"] = keyring["refreshFingerprint"]
         account_id = (
             fingerprints.get("standaloneToken")
             or fingerprints.get("cliToken")
             or fingerprints.get("oauthCreds")
+            or fingerprints.get("keyring")
             or canonical_email(email)
         )
 
@@ -1613,6 +1691,7 @@ def snapshot_active_account(custom_label=None, manual_email=None):
             "db_tokens_by_path": db_tokens_by_path,
             "file_tokens": file_tokens,
             "tokens": db_tokens,
+            "keyring": keyring,
         })
 
         existing = find_profile_by_identity(profiles, entry)
@@ -1659,6 +1738,11 @@ def refresh_profile_metadata(entry, verification):
             db_tokens_by_path[store["path"]] = tokens
     db_tokens = merge_db_tokens_by_path(db_tokens_by_path)
 
+    keyring_provider = get_keyring_provider()
+    keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
+    keyring = get_keyring_credential({"refresh": True, "email": email}) if keyring_available else None
+    if keyring and canonical_email(keyring["email"]) != wanted:
+        warn(f"The Windows keyring belongs to {keyring['email']}; the profile was not refreshed with it.")
     fingerprints = {}
     for category in FILE_CATEGORIES:
         token = file_tokens.get(category)
@@ -1667,13 +1751,18 @@ def refresh_profile_metadata(entry, verification):
         fingerprint = token_fingerprint(token)
         if fingerprint:
             fingerprints[category] = fingerprint
+    if keyring and canonical_email(keyring["email"]) == wanted and keyring.get("refreshFingerprint"):
+        fingerprints["keyring"] = keyring["refreshFingerprint"]
     account_id = (
         fingerprints.get("standaloneToken")
         or fingerprints.get("cliToken")
         or fingerprints.get("oauthCreds")
+        or fingerprints.get("keyring")
         or canonical_email(email)
     )
-    complete = not get_db_paths() or bool(db_tokens_by_path)
+    complete = (not get_db_paths() or bool(db_tokens_by_path)) and (
+        not keyring_available or bool(keyring and canonical_email(keyring["email"]) == wanted)
+    )
 
     refreshed = dict(existing)
     refreshed.update({
@@ -1686,6 +1775,7 @@ def refresh_profile_metadata(entry, verification):
         "db_tokens_by_path": db_tokens_by_path,
         "file_tokens": file_tokens,
         "tokens": db_tokens,
+        "keyring": keyring if keyring and canonical_email(keyring["email"]) == wanted else existing.get("keyring"),
     })
     profiles[existing["email"]] = refreshed
     try:
@@ -1700,12 +1790,25 @@ def restore_profile(profile):
     if not entry:
         raise RuntimeError("Invalid or incomplete profile.")
 
+    keyring_provider = get_keyring_provider()
+    keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
+    keyring = normalize_keyring_record(entry.get("keyring"), entry["email"]) if keyring_available else None
+    if keyring_available and not keyring:
+        raise RuntimeError(
+            f"Profile incomplete: sign in to {entry['email']}, then run agy-switch save to capture the Windows keyring."
+        )
+
     with acquire_switch_lock():
-        captured = capture_current_state()
+        captured = capture_current_state({"include_keyring": keyring_available})
         try:
             file_result = write_file_tokens(entry["file_tokens"], entry["email"])
             db_result = write_profile_db_tokens(entry, entry["email"])
-            verification = verify_restore(entry)
+            if keyring_available:
+                keyring_provider.write(keyring)
+            verification = verify_restore(entry, {
+                "keyring": keyring,
+                "keyringAvailable": keyring_available,
+            })
             if not verification["ok"]:
                 diverged = [
                     f"{file['path']}={file['email']}"
@@ -1716,7 +1819,11 @@ def restore_profile(profile):
                 ] + [
                     f"{missing['path']}=missing"
                     for missing in verification["missingFiles"]
-                ]
+                ] + (
+                    [f"keyring={verification['keyring'].get('email') or 'missing'} expected {entry['email']}"]
+                    if keyring_available and not verification["keyring"]["matches"]
+                    else []
+                )
                 raise RuntimeError(
                     "Switch verification failed after writing. "
                     + (" | ".join(diverged) if diverged else "stores did not converge")
@@ -1728,6 +1835,7 @@ def restore_profile(profile):
                 "email": entry["email"],
                 "db": db_result,
                 "files": file_result,
+                "keyring": redacted_keyring_record(keyring) if keyring_available else None,
                 "verification": verification,
                 "complete": bool(entry.get("complete")),
                 "profile": refreshed_profile,
@@ -1774,7 +1882,21 @@ def build_login_profile(email, label=None):
         tokens.get("antigravityAuthStatus") or tokens.get("google.google-antigravity")
         for tokens in db_tokens_by_path.values()
     )
-    complete = not get_db_paths() or has_db_identity
+    keyring_provider = get_keyring_provider()
+    keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
+    keyring = None
+    if keyring_available:
+        keyring = get_keyring_credential({"refresh": True, "email": email})
+        if keyring and canonical_email(keyring["email"]) != canonical_email(email):
+            raise RuntimeError(
+                f"The Windows keyring belongs to {keyring['email']}, not {email}. "
+                "Sign in again before adopting this login."
+            )
+        if not keyring:
+            warn("The fresh login has no Windows keyring yet; sign in again before switching.")
+    complete = (not get_db_paths() or has_db_identity) and (
+        not keyring_available or bool(keyring)
+    )
 
     fingerprints = {}
     for category in FILE_CATEGORIES:
@@ -1784,10 +1906,13 @@ def build_login_profile(email, label=None):
         fingerprint = token_fingerprint(token)
         if fingerprint:
             fingerprints[category] = fingerprint
+    if keyring and keyring.get("refreshFingerprint"):
+        fingerprints["keyring"] = keyring["refreshFingerprint"]
     account_id = (
         fingerprints.get("standaloneToken")
         or fingerprints.get("cliToken")
         or fingerprints.get("oauthCreds")
+        or fingerprints.get("keyring")
         or canonical_email(email)
     )
     raw_label = label.strip() if isinstance(label, str) and label.strip() else email.split("@")[0]
@@ -1805,6 +1930,7 @@ def build_login_profile(email, label=None):
         "db_tokens_by_path": db_tokens_by_path,
         "file_tokens": file_tokens,
         "tokens": db_tokens,
+        "keyring": keyring,
     }
 
 
@@ -1881,6 +2007,13 @@ def _clear_session_tokens_unlocked():
                     os.unlink(token_path)
             except OSError as error:
                 failed.append(f"{token_path}: {error}")
+
+    provider = get_keyring_provider()
+    if provider and getattr(provider, "available", False):
+        try:
+            provider.delete(KEYRING_TARGET)
+        except Exception as error:
+            failed.append(f"keyring: {error}")
 
     for failure in clear_switch_state()["failed"]:
         failed.append(failure)
@@ -2197,8 +2330,9 @@ public class AgyCredReader {
     public static extern void CredFree(IntPtr credential);
 }
 "@
+$target = '__AGY_KEYRING_TARGET__'
 $ptr = [IntPtr]::Zero
-if (-not [AgyCredReader]::CredRead('gemini:antigravity', 1, 0, [ref]$ptr)) {
+if (-not [AgyCredReader]::CredRead($target, 1, 0, [ref]$ptr)) {
     [pscustomobject]@{ Found = $false } | ConvertTo-Json -Compress
     exit 0
 }
@@ -2218,6 +2352,8 @@ try {
         TargetName = $cred.TargetName
         UserName = $cred.UserName
         BlobLength = $cred.CredentialBlobSize
+        Persist = $cred.Persist
+        Raw = $utf8
         Emails = @($emails)
         HasRefresh = ($combined -match 'refresh')
         HasAccess = ($combined -match 'access')
@@ -2228,6 +2364,10 @@ finally {
     [AgyCredReader]::CredFree($ptr)
 }
 '''
+
+
+KEYRING_TARGET = "gemini:antigravity"
+KEYRING_TEST_TARGET = "gemini:antigravity.test"
 
 
 def parse_keyring_report(payload):
@@ -2243,7 +2383,7 @@ def parse_keyring_report(payload):
     return {
         "available": found,
         "provider": "windows-credential-manager",
-        "target": "gemini:antigravity",
+        "target": KEYRING_TARGET,
         "username": str(payload.get("UserName") or "antigravity") if payload else "antigravity",
         "email": email,
         "emails": emails,
@@ -2251,19 +2391,62 @@ def parse_keyring_report(payload):
         "hasAccessToken": bool(payload and payload.get("HasAccess")),
         "hasIdToken": bool(payload and payload.get("HasIdToken")),
         "blobLength": int(payload.get("BlobLength") or 0) if payload else 0,
-        "managed": False,
+        "managed": True,
     }
 
 
-def read_windows_keyring():
+def parse_keyring_credential(payload):
+    if not isinstance(payload, dict) or not payload.get("Found"):
+        return None
+    raw = payload.get("Raw")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    raw_emails = payload.get("Emails")
+    if isinstance(raw_emails, list):
+        emails = raw_emails
+    elif raw_emails:
+        emails = [raw_emails]
+    else:
+        emails = []
+    email = next((value for value in emails if isinstance(value, str) and "@" in value), "")
+    email = normalize_email(
+        email
+        or _extract_email(parsed)
+        or payload.get("Email")
+        or ""
+    )
+    if not email:
+        return None
+    token_payload = _token_payload(parsed) or {}
+    return {
+        "provider": "windows-credential-manager",
+        "target": str(payload.get("TargetName") or KEYRING_TARGET),
+        "username": str(payload.get("UserName") or "antigravity"),
+        "email": email,
+        "hasRefreshToken": _non_empty(token_payload.get("refresh_token")),
+        "hasAccessToken": _non_empty(token_payload.get("access_token")),
+        "hasIdToken": bool(token_payload.get("id_token")),
+        "blobLength": int(payload.get("BlobLength") or 0) or len(raw.encode("utf-8")),
+        "persist": int(payload.get("Persist") or 0),
+        "refreshFingerprint": token_fingerprint(parsed),
+        "raw": raw,
+    }
+
+
+def read_windows_keyring_credential(options=None):
+    options = options or {}
+    target = options.get("target") or KEYRING_TARGET
+    if target not in (KEYRING_TARGET, KEYRING_TEST_TARGET):
+        return None
     if os.name != "nt" and not _is_wsl_environment():
-        return {
-            "available": False,
-            "provider": "none",
-            "target": "gemini:antigravity",
-            "managed": False,
-            "reason": "unsupported-platform",
-        }
+        return None
+    script = _WINDOWS_KEYRING_SCRIPT.replace("__AGY_KEYRING_TARGET__", target)
     try:
         result = subprocess.run(
             [
@@ -2272,45 +2455,339 @@ def read_windows_keyring():
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
-                _WINDOWS_KEYRING_SCRIPT,
+                script,
             ],
             capture_output=True,
             text=True,
             timeout=8,
         )
         if result.returncode != 0 or not result.stdout.strip():
-            return {
-                "available": False,
-                "provider": "windows-credential-manager",
-                "target": "gemini:antigravity",
-                "managed": False,
-                "reason": "read-failed",
-            }
-        return parse_keyring_report(json.loads(result.stdout))
+            return None
+        return parse_keyring_credential(json.loads(result.stdout))
     except (OSError, ValueError, subprocess.SubprocessError):
-        return {
-            "available": False,
-            "provider": "windows-credential-manager",
-            "target": "gemini:antigravity",
-            "managed": False,
-            "reason": "read-failed",
-        }
+        return None
+
+
+_WINDOWS_KEYRING_WRITE_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class AgyCredWriter {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredWrite(ref CREDENTIAL credential, uint flags);
+}
+"@
+$payloadText = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace($payloadText)) { throw 'no payload' }
+$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadText.Trim())) | ConvertFrom-Json
+$bytes = [Convert]::FromBase64String($payload.blobBase64)
+$blob = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+try {
+    [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $blob, $bytes.Length)
+    $cred = New-Object AgyCredWriter+CREDENTIAL
+    $cred.Type = 1
+    $cred.TargetName = [string]$payload.target
+    $cred.UserName = [string]$payload.username
+    $cred.Persist = [uint32]$payload.persist
+    $cred.CredentialBlobSize = [uint32]$bytes.Length
+    $cred.CredentialBlob = $blob
+    if (-not [AgyCredWriter]::CredWrite([ref]$cred, 0)) {
+        throw "CredWrite failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    [pscustomobject]@{ Written = $true } | ConvertTo-Json -Compress
+}
+finally {
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($blob)
+}
+'''
+
+
+def write_windows_keyring_credential(record):
+    target = record.get("target") or KEYRING_TARGET
+    if target not in (KEYRING_TARGET, KEYRING_TEST_TARGET):
+        raise RuntimeError("Refusing to write an unknown keyring target.")
+    raw = record.get("raw") if isinstance(record, dict) else ""
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError("The keyring credential has no payload.")
+    if len(raw.encode("utf-8")) > 65536:
+        raise RuntimeError("The keyring credential is too large.")
+    try:
+        parsed = json.loads(raw)
+    except ValueError as error:
+        raise RuntimeError("The keyring credential is not valid JSON.") from error
+    if not isinstance(parsed, dict):
+        raise RuntimeError("The keyring credential is not a JSON object.")
+    persist = record.get("persist")
+    if persist not in (1, 2, 3):
+        persist = 2
+    payload = json.dumps({
+        "target": target,
+        "username": record.get("username") or "antigravity",
+        "persist": persist,
+        "blobBase64": base64.b64encode(raw.encode("utf-8")).decode("ascii"),
+    }, separators=(",", ":")).encode("utf-8")
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            _WINDOWS_KEYRING_WRITE_SCRIPT,
+        ],
+        input=base64.b64encode(payload).decode("ascii"),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Could not write the Windows Credential Manager entry.")
+    try:
+        response = json.loads(result.stdout.strip() or "{}")
+    except ValueError as error:
+        raise RuntimeError("The Windows Credential Manager returned an invalid response.") from error
+    if not response.get("Written"):
+        raise RuntimeError("Could not write the Windows Credential Manager entry.")
+    _KEYRING_CACHE["at"] = 0.0
+    _KEYRING_CACHE["value"] = None
+    return True
+
+
+_WINDOWS_KEYRING_DELETE_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class AgyCredDeleter {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredDelete(string target, uint type, uint flags);
+}
+"@
+$target = '__AGY_KEYRING_TARGET__'
+if ([AgyCredDeleter]::CredDelete($target, 1, 0)) {
+    [pscustomobject]@{ Deleted = $true } | ConvertTo-Json -Compress
+} else {
+    [pscustomobject]@{ Deleted = $false; ErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error() } | ConvertTo-Json -Compress
+}
+'''
+
+
+def delete_windows_keyring_credential(target=KEYRING_TARGET):
+    if target not in (KEYRING_TARGET, KEYRING_TEST_TARGET):
+        raise RuntimeError("Refusing to delete an unknown keyring target.")
+    script = _WINDOWS_KEYRING_DELETE_SCRIPT.replace("__AGY_KEYRING_TARGET__", target)
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("Could not delete the Windows Credential Manager entry.")
+    response = json.loads(result.stdout)
+    _KEYRING_CACHE["at"] = 0.0
+    _KEYRING_CACHE["value"] = None
+    return bool(response.get("Deleted"))
 
 
 _KEYRING_CACHE = {"at": 0.0, "value": None}
+_KEYRING_PROVIDER_OVERRIDE = None
+
+
+class _WindowsKeyringProvider:
+    id = "windows-credential-manager"
+    target = KEYRING_TARGET
+    available = os.name == "nt" or _is_wsl_environment()
+
+    def read(self, options=None):
+        return read_windows_keyring_credential(options or {})
+
+    def write(self, record):
+        return write_windows_keyring_credential(record)
+
+    def delete(self, target=KEYRING_TARGET):
+        return delete_windows_keyring_credential(target)
+
+
+def get_keyring_provider():
+    return _KEYRING_PROVIDER_OVERRIDE or _WindowsKeyringProvider()
+
+
+def set_keyring_provider_for_tests(provider):
+    global _KEYRING_PROVIDER_OVERRIDE
+    _KEYRING_PROVIDER_OVERRIDE = provider
+    _KEYRING_CACHE["at"] = 0.0
+    _KEYRING_CACHE["value"] = None
+
+
+def normalize_keyring_record(raw, fallback_email=None):
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        raw = {"raw": raw}
+    if not isinstance(raw, dict):
+        return None
+    target = raw.get("target") or KEYRING_TARGET
+    if target not in (KEYRING_TARGET, KEYRING_TEST_TARGET):
+        return None
+    raw_text = raw.get("raw")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return None
+    if len(raw_text.encode("utf-8")) > 65536:
+        return None
+    try:
+        parsed = json.loads(raw_text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    email = normalize_email(
+        raw.get("email")
+        or _extract_email(parsed)
+        or fallback_email
+        or ""
+    )
+    if not email:
+        return None
+    token_payload = _token_payload(parsed) or {}
+    return {
+        "provider": raw.get("provider") or "windows-credential-manager",
+        "target": target,
+        "username": raw.get("username") or "antigravity",
+        "email": email,
+        "hasRefreshToken": _non_empty(token_payload.get("refresh_token")),
+        "hasAccessToken": _non_empty(token_payload.get("access_token")),
+        "hasIdToken": bool(token_payload.get("id_token")),
+        "blobLength": int(raw.get("blobLength") or 0) or len(raw_text.encode("utf-8")),
+        "persist": int(raw.get("persist") or 0),
+        "refreshFingerprint": raw.get("refreshFingerprint") or token_fingerprint(parsed),
+        "raw": raw_text,
+    }
+
+
+def redacted_keyring_record(record):
+    if not record:
+        return None
+    return {
+        "available": True,
+        "provider": record.get("provider") or "windows-credential-manager",
+        "target": record.get("target") or KEYRING_TARGET,
+        "username": record.get("username") or "antigravity",
+        "email": record.get("email") or "",
+        "emails": [record["email"]] if record.get("email") else [],
+        "hasRefreshToken": bool(record.get("hasRefreshToken")),
+        "hasAccessToken": bool(record.get("hasAccessToken")),
+        "hasIdToken": bool(record.get("hasIdToken")),
+        "blobLength": int(record.get("blobLength") or 0),
+        "managed": True,
+    }
+
+
+def get_keyring_credential(options=None):
+    options = options or {}
+    provider = get_keyring_provider()
+    if not provider or not getattr(provider, "available", False):
+        return None
+    target = options.get("target") or getattr(provider, "target", KEYRING_TARGET)
+    record = provider.read({"target": target, "refresh": options.get("refresh", False)})
+    return normalize_keyring_record(record, options.get("email"))
+
+
+def verify_keyring_record(record):
+    if not record:
+        return {"ok": False, "matches": False, "present": False, "email": "", "target": KEYRING_TARGET}
+    current = get_keyring_credential({
+        "refresh": True,
+        "target": record.get("target", KEYRING_TARGET),
+        "email": record.get("email"),
+    })
+    if not current:
+        return {
+            "ok": False,
+            "matches": False,
+            "present": False,
+            "email": "",
+            "target": record.get("target", KEYRING_TARGET),
+            "expectedEmail": record.get("email"),
+        }
+    email_matches = canonical_email(current["email"]) == canonical_email(record["email"])
+    fingerprint_matches = not record.get("refreshFingerprint") or (
+        current.get("refreshFingerprint") == record.get("refreshFingerprint")
+    )
+    return {
+        "ok": email_matches and fingerprint_matches,
+        "matches": email_matches and fingerprint_matches,
+        "present": True,
+        "email": current["email"],
+        "expectedEmail": record.get("email"),
+        "target": current.get("target", KEYRING_TARGET),
+        "refreshFingerprint": current.get("refreshFingerprint", ""),
+    }
+
+
+def read_windows_keyring(options=None):
+    credential = read_windows_keyring_credential(options or {})
+    if not credential:
+        return {
+            "available": False,
+            "provider": "windows-credential-manager",
+            "target": (options or {}).get("target", KEYRING_TARGET),
+            "managed": True,
+            "reason": "not-found",
+        }
+    return redacted_keyring_record(credential)
 
 
 def get_keyring_report(refresh=False):
+    provider = get_keyring_provider()
+    if not provider or not getattr(provider, "available", False):
+        return {
+            "available": False,
+            "provider": getattr(provider, "id", "none"),
+            "target": KEYRING_TARGET,
+            "managed": False,
+            "reason": "unsupported-platform",
+        }
     if not refresh and _KEYRING_CACHE["value"] and time.monotonic() - _KEYRING_CACHE["at"] < 30:
         return json.loads(json.dumps(_KEYRING_CACHE["value"]))
-    report = read_windows_keyring()
+    record = get_keyring_credential({"refresh": True})
+    report = redacted_keyring_record(record) if record else {
+        "available": False,
+        "provider": getattr(provider, "id", "windows-credential-manager"),
+        "target": KEYRING_TARGET,
+        "managed": True,
+        "reason": "not-found",
+    }
     _KEYRING_CACHE["at"] = time.monotonic()
     _KEYRING_CACHE["value"] = report
     return json.loads(json.dumps(report))
 
 
 def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
-    session = detect_sessions(preferred_store or _preferred_store())
+    session = detect_sessions(preferred_store or _preferred_store(), include_keyring=True)
     state = read_switch_state()
     surface_report = evaluate_surfaces(
         surfaces if surfaces is not None else get_running_surfaces(),
@@ -2331,9 +2808,25 @@ def get_doctor_report(surfaces=None, preferred_store=None, keyring=None):
             "code": "keyring-mismatch",
             "severity": "error",
             "message": f"Windows Credential Manager {keyring.get('target')} is {keyring['email']}, "
-                       f"but the active account is {session['email']}; this build detects the keyring "
-                       "but does not write it yet.",
+                       f"but the active account is {session['email']}; reapply the target profile "
+                       "or sign in again.",
         })
+
+    if keyring and keyring.get("managed"):
+        profiles = load_profiles()
+        missing_keyring = [
+            profile.get("email", email)
+            for email, profile in profiles.items()
+            if profile.get("complete") and not profile.get("keyring")
+        ]
+        if missing_keyring:
+            warnings.append({
+                "code": "keyring-profile-missing",
+                "severity": "warning",
+                "message": "Profiles without a captured keyring: "
+                           + ", ".join(missing_keyring)
+                           + ". Sign in to each account and run agy-switch save before switching.",
+            })
 
     for conflict in session.get("conflicts", []):
         if conflict["type"] == "multiple-emails":
@@ -2415,7 +2908,7 @@ def cmd_doctor(as_json=False):
         print(f"Switch applied at: {report['switchState']['appliedAt'] or '(none)'}")
         keyring = report.get("keyring") or {}
         if keyring.get("available"):
-            print(f"Keyring: {keyring.get('target')} -> {keyring.get('email') or '(no email)'} (read-only)")
+            print(f"Keyring: {keyring.get('target')} -> {keyring.get('email') or '(no email)'} (managed)")
         else:
             print(f"Keyring: not available ({keyring.get('reason') or 'unknown'})")
         print("Running surfaces:")
@@ -2435,8 +2928,9 @@ def cmd_doctor(as_json=False):
 def get_diagnostics():
     profiles = load_profiles()
     warnings = last_warnings()
-    session = detect_active_session()
+    session = detect_active_session(include_keyring=True)
     state = read_switch_state()
+    keyring = get_keyring_report()
     return {
         "version": VERSION,
         "platform": sys.platform,
@@ -2450,17 +2944,21 @@ def get_diagnostics():
         "conflicts": session.get("conflicts", []),
         "switchState": state,
         "storeDiff": diff_against_switch_state(state),
-        "keyring": get_keyring_report(),
+        "keyring": keyring,
         "doctor": get_doctor_report(),
         "savedProfiles": sorted(profiles.keys()),
         "profileCompleteness": {
             email: {
-                "complete": bool(profile.get("complete")),
+                "complete": bool(profile.get("complete")) and (
+                    not keyring.get("managed") or bool(profile.get("keyring"))
+                ),
                 "saved_at": profile.get("saved_at", ""),
                 "aliases": profile.get("aliases", []),
                 "account_id": profile.get("account_id", ""),
                 "fingerprints": sorted((profile.get("fingerprints") or {}).keys()),
                 "dbPaths": sorted((profile.get("db_tokens_by_path") or {}).keys()),
+                "keyring": bool(profile.get("keyring")),
+                "keyringFingerprint": (profile.get("fingerprints") or {}).get("keyring", ""),
             }
             for email, profile in profiles.items()
         },

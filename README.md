@@ -7,7 +7,7 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.0--alpha.1-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.8.0-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
 [![CI](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml/badge.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml)
 
@@ -15,12 +15,12 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-### What's new in 1.8.0-alpha.1
+### What's new in 1.8.0
 
-- **Custom extension icon:** an original 128×128 PNG (`assets/icon.png`) now identifies the extension in the Antigravity/VS Code Extensions view and the VSIX.
-- **Keyring read-only detection:** diagnostics and the Doctor now read the Windows Credential Manager entry `gemini:antigravity` and show its email/token-presence metadata without printing token material. The keyring is **not written yet**; that is the next 1.8.0 milestone.
-- **Master plan and keyring spec:** see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) and [docs/SPEC-1.8.0-KEYRING.md](docs/SPEC-1.8.0-KEYRING.md) for the TOS-safe roadmap, keyring architecture and acceptance criteria.
-- **Installer parity:** `install.sh` copies `assets/`, `README.md` and `CHANGELOG.md` into directory installs.
+- **Keyring-aware switching:** the Windows Credential Manager entry `gemini:antigravity` is now a first-class store. Profiles capture it; `restoreProfile` writes it, verifies email + refresh fingerprint and rolls it back with the files/databases if anything fails.
+- **Strict migration:** profiles saved before 1.8.0 do not contain the keyring and are blocked with a clear message. Sign in to each account once and run `agy-switch save` (or use **Snapshot Current Session**) to capture it.
+- **Safer diagnostics:** the keyring is shown as managed in diagnostics/Doctor; token values are never printed; the real provider is tested against `gemini:antigravity.test`, never the production entry.
+- **Custom icon, master plan and spec:** [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) and [docs/SPEC-1.8.0-KEYRING.md](docs/SPEC-1.8.0-KEYRING.md).
 
 Previous 1.7.4: the read-only **Reliability Doctor**, helper-process filtering, Ubuntu/Windows CI and tagged VSIX releases.
 
@@ -106,7 +106,7 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 
 The switcher is designed for **one account at a time** across all surfaces. With the IDE, Desktop 2.0 and the CLI open at the same time, each process keeps its own copy of the OAuth token and may refresh it independently (the CLI refreshes roughly every hour). The switcher cannot force three running processes to keep three different accounts; any tool that writes the shared token files will win the last write.
 
-What v1.8.0-alpha.1 does instead:
+What v1.8.0 does instead:
 
 * runs a cross-process lock (`~/.gemini/.antigravity-switch.lock`) so two switches cannot interleave;
 * records the expected identity and hashes in `~/.gemini/antigravity_switch_state.json`;
@@ -116,7 +116,7 @@ What v1.8.0-alpha.1 does instead:
 
 The status bar prefers the surface selected by `antigravityAccountSwitcher.preferredStore` (`standaloneToken` by default, or `cliToken`), and always prefers the account most recently applied by the switcher while that store still exists. It never chooses a winner by modification time.
 
-### Identity rules (v1.8.0-alpha.1)
+### Identity rules (v1.8.0)
 
 * Gmail aliases are canonicalized for comparisons: `user+tag@gmail.com` and `u.ser@gmail.com` collapse to the same canonical address. The original email is still used when writing tokens.
 * Each profile stores an `account_id` and a refresh-token fingerprint per token category. Profiles that share a canonical email or a fingerprint are **merged into one** (with `aliases`) instead of creating a second entry.
@@ -128,7 +128,7 @@ The status bar prefers the surface selected by `antigravityAccountSwitcher.prefe
 
 When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Connect / Sign In to Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
 
-To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.0-alpha.1; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
+To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.0; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
 
 ### Reliability Doctor
 
@@ -269,7 +269,7 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.8.0-alpha.1.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.8.0.vsix` located in the repository folder.
 4. Reload the window when prompted.
 
 To rebuild the VSIX from source:

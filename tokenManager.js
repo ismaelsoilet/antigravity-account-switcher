@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.8.0-alpha.1';
+const VERSION = '1.8.0';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;
@@ -555,11 +555,13 @@ function buildSwitchState(entry, verification) {
         complete: Boolean(entry.complete),
         files: snapshot.files,
         databases: snapshot.databases,
+        keyring: redactedKeyringRecord(entry.keyring),
         verification: {
             ok: Boolean(verification && verification.ok),
             files: verification ? verification.files : [],
             missingFiles: verification ? verification.missingFiles : [],
-            databases: verification ? verification.dbs : []
+            databases: verification ? verification.dbs : [],
+            keyring: verification ? verification.keyring : null
         }
     };
 }
@@ -803,7 +805,32 @@ function detectSessions(options = {}) {
             ? { ...store, email: dbEmail, canonicalEmail: canonicalEmail(dbEmail), needsEmail: false }
             : store
     ));
-    const stores = [...fileStores, ...dbStores];
+    let keyringStore = null;
+    if (options.includeKeyring) {
+        const keyringProvider = getKeyringProvider();
+        if (keyringProvider && keyringProvider.available) {
+            const record = getKeyringCredential({ refresh: false });
+            if (record) {
+                keyringStore = {
+                    path: `keyring://${record.target}`,
+                    kind: 'keyring',
+                    category: 'keyring',
+                    home: 'win',
+                    email: record.email,
+                    canonicalEmail: canonicalEmail(record.email),
+                    fingerprint: record.refreshFingerprint || '',
+                    mtimeMs: 0,
+                    size: record.blobLength || 0,
+                    usable: true,
+                    hasToken: true,
+                    hasIdentity: true,
+                    hasOauthToken: false,
+                    needsEmail: false
+                };
+            }
+        }
+    }
+    const stores = [...fileStores, ...dbStores, ...(keyringStore ? [keyringStore] : [])];
     const usable = stores.filter(store => store.usable && store.hasToken && !store.identityConflict);
 
     const identityEntries = [];
@@ -942,14 +969,22 @@ function normalizeProfileEntry(raw, fallbackKey) {
     const aliases = Array.isArray(raw.aliases)
         ? uniqueStrings(raw.aliases.filter(isValidEmail).map(normalizeEmail))
         : [];
+    const keyring = normalizeKeyringRecord(raw.keyring, email);
     const fingerprints = {};
     if (raw.fingerprints && typeof raw.fingerprints === 'object' && !Array.isArray(raw.fingerprints)) {
         for (const [key, value] of Object.entries(raw.fingerprints)) {
+            if (key === 'keyring') {
+                if (typeof value === 'string' && value.trim()) fingerprints.keyring = value.trim();
+                continue;
+            }
             const canonical = FILE_KEY_ALIASES[key];
             if (canonical && typeof value === 'string' && value.trim()) {
                 fingerprints[canonical] = value.trim();
             }
         }
+    }
+    if (!fingerprints.keyring && keyring && keyring.refreshFingerprint) {
+        fingerprints.keyring = keyring.refreshFingerprint;
     }
 
     return {
@@ -962,7 +997,8 @@ function normalizeProfileEntry(raw, fallbackKey) {
         account_id: typeof raw.account_id === 'string' ? raw.account_id.trim() : '',
         db_tokens: dbTokens,
         file_tokens: fileTokens,
-        tokens: dbTokens
+        tokens: dbTokens,
+        keyring: keyring || null
     };
 }
 
@@ -1012,6 +1048,7 @@ function mergeProfileEntries(existing, incoming) {
         db_tokens_by_path: newer.db_tokens_by_path || older.db_tokens_by_path,
         file_tokens: newer.file_tokens || older.file_tokens,
         tokens: newer.tokens || older.tokens,
+        keyring: newer.keyring || older.keyring || null,
         complete: newer.complete !== undefined ? newer.complete : older.complete,
         saved_at: newer.saved_at || older.saved_at
     };
@@ -1432,7 +1469,7 @@ function mergeDbTokensByPath(byPath) {
     return output;
 }
 
-function captureCurrentState() {
+function captureCurrentState(options = {}) {
     const files = {};
     for (const category of FILE_CATEGORIES) {
         for (const tokenPath of getTokenFilePaths()[category]) {
@@ -1461,7 +1498,14 @@ function captureCurrentState() {
         }
         databases[store.path] = tokens;
     }
-    return { files, databases };
+
+    const keyringProvider = getKeyringProvider();
+    let keyring = null;
+    if (options.includeKeyring && keyringProvider && keyringProvider.available) {
+        const record = getKeyringCredential({ refresh: true });
+        keyring = record ? { ...record } : { absent: true, target: KEYRING_TARGET };
+    }
+    return { files, databases, keyring };
 }
 
 function restoreCapturedState(captured) {
@@ -1484,13 +1528,29 @@ function restoreCapturedState(captured) {
             failed.push(`${dbPath}: ${error.message}`);
         }
     }
+
+    if (captured.keyring) {
+        const keyringProvider = getKeyringProvider();
+        if (keyringProvider && keyringProvider.available) {
+            try {
+                if (captured.keyring.absent) {
+                    keyringProvider.delete(KEYRING_TARGET);
+                } else {
+                    keyringProvider.write(captured.keyring);
+                }
+            } catch (error) {
+                failed.push(`keyring: ${error.message}`);
+            }
+        }
+    }
+
     if (failed.length > 0) {
         lastLoadWarnings.push(`Rollback was incomplete: ${failed.join(' | ')}`);
     }
     return { failed };
 }
 
-function verifyRestore(entry) {
+function verifyRestore(entry, options = {}) {
     const email = entry.email;
     const wanted = canonicalEmail(email);
     const fileStores = readFileStores();
@@ -1521,9 +1581,13 @@ function verifyRestore(entry) {
         };
     });
 
+    const keyring = options.keyringAvailable
+        ? verifyKeyringRecord(options.keyring || entry.keyring)
+        : { ok: true, matches: true, present: false, email: '', target: KEYRING_TARGET };
     const filesOk = files.every(file => !file.email || file.matches) && missingFiles.length === 0;
     const dbsOk = dbs.every(database => database.matches);
-    return { ok: filesOk && dbsOk, files, missingFiles, dbs };
+    const keyringOk = !options.keyringAvailable || keyring.matches;
+    return { ok: filesOk && dbsOk && keyringOk, files, missingFiles, dbs, keyring };
 }
 
 function writeProfileDbTokens(entry, email) {
@@ -1590,7 +1654,7 @@ function makeUniqueLabel(profiles, email, requestedLabel) {
 function snapshotActiveAccount(customLabel, manualEmail) {
     const lock = acquireSwitchLock();
     try {
-        const session = detectActiveSession();
+        const session = detectActiveSession({ includeKeyring: true });
         if (!session.hasToken) {
             throw new Error('No active Antigravity session was detected. Sign in first.');
         }
@@ -1673,16 +1737,37 @@ function snapshotActiveAccount(customLabel, manualEmail) {
         }
         patchTokenEmail(fileTokens, email);
         const hasFileTokens = Boolean(fileTokens.cliToken || fileTokens.standaloneToken || fileTokens.oauthCreds);
-        const complete = hasFileTokens && (dbStores.length === 0 || hasDbIdentity);
+        const keyringProvider = getKeyringProvider();
+        const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
+        let keyring = null;
+        if (keyringAvailable) {
+            keyring = getKeyringCredential({ refresh: true, email });
+            if (keyring && canonicalEmail(keyring.email) !== canonicalEmail(email)) {
+                throw new Error(
+                    `The Windows keyring belongs to ${keyring.email}, not ${email}. `
+                    + 'Sign in again or resolve the keyring conflict before saving a profile.'
+                );
+            }
+            if (!keyring) {
+                lastLoadWarnings.push(
+                    'Profile saved without the Windows keyring; sign in again and save it before switching.'
+                );
+            }
+        }
+        const complete = hasFileTokens
+            && (dbStores.length === 0 || hasDbIdentity)
+            && (!keyringAvailable || Boolean(keyring));
         const fingerprints = {};
         for (const category of FILE_CATEGORIES) {
             if (!fileTokens[category]) continue;
             const fingerprint = tokenFingerprint(fileTokens[category]);
             if (fingerprint) fingerprints[category] = fingerprint;
         }
+        if (keyring && keyring.refreshFingerprint) fingerprints.keyring = keyring.refreshFingerprint;
         const accountId = fingerprints.standaloneToken
             || fingerprints.cliToken
             || fingerprints.oauthCreds
+            || fingerprints.keyring
             || canonicalEmail(email);
 
         for (const category of FILE_CATEGORIES) {
@@ -1714,7 +1799,8 @@ function snapshotActiveAccount(customLabel, manualEmail) {
             db_tokens: dbTokens,
             db_tokens_by_path: dbTokensByPath,
             file_tokens: fileTokens,
-            tokens: dbTokens
+            tokens: dbTokens,
+            keyring
         };
 
         const existing = findProfileByIdentity(profiles, entry);
@@ -1775,7 +1861,25 @@ function buildLoginProfile(candidate, label) {
     const hasDbIdentity = Object.values(dbTokensByPath).some(
         tokens => Boolean(tokens['antigravityAuthStatus'] || tokens['google.google-antigravity'])
     );
-    const complete = getDbPaths().length === 0 || hasDbIdentity;
+    const keyringProvider = getKeyringProvider();
+    const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
+    let keyring = null;
+    if (keyringAvailable) {
+        keyring = getKeyringCredential({ refresh: true, email });
+        if (keyring && canonicalEmail(keyring.email) !== canonicalEmail(email)) {
+            throw new Error(
+                `The Windows keyring belongs to ${keyring.email}, not ${email}. `
+                + 'Sign in again before adopting this login.'
+            );
+        }
+        if (!keyring) {
+            lastLoadWarnings.push(
+                'The fresh login has no Windows keyring yet; sign in again before switching.'
+            );
+        }
+    }
+    const complete = (getDbPaths().length === 0 || hasDbIdentity)
+        && (!keyringAvailable || Boolean(keyring));
 
     const fingerprints = {};
     for (const key of FILE_CATEGORIES) {
@@ -1783,9 +1887,11 @@ function buildLoginProfile(candidate, label) {
         const fingerprint = tokenFingerprint(fileTokens[key]);
         if (fingerprint) fingerprints[key] = fingerprint;
     }
+    if (keyring && keyring.refreshFingerprint) fingerprints.keyring = keyring.refreshFingerprint;
     const accountId = fingerprints.standaloneToken
         || fingerprints.cliToken
         || fingerprints.oauthCreds
+        || fingerprints.keyring
         || canonicalEmail(email);
     const profiles = loadProfiles();
     const rawLabel = label && label.trim() ? label.trim() : email.split('@')[0];
@@ -1802,7 +1908,8 @@ function buildLoginProfile(candidate, label) {
         db_tokens: dbTokens,
         db_tokens_by_path: dbTokensByPath,
         file_tokens: fileTokens,
-        tokens: dbTokens
+        tokens: dbTokens,
+        keyring
     };
 }
 
@@ -1848,17 +1955,28 @@ function refreshProfileMetadata(entry, verification) {
         if (Object.keys(tokens).length > 0) dbTokensByPath[store.path] = tokens;
     }
     const dbTokens = mergeDbTokensByPath(dbTokensByPath);
+    const keyringProvider = getKeyringProvider();
+    const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
+    const keyring = keyringAvailable ? getKeyringCredential({ refresh: true, email }) : null;
+    if (keyring && canonicalEmail(keyring.email) !== wanted) {
+        lastLoadWarnings.push(`The Windows keyring belongs to ${keyring.email}; the profile was not refreshed with it.`);
+    }
     const fingerprints = {};
     for (const category of FILE_CATEGORIES) {
         if (!fileTokens[category]) continue;
         const fingerprint = tokenFingerprint(fileTokens[category]);
         if (fingerprint) fingerprints[category] = fingerprint;
     }
+    if (keyring && canonicalEmail(keyring.email) === wanted && keyring.refreshFingerprint) {
+        fingerprints.keyring = keyring.refreshFingerprint;
+    }
     const accountId = fingerprints.standaloneToken
         || fingerprints.cliToken
         || fingerprints.oauthCreds
+        || fingerprints.keyring
         || canonicalEmail(email);
-    const complete = getDbPaths().length === 0 || Object.keys(dbTokensByPath).length > 0;
+    const complete = (getDbPaths().length === 0 || Object.keys(dbTokensByPath).length > 0)
+        && (!keyringAvailable || Boolean(keyring && canonicalEmail(keyring.email) === wanted));
 
     const refreshed = {
         ...existing,
@@ -1870,7 +1988,8 @@ function refreshProfileMetadata(entry, verification) {
         db_tokens: dbTokens,
         db_tokens_by_path: dbTokensByPath,
         file_tokens: fileTokens,
-        tokens: dbTokens
+        tokens: dbTokens,
+        keyring: keyring && canonicalEmail(keyring.email) === wanted ? keyring : (existing.keyring || null)
     };
     profiles[existing.email] = refreshed;
     try {
@@ -1887,13 +2006,23 @@ function restoreProfile(profile) {
         throw new Error('Invalid or incomplete profile.');
     }
 
+    const keyringProvider = getKeyringProvider();
+    const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
+    const keyring = keyringAvailable ? normalizeKeyringRecord(entry.keyring, entry.email) : null;
+    if (keyringAvailable && !keyring) {
+        throw new Error(
+            `Profile incomplete: sign in to ${entry.email}, then run agy-switch save to capture the Windows keyring.`
+        );
+    }
+
     const lock = acquireSwitchLock();
     let captured = null;
     try {
-        captured = captureCurrentState();
+        captured = captureCurrentState({ includeKeyring: keyringAvailable });
         const fileResult = writeTokensToFiles(entry.file_tokens, entry.email);
         const dbResult = writeProfileDbTokens(entry, entry.email);
-        const verification = verifyRestore(entry);
+        if (keyringAvailable) keyringProvider.write(keyring);
+        const verification = verifyRestore(entry, { keyring, keyringAvailable });
 
         if (!verification.ok) {
             const diverged = [
@@ -1901,7 +2030,10 @@ function restoreProfile(profile) {
                     .map(file => `${file.path}=${file.email}`),
                 ...verification.dbs.filter(database => !database.matches)
                     .map(database => `${database.path}=${(database.identityEmails || []).join(' vs ')}`),
-                ...verification.missingFiles.map(file => `${file.path}=missing`)
+                ...verification.missingFiles.map(file => `${file.path}=missing`),
+                ...(keyringAvailable && verification.keyring && !verification.keyring.matches
+                    ? [`keyring=${verification.keyring.email || 'missing'} expected ${entry.email}`]
+                    : [])
             ];
             throw new Error(`Switch verification failed after writing. ${diverged.join(' | ') || 'stores did not converge'}`);
         }
@@ -1912,6 +2044,7 @@ function restoreProfile(profile) {
             email: entry.email,
             db: dbResult,
             files: fileResult,
+            keyring: keyringAvailable ? redactedKeyringRecord(keyring) : null,
             verification,
             complete: Boolean(entry.complete),
             profile: refreshedProfile
@@ -1992,6 +2125,15 @@ function clearAllSessionTokensUnlocked() {
             } catch (error) {
                 failed.push(`${tokenPath}: ${error.message}`);
             }
+        }
+    }
+
+    const keyringProvider = getKeyringProvider();
+    if (keyringProvider && keyringProvider.available) {
+        try {
+            keyringProvider.delete(KEYRING_TARGET);
+        } catch (error) {
+            failed.push(`keyring: ${error.message}`);
         }
     }
 
@@ -2246,6 +2388,9 @@ function getPermissionWarnings() {
     return warnings;
 }
 
+const KEYRING_TARGET = 'gemini:antigravity';
+const KEYRING_TEST_TARGET = 'gemini:antigravity.test';
+
 function isWslEnvironment() {
     if (process.platform !== 'linux') return false;
     if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
@@ -2283,8 +2428,9 @@ public class AgyCredReader {
     public static extern void CredFree(IntPtr credential);
 }
 "@
+$target = '__AGY_KEYRING_TARGET__'
 $ptr = [IntPtr]::Zero
-if (-not [AgyCredReader]::CredRead('gemini:antigravity', 1, 0, [ref]$ptr)) {
+if (-not [AgyCredReader]::CredRead($target, 1, 0, [ref]$ptr)) {
     [pscustomobject]@{ Found = $false } | ConvertTo-Json -Compress
     exit 0
 }
@@ -2304,6 +2450,8 @@ try {
         TargetName = $cred.TargetName
         UserName = $cred.UserName
         BlobLength = $cred.CredentialBlobSize
+        Persist = $cred.Persist
+        Raw = $utf8
         Emails = @($emails)
         HasRefresh = ($combined -match 'refresh')
         HasAccess = ($combined -match 'access')
@@ -2323,7 +2471,7 @@ function parseKeyringReport(payload) {
     return {
         available: found,
         provider: 'windows-credential-manager',
-        target: 'gemini:antigravity',
+        target: KEYRING_TARGET,
         username: payload && payload.UserName ? String(payload.UserName) : 'antigravity',
         email,
         emails,
@@ -2331,67 +2479,358 @@ function parseKeyringReport(payload) {
         hasAccessToken: Boolean(payload && payload.HasAccess),
         hasIdToken: Boolean(payload && payload.HasIdToken),
         blobLength: Number(payload && payload.BlobLength) || 0,
-        managed: false
+        managed: true
+    };
+}
+
+function parseKeyringCredential(payload) {
+    if (!payload || !payload.Found) return null;
+    const raw = typeof payload.Raw === 'string' ? payload.Raw : '';
+    if (!raw.trim()) return null;
+    const parsed = safeJsonParse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const rawEmails = payload.Emails;
+    const emails = Array.isArray(rawEmails) ? rawEmails : (rawEmails ? [rawEmails] : []);
+    const email = normalizeEmail(
+        emails.find(value => typeof value === 'string' && value.includes('@'))
+        || extractEmailFromToken(parsed)
+        || payload.Email
+        || ''
+    );
+    if (!email) return null;
+    const tokenPayload = getTokenPayload(parsed) || {};
+    return {
+        provider: 'windows-credential-manager',
+        target: String(payload.TargetName || KEYRING_TARGET),
+        username: String(payload.UserName || 'antigravity'),
+        email,
+        hasRefreshToken: nonEmptyString(tokenPayload.refresh_token),
+        hasAccessToken: nonEmptyString(tokenPayload.access_token),
+        hasIdToken: Boolean(tokenPayload.id_token),
+        blobLength: Number(payload.BlobLength) || Buffer.byteLength(raw, 'utf-8'),
+        persist: Number(payload.Persist) || 0,
+        refreshFingerprint: tokenFingerprint(parsed),
+        raw
     };
 }
 
 function readWindowsKeyring(options = {}) {
-    if (process.platform !== 'win32' && !options.force && !isWslEnvironment()) {
+    const credential = readWindowsKeyringCredential(options);
+    if (!credential) {
         return {
             available: false,
-            provider: 'none',
-            target: 'gemini:antigravity',
-            managed: false,
-            reason: 'unsupported-platform'
+            provider: 'windows-credential-manager',
+            target: options.target || KEYRING_TARGET,
+            managed: true,
+            reason: 'not-found'
         };
     }
+    return redactedKeyringRecord(credential);
+}
+
+function readWindowsKeyringCredential(options = {}) {
+    if (process.platform !== 'win32' && !options.force && !isWslEnvironment()) {
+        return null;
+    }
+    const target = options.target || KEYRING_TARGET;
+    if (target !== KEYRING_TARGET && target !== KEYRING_TEST_TARGET) return null;
     try {
+        const script = WINDOWS_KEYRING_SCRIPT.replace('__AGY_KEYRING_TARGET__', target);
         const raw = execFileSync('powershell.exe', [
             '-NoProfile',
             '-ExecutionPolicy',
             'Bypass',
             '-Command',
-            WINDOWS_KEYRING_SCRIPT
+            script
         ], {
             encoding: 'utf-8',
             timeout: options.timeout || 8000,
             stdio: ['ignore', 'pipe', 'ignore']
         });
         const trimmed = raw.trim();
-        if (!trimmed) {
-            return {
-                available: false,
-                provider: 'windows-credential-manager',
-                target: 'gemini:antigravity',
-                managed: false,
-                reason: 'empty-response'
-            };
-        }
-        return parseKeyringReport(JSON.parse(trimmed));
+        if (!trimmed) return null;
+        return parseKeyringCredential(JSON.parse(trimmed));
     } catch {
+        return null;
+    }
+}
+
+const WINDOWS_KEYRING_WRITE_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class AgyCredWriter {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredWrite(ref CREDENTIAL credential, uint flags);
+}
+"@
+$payloadText = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace($payloadText)) { throw 'no payload' }
+$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadText.Trim())) | ConvertFrom-Json
+$bytes = [Convert]::FromBase64String($payload.blobBase64)
+$blob = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+try {
+    [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $blob, $bytes.Length)
+    $cred = New-Object AgyCredWriter+CREDENTIAL
+    $cred.Type = 1
+    $cred.TargetName = [string]$payload.target
+    $cred.UserName = [string]$payload.username
+    $cred.Persist = [uint32]$payload.persist
+    $cred.CredentialBlobSize = [uint32]$bytes.Length
+    $cred.CredentialBlob = $blob
+    if (-not [AgyCredWriter]::CredWrite([ref]$cred, 0)) {
+        throw "CredWrite failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    [pscustomobject]@{ Written = $true } | ConvertTo-Json -Compress
+}
+finally {
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($blob)
+}
+`;
+
+function writeWindowsKeyringCredential(record, options = {}) {
+    const target = record && record.target ? record.target : KEYRING_TARGET;
+    if (target !== KEYRING_TARGET && target !== KEYRING_TEST_TARGET) {
+        throw new Error('Refusing to write an unknown keyring target.');
+    }
+    const raw = record && typeof record.raw === 'string' ? record.raw : '';
+    if (!raw.trim()) throw new Error('The keyring credential has no payload.');
+    if (Buffer.byteLength(raw, 'utf-8') > 65536) throw new Error('The keyring credential is too large.');
+    const parsed = safeJsonParse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('The keyring credential is not valid JSON.');
+    }
+    const persist = [1, 2, 3].includes(Number(record.persist)) ? Number(record.persist) : 2;
+    const payload = Buffer.from(JSON.stringify({
+        target,
+        username: record.username || 'antigravity',
+        persist,
+        blobBase64: Buffer.from(raw, 'utf-8').toString('base64')
+    }), 'utf-8').toString('base64');
+
+    const output = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        WINDOWS_KEYRING_WRITE_SCRIPT
+    ], {
+        input: payload,
+        encoding: 'utf-8',
+        timeout: options.timeout || 15000,
+        stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const result = JSON.parse(output.trim() || '{}');
+    if (!result.Written) throw new Error('Could not write the Windows Credential Manager entry.');
+    keyringCache = { at: 0, value: null };
+    return true;
+}
+
+const WINDOWS_KEYRING_DELETE_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class AgyCredDeleter {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredDelete(string target, uint type, uint flags);
+}
+"@
+$target = '__AGY_KEYRING_TARGET__'
+if ([AgyCredDeleter]::CredDelete($target, 1, 0)) {
+    [pscustomobject]@{ Deleted = $true } | ConvertTo-Json -Compress
+} else {
+    [pscustomobject]@{ Deleted = $false; ErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error() } | ConvertTo-Json -Compress
+}
+`;
+
+function deleteWindowsKeyringCredential(target = KEYRING_TARGET, options = {}) {
+    if (target !== KEYRING_TARGET && target !== KEYRING_TEST_TARGET) {
+        throw new Error('Refusing to delete an unknown keyring target.');
+    }
+    const script = WINDOWS_KEYRING_DELETE_SCRIPT.replace('__AGY_KEYRING_TARGET__', target);
+    const output = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        script
+    ], {
+        encoding: 'utf-8',
+        timeout: options.timeout || 8000,
+        stdio: ['ignore', 'pipe', 'ignore']
+    });
+    const result = JSON.parse(output.trim() || '{}');
+    keyringCache = { at: 0, value: null };
+    return Boolean(result.Deleted);
+}
+
+function getRealKeyringProvider() {
+    const available = process.platform === 'win32' || isWslEnvironment();
+    return {
+        id: 'windows-credential-manager',
+        target: KEYRING_TARGET,
+        available,
+        read(options = {}) {
+            return readWindowsKeyringCredential(options);
+        },
+        write(record) {
+            return writeWindowsKeyringCredential(record);
+        },
+        delete(target = KEYRING_TARGET) {
+            return deleteWindowsKeyringCredential(target);
+        }
+    };
+}
+
+let keyringProviderOverride = null;
+
+function getKeyringProvider() {
+    return keyringProviderOverride || getRealKeyringProvider();
+}
+
+function setKeyringProviderForTests(provider) {
+    keyringProviderOverride = provider;
+    keyringCache = { at: 0, value: null };
+}
+
+function normalizeKeyringRecord(raw, fallbackEmail) {
+    if (!raw) return null;
+    const source = typeof raw === 'string' ? { raw } : raw;
+    if (!source || typeof source !== 'object') return null;
+    const target = source.target || KEYRING_TARGET;
+    if (target !== KEYRING_TARGET && target !== KEYRING_TEST_TARGET) return null;
+    const rawText = typeof source.raw === 'string' ? source.raw : '';
+    if (!rawText.trim() || Buffer.byteLength(rawText, 'utf-8') > 65536) return null;
+    const parsed = safeJsonParse(rawText);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const email = normalizeEmail(
+        source.email
+        || extractEmailFromToken(parsed)
+        || fallbackEmail
+        || ''
+    );
+    if (!email) return null;
+    const tokenPayload = getTokenPayload(parsed) || {};
+    const refreshFingerprint = source.refreshFingerprint || tokenFingerprint(parsed);
+    return {
+        provider: source.provider || 'windows-credential-manager',
+        target,
+        username: source.username || 'antigravity',
+        email,
+        hasRefreshToken: nonEmptyString(tokenPayload.refresh_token),
+        hasAccessToken: nonEmptyString(tokenPayload.access_token),
+        hasIdToken: Boolean(tokenPayload.id_token),
+        blobLength: Number(source.blobLength) || Buffer.byteLength(rawText, 'utf-8'),
+        persist: Number(source.persist) || 0,
+        refreshFingerprint,
+        raw: rawText
+    };
+}
+
+function redactedKeyringRecord(record) {
+    if (!record) return null;
+    return {
+        available: true,
+        provider: record.provider || 'windows-credential-manager',
+        target: record.target || KEYRING_TARGET,
+        username: record.username || 'antigravity',
+        email: record.email || '',
+        emails: record.email ? [record.email] : [],
+        hasRefreshToken: Boolean(record.hasRefreshToken),
+        hasAccessToken: Boolean(record.hasAccessToken),
+        hasIdToken: Boolean(record.hasIdToken),
+        blobLength: Number(record.blobLength) || 0,
+        managed: true
+    };
+}
+
+function getKeyringCredential(options = {}) {
+    const provider = getKeyringProvider();
+    if (!provider || !provider.available) return null;
+    const target = options.target || provider.target || KEYRING_TARGET;
+    const record = provider.read({ ...options, target });
+    return normalizeKeyringRecord(record, options.email);
+}
+
+function verifyKeyringRecord(record) {
+    if (!record) return { ok: false, matches: false, present: false, email: '', target: KEYRING_TARGET };
+    const current = getKeyringCredential({ refresh: true, target: record.target, email: record.email });
+    if (!current) {
         return {
-            available: false,
-            provider: 'windows-credential-manager',
-            target: 'gemini:antigravity',
-            managed: false,
-            reason: 'read-failed'
+            ok: false,
+            matches: false,
+            present: false,
+            email: '',
+            target: record.target || KEYRING_TARGET,
+            expectedEmail: record.email
         };
     }
+    const emailMatches = canonicalEmail(current.email) === canonicalEmail(record.email);
+    const fingerprintMatches = !record.refreshFingerprint
+        || current.refreshFingerprint === record.refreshFingerprint;
+    return {
+        ok: emailMatches && fingerprintMatches,
+        matches: emailMatches && fingerprintMatches,
+        present: true,
+        email: current.email,
+        expectedEmail: record.email,
+        target: current.target || record.target || KEYRING_TARGET,
+        refreshFingerprint: current.refreshFingerprint || ''
+    };
 }
 
 let keyringCache = { at: 0, value: null };
 
 function getKeyringReport(options = {}) {
+    const provider = getKeyringProvider();
+    if (!provider || !provider.available) {
+        return {
+            available: false,
+            provider: provider && provider.id ? provider.id : 'none',
+            target: KEYRING_TARGET,
+            managed: false,
+            reason: 'unsupported-platform'
+        };
+    }
     if (!options.refresh && keyringCache.value && Date.now() - keyringCache.at < 30000) {
         return clone(keyringCache.value);
     }
-    const report = readWindowsKeyring(options);
+    const record = getKeyringCredential({ refresh: true, target: options.target || KEYRING_TARGET });
+    const report = record
+        ? redactedKeyringRecord(record)
+        : {
+            available: false,
+            provider: provider.id || 'windows-credential-manager',
+            target: options.target || KEYRING_TARGET,
+            managed: true,
+            reason: 'not-found'
+        };
     keyringCache = { at: Date.now(), value: report };
     return clone(report);
 }
 
 function getDoctorReport(options = {}) {
-    const session = detectSessions({ preferredStore: options.preferredStore || 'standaloneToken' });
+    const session = detectSessions({
+        preferredStore: options.preferredStore || 'standaloneToken',
+        includeKeyring: true
+    });
     const state = readSwitchState();
     const surfaceReport = evaluateSurfaces(
         options.surfaces || getRunningSurfaces({ refresh: options.refresh }),
@@ -2411,8 +2850,22 @@ function getDoctorReport(options = {}) {
         warnings.push({
             code: 'keyring-mismatch',
             severity: 'error',
-            message: `Windows Credential Manager ${keyring.target} is ${keyring.email}, but the active account is ${session.email}; this build detects the keyring but does not write it yet.`
+            message: `Windows Credential Manager ${keyring.target} is ${keyring.email}, but the active account is ${session.email}; reapply the target profile or sign in again.`
         });
+    }
+
+    if (keyring && keyring.managed) {
+        const profiles = loadProfiles();
+        const missingKeyring = Object.values(profiles)
+            .filter(profile => profile.complete && !profile.keyring)
+            .map(profile => profile.email);
+        if (missingKeyring.length > 0) {
+            warnings.push({
+                code: 'keyring-profile-missing',
+                severity: 'warning',
+                message: `Profiles without a captured keyring: ${missingKeyring.join(', ')}. Sign in to each account and run agy-switch save before switching.`
+            });
+        }
     }
 
     for (const conflict of session.conflicts || []) {
@@ -2489,8 +2942,9 @@ function getDoctorReport(options = {}) {
 function getDiagnostics() {
     const profiles = loadProfiles();
     const warnings = getLastLoadWarnings();
-    const session = detectActiveSession();
+    const session = detectActiveSession({ includeKeyring: true });
     const state = readSwitchState();
+    const keyring = getKeyringReport();
     return {
         version: VERSION,
         platform: process.platform,
@@ -2504,18 +2958,20 @@ function getDiagnostics() {
         conflicts: session.conflicts,
         switchState: state,
         storeDiff: diffAgainstSwitchState(state),
-        keyring: getKeyringReport(),
+        keyring,
         doctor: getDoctorReport(),
         savedProfiles: Object.keys(profiles),
         profileCompleteness: Object.fromEntries(Object.entries(profiles).map(([email, profile]) => [
             email,
             {
-                complete: Boolean(profile.complete),
+                complete: Boolean(profile.complete) && (!keyring.managed || Boolean(profile.keyring)),
                 saved_at: profile.saved_at || '',
                 aliases: profile.aliases || [],
                 account_id: profile.account_id || '',
                 fingerprints: Object.keys(profile.fingerprints || {}),
-                dbPaths: Object.keys(profile.db_tokens_by_path || {})
+                dbPaths: Object.keys(profile.db_tokens_by_path || {}),
+                keyring: Boolean(profile.keyring),
+                keyringFingerprint: profile.fingerprints && profile.fingerprints.keyring ? profile.fingerprints.keyring : ''
             }
         ])),
         vaultWarnings: warnings
@@ -2573,8 +3029,20 @@ module.exports = {
     evaluateSurfaces,
     getRunningSurfaces,
     getPermissionWarnings,
+    KEYRING_TARGET,
+    KEYRING_TEST_TARGET,
     parseKeyringReport,
+    parseKeyringCredential,
     readWindowsKeyring,
+    readWindowsKeyringCredential,
+    writeWindowsKeyringCredential,
+    deleteWindowsKeyringCredential,
+    getKeyringProvider,
+    setKeyringProviderForTests,
+    normalizeKeyringRecord,
+    redactedKeyringRecord,
+    getKeyringCredential,
+    verifyKeyringRecord,
     getKeyringReport,
     getDoctorReport,
     acquireSwitchLock,

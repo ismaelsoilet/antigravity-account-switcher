@@ -32,6 +32,46 @@ def make_token(email, access="access-token", refresh="refresh-token", expiry="20
     }
 
 
+def make_keyring_record(email, refresh="keyring-refresh"):
+    raw = json.dumps({
+        "id_token_email": email,
+        "access_token": f"access-{refresh}",
+        "refresh_token": refresh,
+        "token_type": "Bearer",
+        "expiry": "2099-01-01T00:00:00Z",
+    })
+    return {
+        "provider": "fake-keyring",
+        "target": switch.KEYRING_TARGET,
+        "username": "antigravity",
+        "email": email,
+        "raw": raw,
+        "refreshFingerprint": switch.token_fingerprint(json.loads(raw)),
+        "hasRefreshToken": True,
+        "blobLength": len(raw.encode("utf-8")),
+        "persist": 2,
+    }
+
+
+class FakeKeyringProvider:
+    def __init__(self, record=None, available=True):
+        self.id = "fake-keyring"
+        self.target = switch.KEYRING_TARGET
+        self.available = available
+        self.record = json.loads(json.dumps(record)) if record else None
+
+    def read(self, options=None):
+        return json.loads(json.dumps(self.record)) if self.record else None
+
+    def write(self, record):
+        self.record = json.loads(json.dumps(record))
+        return True
+
+    def delete(self, target=switch.KEYRING_TARGET):
+        self.record = None
+        return True
+
+
 class TestSwitchCLI(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="agy_cli_test_")
@@ -53,6 +93,8 @@ class TestSwitchCLI(unittest.TestCase):
         conn.close()
         switch.last_warnings()
         switch._LAST_WARNINGS.clear()
+        self.keyring = FakeKeyringProvider(record=None, available=False)
+        switch.set_keyring_provider_for_tests(self.keyring)
 
     def tearDown(self):
         if self.previous_home is None:
@@ -843,7 +885,7 @@ class TestSwitchCLI(unittest.TestCase):
         self.assertTrue(report["available"])
         self.assertEqual(report["email"], "other@example.com")
         self.assertTrue(report["hasRefreshToken"])
-        self.assertFalse(report["managed"])
+        self.assertTrue(report["managed"])
         self.assertNotIn("raw", report)
         self.assertNotIn("refresh_token", json.dumps(report))
 
@@ -863,6 +905,109 @@ class TestSwitchCLI(unittest.TestCase):
 
         self.assertFalse(report["ok"])
         self.assertTrue(any(warning["code"] == "keyring-mismatch" for warning in report["warnings"]))
+
+    def test_keyring_aware_snapshot_captures_credential_and_fingerprint(self):
+        self.keyring = FakeKeyringProvider(make_keyring_record("key@example.com"))
+        switch.set_keyring_provider_for_tests(self.keyring)
+        self.write_token("cliToken", make_token("key@example.com"))
+        self.set_db_rows({
+            "antigravityAuthStatus": json.dumps({"email": "key@example.com", "apiKey": ""}),
+            "google.google-antigravity": json.dumps({
+                "antigravity-storage": {
+                    "agy.onboarding.lastLoginUsername": "key@example.com",
+                    "jetski.onboarding.lastLoginUsername": "key@example.com",
+                }
+            }),
+        })
+
+        entry = switch.snapshot_active_account("Key", "key@example.com")
+
+        self.assertEqual(entry["keyring"]["email"], "key@example.com")
+        self.assertEqual(entry["fingerprints"]["keyring"], make_keyring_record("key@example.com")["refreshFingerprint"])
+        self.assertTrue(entry["complete"])
+
+    def test_keyring_aware_restore_writes_credential_and_verifies(self):
+        self.write_token("cliToken", make_token("old@example.com"))
+        self.keyring = FakeKeyringProvider(make_keyring_record("old@example.com"))
+        switch.set_keyring_provider_for_tests(self.keyring)
+
+        result = switch.restore_profile({
+            "email": "new@example.com",
+            "label": "New",
+            "complete": True,
+            "file_tokens": {"cliToken": make_token("new@example.com")},
+            "db_tokens_by_path": {},
+            "keyring": make_keyring_record("new@example.com"),
+        })
+
+        self.assertTrue(result["verification"]["ok"])
+        self.assertEqual(self.keyring.record["email"], "new@example.com")
+        self.assertEqual(result["keyring"]["email"], "new@example.com")
+        self.assertEqual(
+            switch.read_current_file_tokens("new@example.com")["cliToken"]["id_token_email"],
+            "new@example.com",
+        )
+
+    def test_strict_mode_blocks_profile_without_keyring(self):
+        self.keyring = FakeKeyringProvider(make_keyring_record("key@example.com"))
+        switch.set_keyring_provider_for_tests(self.keyring)
+
+        with self.assertRaisesRegex(RuntimeError, "Profile incomplete: sign in to key@example.com"):
+            switch.restore_profile({
+                "email": "key@example.com",
+                "label": "Key",
+                "complete": True,
+                "file_tokens": {"cliToken": make_token("key@example.com")},
+                "db_tokens_by_path": {},
+            })
+
+    def test_snapshot_rejects_keyring_from_another_account(self):
+        self.keyring = FakeKeyringProvider(make_keyring_record("other@example.com"))
+        switch.set_keyring_provider_for_tests(self.keyring)
+        self.write_token("cliToken", make_token("key@example.com"))
+
+        with self.assertRaisesRegex(RuntimeError, "stores disagree|keyring belongs"):
+            switch.snapshot_active_account("Key", "key@example.com")
+
+    def test_keyring_provider_refuses_unknown_targets(self):
+        with self.assertRaisesRegex(RuntimeError, "unknown keyring target"):
+            switch.write_windows_keyring_credential({"target": "evil", "raw": "{}"})
+        with self.assertRaisesRegex(RuntimeError, "unknown keyring target"):
+            switch.delete_windows_keyring_credential("evil")
+
+    @unittest.skipUnless(
+        os.environ.get("AGY_SWITCH_KEYRING_TEST") == "1",
+        "set AGY_SWITCH_KEYRING_TEST=1 to exercise the real Windows keyring",
+    )
+    def test_real_keyring_provider_round_trip_uses_test_target(self):
+        if os.name != "nt" and not switch._is_wsl_environment():
+            self.skipTest("Windows Credential Manager is unavailable")
+        target = switch.KEYRING_TEST_TARGET
+        raw = json.dumps({
+            "id_token_email": "keyring-test@example.com",
+            "access_token": "fake-access",
+            "refresh_token": "fake-refresh",
+            "token_type": "Bearer",
+            "expiry": "2099-01-01T00:00:00Z",
+        })
+        record = {
+            "provider": "windows-credential-manager",
+            "target": target,
+            "username": "antigravity",
+            "email": "keyring-test@example.com",
+            "raw": raw,
+            "refreshFingerprint": switch.token_fingerprint(json.loads(raw)),
+            "persist": 2,
+        }
+        try:
+            switch.write_windows_keyring_credential(record)
+            read = switch.read_windows_keyring_credential({"target": target})
+            self.assertIsNotNone(read)
+            self.assertEqual(read["target"], target)
+            self.assertEqual(read["email"], record["email"])
+            self.assertEqual(read["refreshFingerprint"], record["refreshFingerprint"])
+        finally:
+            switch.delete_windows_keyring_credential(target)
 
     def test_get_permission_warnings_flags_group_readable_token(self):
         if os.name == "nt":

@@ -61,6 +61,14 @@ function resetState() {
     process.env.AGY_SWITCH_HOME = home;
     process.env.AGY_SWITCH_DB_PATHS = dbPath;
     if (DatabaseSync) withDb(db => db.exec('DELETE FROM ItemTable'));
+    tokenManager.setKeyringProviderForTests({
+        id: 'fake-keyring',
+        target: tokenManager.KEYRING_TARGET,
+        available: false,
+        read() { return null; },
+        write() { throw new Error('keyring disabled in this test'); },
+        delete() { return false; }
+    });
 }
 
 function setDbRows(rows) {
@@ -88,6 +96,48 @@ function writeToken(category, data) {
     const target = tokenPath(category);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, JSON.stringify(data), 'utf-8');
+}
+
+function keyringRecord(email, refresh = 'keyring-refresh') {
+    const raw = JSON.stringify({
+        id_token_email: email,
+        access_token: `access-${refresh}`,
+        refresh_token: refresh,
+        token_type: 'Bearer',
+        expiry: '2099-01-01T00:00:00Z'
+    });
+    return {
+        provider: 'fake-keyring',
+        target: tokenManager.KEYRING_TARGET,
+        username: 'antigravity',
+        email,
+        raw,
+        refreshFingerprint: tokenManager.tokenFingerprint(JSON.parse(raw)),
+        hasRefreshToken: true,
+        blobLength: raw.length,
+        persist: 2
+    };
+}
+
+function installKeyring(record) {
+    const state = { record: record ? JSON.parse(JSON.stringify(record)) : null };
+    tokenManager.setKeyringProviderForTests({
+        id: 'fake-keyring',
+        target: tokenManager.KEYRING_TARGET,
+        available: true,
+        read() {
+            return state.record ? JSON.parse(JSON.stringify(state.record)) : null;
+        },
+        write(next) {
+            state.record = JSON.parse(JSON.stringify(next));
+            return true;
+        },
+        delete() {
+            state.record = null;
+            return true;
+        }
+    });
+    return state;
 }
 
 function makeToken(email, access = 'access-token', refresh = 'refresh-token', expiry = '2099-01-01T00:00:00Z') {
@@ -950,9 +1000,90 @@ test('parseKeyringReport keeps only redacted metadata', async () => {
     assert.strictEqual(report.available, true);
     assert.strictEqual(report.email, 'other@example.com');
     assert.strictEqual(report.hasRefreshToken, true);
-    assert.strictEqual(report.managed, false);
+    assert.strictEqual(report.managed, true);
     assert.ok(!('raw' in report));
     assert.ok(!JSON.stringify(report).includes('refresh_token'));
+});
+
+test('normalizeKeyringRecord keeps the raw payload out of redacted reports', async () => {
+    const record = tokenManager.normalizeKeyringRecord(keyringRecord('key@example.com'));
+    assert.ok(record);
+    assert.strictEqual(record.email, 'key@example.com');
+    assert.ok(record.raw.includes('refresh_token'));
+
+    const redacted = tokenManager.redactedKeyringRecord(record);
+    assert.strictEqual(redacted.managed, true);
+    assert.strictEqual(redacted.email, 'key@example.com');
+    assert.ok(!('raw' in redacted));
+    assert.ok(!JSON.stringify(redacted).includes('refresh_token'));
+});
+
+test('keyring-aware snapshot captures the credential and fingerprint', async () => {
+    resetState();
+    installKeyring(keyringRecord('key@example.com'));
+    writeToken('cliToken', makeToken('key@example.com'));
+    setDbRows({
+        antigravityAuthStatus: JSON.stringify({ email: 'key@example.com', apiKey: '' }),
+        'google.google-antigravity': JSON.stringify({
+            'antigravity-storage': {
+                'agy.onboarding.lastLoginUsername': 'key@example.com',
+                'jetski.onboarding.lastLoginUsername': 'key@example.com'
+            }
+        })
+    });
+
+    const entry = tokenManager.snapshotActiveAccount('Key', 'key@example.com');
+
+    assert.strictEqual(entry.keyring.email, 'key@example.com');
+    assert.strictEqual(entry.fingerprints.keyring, keyringRecord('key@example.com').refreshFingerprint);
+    assert.strictEqual(entry.complete, true);
+});
+
+test('keyring-aware restore writes the credential and verifies it', async () => {
+    resetState();
+    writeToken('cliToken', makeToken('old@example.com'));
+    const state = installKeyring(keyringRecord('old@example.com'));
+
+    const result = tokenManager.restoreProfile({
+        email: 'new@example.com',
+        label: 'New',
+        complete: true,
+        file_tokens: { cliToken: makeToken('new@example.com') },
+        db_tokens_by_path: {},
+        keyring: keyringRecord('new@example.com')
+    });
+
+    assert.strictEqual(result.verification.ok, true);
+    assert.strictEqual(state.record.email, 'new@example.com');
+    assert.strictEqual(result.keyring.email, 'new@example.com');
+    assert.strictEqual(tokenManager.readCurrentFileTokens('new@example.com').cliToken.id_token_email, 'new@example.com');
+});
+
+test('strict mode blocks a profile without a keyring', async () => {
+    resetState();
+    installKeyring(keyringRecord('key@example.com'));
+
+    assert.throws(
+        () => tokenManager.restoreProfile({
+            email: 'key@example.com',
+            label: 'Key',
+            complete: true,
+            file_tokens: { cliToken: makeToken('key@example.com') },
+            db_tokens_by_path: {}
+        }),
+        /Profile incomplete: sign in to key@example\.com/
+    );
+});
+
+test('snapshot rejects a keyring that belongs to another account', async () => {
+    resetState();
+    installKeyring(keyringRecord('other@example.com'));
+    writeToken('cliToken', makeToken('key@example.com'));
+
+    assert.throws(
+        () => tokenManager.snapshotActiveAccount('Key', 'key@example.com'),
+        /stores disagree|keyring belongs/i
+    );
 });
 
 test('getDoctorReport flags a keyring mismatch', async () => {
@@ -972,6 +1103,52 @@ test('getDoctorReport flags a keyring mismatch', async () => {
 
     assert.strictEqual(report.ok, false);
     assert.ok(report.warnings.some(warning => warning.code === 'keyring-mismatch'));
+});
+
+test('keyring provider refuses unknown targets', async () => {
+    assert.throws(
+        () => tokenManager.writeWindowsKeyringCredential({ target: 'evil', raw: '{}' }),
+        /unknown keyring target/i
+    );
+    assert.throws(
+        () => tokenManager.deleteWindowsKeyringCredential('evil'),
+        /unknown keyring target/i
+    );
+});
+
+test('real keyring provider round-trip uses only the test target', async () => {
+    if (process.env.AGY_SWITCH_KEYRING_TEST !== '1') return;
+    if (process.platform !== 'win32' && !process.env.WSL_DISTRO_NAME && !process.env.WSL_INTEROP) return;
+
+    const target = tokenManager.KEYRING_TEST_TARGET;
+    const parsed = {
+        id_token_email: 'keyring-test@example.com',
+        access_token: 'fake-access',
+        refresh_token: 'fake-refresh',
+        token_type: 'Bearer',
+        expiry: '2099-01-01T00:00:00Z'
+    };
+    const raw = JSON.stringify(parsed);
+    const record = {
+        provider: 'windows-credential-manager',
+        target,
+        username: 'antigravity',
+        email: parsed.id_token_email,
+        raw,
+        refreshFingerprint: tokenManager.tokenFingerprint(parsed),
+        persist: 2
+    };
+
+    try {
+        tokenManager.writeWindowsKeyringCredential(record);
+        const read = tokenManager.readWindowsKeyringCredential({ target, force: true });
+        assert.ok(read);
+        assert.strictEqual(read.target, target);
+        assert.strictEqual(read.email, parsed.id_token_email);
+        assert.strictEqual(read.refreshFingerprint, record.refreshFingerprint);
+    } finally {
+        tokenManager.deleteWindowsKeyringCredential(target);
+    }
 });
 
 test('getPermissionWarnings flags group-readable token files', async () => {

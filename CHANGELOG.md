@@ -4,6 +4,38 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.0 — 2026-10-31
+
+### Added
+
+- **Keyring-aware switching:** the Windows Credential Manager entry
+  `gemini:antigravity` is now read, captured in profiles, written on switch,
+  verified by email + refresh-token fingerprint, and rolled back with the files
+  and databases on failure.
+- Profile schema v2 includes `keyring` (raw payload + fingerprint). Detection,
+  diagnostics, Doctor, `save`, `load`, `adopt`, `clear` and `reset` cover it.
+- Strict migration: profiles saved before 1.8.0 are blocked with an actionable
+  message until the account is signed in and saved once.
+- Real provider tests use `gemini:antigravity.test`; the production entry is
+  never used by tests.
+
+### Changed
+
+- The keyring is shown as managed in diagnostics/Doctor; `keyring-mismatch` is
+  actionable and token values are never printed.
+- `install.sh` copies the icon, README and CHANGELOG with the extension.
+
+### Known limitation
+
+- Existing profiles require a one-time sign-in + `agy-switch save` to capture
+  the keyring. The Windows CLI may also require one fresh sign-in to rewrite its
+  keyring in the current schema; the extension verifies the stores it writes.
+
+### Tests
+
+- 52 JavaScript tests and 52 Python tests passing, plus an opt-in real keyring
+  round-trip against the test target.
+
 ## 1.8.0-alpha.1 — 2026-10-31
 
 ### Added

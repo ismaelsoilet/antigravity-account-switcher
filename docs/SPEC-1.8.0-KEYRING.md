@@ -1,6 +1,6 @@
 # SPEC 1.8.0 — Keyring-Aware Manual Switching
 
-Status: ready to implement
+Status: implemented in 1.8.0
 Depends on: 1.8.0-alpha.1 read-only keyring detection
 Scope: one manually selected account at a time; no parallel accounts, no quota
 pooling, no automatic switching
@@ -262,7 +262,18 @@ The Windows integration test must never touch `gemini:antigravity`; it creates
    instruction.
 8. Existing tests stay green; new keyring tests pass on Ubuntu and Windows CI.
 
-## 15. Risks and mitigations
+## 15. Implementation notes
+
+- Implemented on Windows/WSL through PowerShell `CredReadW`/`CredWriteW`/
+  `CredDeleteW`; target and username are validated constants.
+- The switch writes files, databases and keyring, then verifies email + refresh
+  fingerprint for every store; the captured keyring is restored on failure.
+- The real credential is never used in tests: the suite uses a fake provider and
+  an opt-in round-trip against `gemini:antigravity.test`.
+- Existing profiles require a one-time sign-in + save. A fresh Windows CLI
+  sign-in may be needed once if its saved token predates the current schema.
+
+## 16. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
