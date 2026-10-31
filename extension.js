@@ -308,6 +308,11 @@ async function showAccountSwitcherMenu() {
                 action: 'diagnostics'
             },
             {
+                label: '$(heart) Run Doctor (surfaces, conflicts, permissions)',
+                detail: 'Detect running Antigravity surfaces that predate the last switch and may overwrite the token',
+                action: 'doctor'
+            },
+            {
                 label: '$(clear-all) Reset / Clear All Switcher Data...',
                 detail: 'Clear every saved profile and all session tokens',
                 action: 'clear_all'
@@ -353,6 +358,8 @@ async function showAccountSwitcherMenu() {
             await deleteAccount(savedList);
         } else if (selected.action === 'diagnostics') {
             await showDiagnostics();
+        } else if (selected.action === 'doctor') {
+            await showDoctor();
         } else if (selected.action === 'clear_all') {
             await clearAllData();
         } else if (selected.action === 'reload') {
@@ -791,6 +798,34 @@ async function showDiagnostics() {
     }
 }
 
+async function showDoctor() {
+    try {
+        const report = tokenManager.getDoctorReport({ preferredStore: getPreferredStore() });
+        if (outputChannel) {
+            outputChannel.clear();
+            outputChannel.appendLine(JSON.stringify(report, null, 2));
+            outputChannel.show(true);
+        }
+        const errors = report.warnings.filter(warning => warning.severity === 'error').length;
+        const warnings = report.warnings.length;
+        if (report.ok) {
+            vscode.window.showInformationMessage(
+                `Account Switcher Doctor: no blocking issues (${warnings} warning${warnings === 1 ? '' : 's'}).`
+            );
+        } else {
+            const choice = await vscode.window.showWarningMessage(
+                `Account Switcher Doctor: ${errors} blocking issue(s), ${warnings} total.`,
+                'Show Output',
+                'Dismiss'
+            );
+            if (choice === 'Show Output' && outputChannel) outputChannel.show(true);
+        }
+    } catch (error) {
+        logError('Doctor failed', error);
+        vscode.window.showErrorMessage(`Doctor failed: ${error.message || error}`);
+    }
+}
+
 async function checkAndPromptNewAccountOnStartup() {
     if (switchInProgress || Date.now() < suppressWatcherUntil) return;
     try {
@@ -943,7 +978,8 @@ function activate(context) {
         vscode.commands.registerCommand('antigravity-account-switcher.switch', showAccountSwitcherMenu),
         vscode.commands.registerCommand('antigravity-account-switcher.save', () => saveOrRenameAccount('', '')),
         vscode.commands.registerCommand('antigravity-account-switcher.login', loginNewAccount),
-        vscode.commands.registerCommand('antigravity-account-switcher.diagnostics', showDiagnostics)
+        vscode.commands.registerCommand('antigravity-account-switcher.diagnostics', showDiagnostics),
+        vscode.commands.registerCommand('antigravity-account-switcher.doctor', showDoctor)
     );
 
     activationTime = Date.now();

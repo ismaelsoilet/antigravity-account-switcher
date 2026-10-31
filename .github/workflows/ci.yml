@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax checks
+        run: |
+          node --check tokenManager.js
+          node --check extension.js
+          python -m py_compile switch.py
+
+      - name: JavaScript tests
+        run: node tests/test_token_manager.js
+
+      - name: Python tests
+        run: python -m unittest discover -s tests -v

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.7.3)
+Antigravity Account Switcher - CLI Core Engine (v1.7.4)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -26,7 +26,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
 FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {
@@ -1889,6 +1889,376 @@ def _clear_session_tokens_unlocked():
         raise RuntimeError("Could not clear every session store. " + " | ".join(failed))
 
 
+def classify_surface_command(command):
+    text = str(command or "")
+    if not text:
+        return None
+    if re.search(r"Antigravity IDE\.exe", text, re.IGNORECASE):
+        if "--type=" in text:
+            return None
+        return {"kind": "ide-win", "label": "Antigravity IDE (Windows UI)"}
+    if re.search(r"(^|[\\/])Antigravity\.exe", text, re.IGNORECASE):
+        if "--type=" in text:
+            return None
+        return {"kind": "desktop-win", "label": "Antigravity Desktop 2.0 (Windows UI)"}
+    if re.search(r"language_server", text) and re.search(r"--app_data_dir\s+antigravity", text):
+        return {"kind": "desktop-wsl", "label": "Antigravity Desktop 2.0 (WSL backend)"}
+    if re.search(r"antigravity-ide-server|server-main\.js", text):
+        if re.search(
+            r"bootstrap-fork|--type=extensionHost|--type=fileWatcher|--type=ptyHost|"
+            r"--type=renderer|--type=nodeService|--type=utility|--type=gpu-process",
+            text,
+        ):
+            return None
+        if re.search(r"server-main\.js", text) and re.search(r"--start-server", text):
+            return {"kind": "ide-wsl", "label": "Antigravity IDE (WSL server)"}
+        return None
+    if re.search(r"(^|[\\/])agy(?:\.exe)?\s+--hub", text, re.IGNORECASE):
+        return {"kind": "agent-hub", "label": "Antigravity agent hub"}
+    if re.search(r"(^|[\\/])agy(?:\.exe)?(?:\s|$)", text, re.IGNORECASE) and "--hub" not in text:
+        return {"kind": "cli", "label": "Antigravity CLI (agy)"}
+    return None
+
+
+def _parse_proc_start_time(proc_root, pid, boot_time_ms, clock_ticks):
+    with open(os.path.join(proc_root, str(pid), "stat"), "r", encoding="utf-8") as handle:
+        stat_line = handle.read()
+    close = stat_line.rfind(")")
+    if close < 0:
+        return 0
+    fields = stat_line[close + 2:].split()
+    try:
+        start_ticks = float(fields[19])
+    except (IndexError, ValueError):
+        return 0
+    if not boot_time_ms:
+        return 0
+    return boot_time_ms + (start_ticks / (clock_ticks or 100)) * 1000
+
+
+def _linux_boot_time_ms():
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as handle:
+            match = re.search(r"^btime\s+(\d+)", handle.read(), re.MULTILINE)
+        return int(match.group(1)) * 1000 if match else 0
+    except OSError:
+        return 0
+
+
+def _linux_clock_ticks():
+    try:
+        return os.sysconf("SC_CLK_TCK") or 100
+    except (ValueError, OSError):
+        return 100
+
+
+def _list_linux_surfaces(proc_root="/proc", boot_time_ms=None, clock_ticks=None):
+    boot = _linux_boot_time_ms() if boot_time_ms is None else boot_time_ms
+    ticks = _linux_clock_ticks() if clock_ticks is None else clock_ticks
+    surfaces = []
+    try:
+        pids = [name for name in os.listdir(proc_root) if name.isdigit()]
+    except OSError:
+        return surfaces
+
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "r", encoding="utf-8", errors="replace") as handle:
+                command = handle.read().replace("\0", " ").strip()
+        except OSError:
+            continue
+        surface = classify_surface_command(command)
+        if not surface:
+            continue
+        try:
+            started_at_ms = _parse_proc_start_time(proc_root, pid, boot, ticks)
+        except OSError:
+            started_at_ms = 0
+        surfaces.append({
+            "pid": int(pid),
+            "kind": surface["kind"],
+            "label": surface["label"],
+            "command": command,
+            "startedAtMs": started_at_ms,
+            "startedAt": datetime.fromtimestamp(started_at_ms / 1000, timezone.utc).isoformat() if started_at_ms else "",
+            "source": "linux",
+        })
+    return surfaces
+
+
+def _parse_windows_date(value):
+    if isinstance(value, (int, float)):
+        return value * 1000 if value < 1e12 else value
+    if isinstance(value, str):
+        match = re.search(r"/Date\((\d+)\)/", value)
+        if match:
+            return int(match.group(1))
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            return 0
+    return 0
+
+
+def _list_windows_surfaces():
+    script = (
+        "@(Get-CimInstance Win32_Process -Filter \"Name='Antigravity.exe' OR Name='Antigravity IDE.exe'\" "
+        "| Select-Object ProcessId,Name,CreationDate,CommandLine) | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        parsed = json.loads(result.stdout)
+        items = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+        surfaces = []
+        for item in items:
+            surface = classify_surface_command(item.get("CommandLine") or item.get("Name") or "")
+            if not surface:
+                continue
+            started_at_ms = _parse_windows_date(item.get("CreationDate"))
+            surfaces.append({
+                "pid": int(item.get("ProcessId") or 0),
+                "kind": surface["kind"],
+                "label": surface["label"],
+                "command": item.get("CommandLine") or item.get("Name") or "",
+                "startedAtMs": started_at_ms,
+                "startedAt": datetime.fromtimestamp(started_at_ms / 1000, timezone.utc).isoformat() if started_at_ms else "",
+                "source": "windows",
+            })
+        return surfaces
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def _list_mac_surfaces():
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,lstart=,command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            return []
+        surfaces = []
+        for line in result.stdout.splitlines():
+            match = re.match(
+                r"^(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$",
+                line.strip(),
+            )
+            if not match:
+                continue
+            surface = classify_surface_command(match.group(3))
+            if not surface:
+                continue
+            try:
+                started_at_ms = datetime.strptime(match.group(2), "%a %b %d %H:%M:%S %Y").timestamp() * 1000
+            except ValueError:
+                started_at_ms = 0
+            surfaces.append({
+                "pid": int(match.group(1)),
+                "kind": surface["kind"],
+                "label": surface["label"],
+                "command": match.group(3),
+                "startedAtMs": started_at_ms,
+                "startedAt": datetime.fromtimestamp(started_at_ms / 1000, timezone.utc).isoformat() if started_at_ms else "",
+                "source": "mac",
+            })
+        return surfaces
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+_SURFACE_CACHE = {"at": 0.0, "value": []}
+
+
+def get_running_surfaces(refresh=False):
+    if not refresh and _SURFACE_CACHE["value"] and time.monotonic() - _SURFACE_CACHE["at"] < 30:
+        return json.loads(json.dumps(_SURFACE_CACHE["value"]))
+    surfaces = []
+    if os.name == "posix":
+        surfaces.extend(_list_linux_surfaces())
+        surfaces.extend(_list_windows_surfaces())
+    elif os.name == "nt":
+        surfaces.extend(_list_windows_surfaces())
+    if sys.platform == "darwin":
+        surfaces.extend(_list_mac_surfaces())
+    _SURFACE_CACHE["at"] = time.monotonic()
+    _SURFACE_CACHE["value"] = surfaces
+    return json.loads(json.dumps(surfaces))
+
+
+def evaluate_surfaces(surfaces, applied_at):
+    applied_at_ms = 0
+    if applied_at:
+        try:
+            applied_at_ms = datetime.fromisoformat(applied_at.replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            applied_at_ms = 0
+    counts = {}
+    enriched = []
+    for surface in surfaces or []:
+        try:
+            started_at_ms = int(surface.get("startedAtMs") or 0)
+        except (TypeError, ValueError):
+            started_at_ms = 0
+        if not started_at_ms and surface.get("startedAt"):
+            try:
+                started_at_ms = datetime.fromisoformat(surface["startedAt"].replace("Z", "+00:00")).timestamp() * 1000
+            except ValueError:
+                started_at_ms = 0
+        kind = surface.get("kind", "unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+        enriched.append({
+            **surface,
+            "startedAtMs": started_at_ms,
+            "startedAt": datetime.fromtimestamp(started_at_ms / 1000, timezone.utc).isoformat() if started_at_ms else surface.get("startedAt", ""),
+            "stale": bool(applied_at_ms and started_at_ms and started_at_ms < applied_at_ms),
+        })
+    main_surface_kinds = {"desktop-wsl", "ide-wsl", "desktop-win", "ide-win"}
+    duplicates = [
+        {"kind": kind, "count": count}
+        for kind, count in counts.items()
+        if count > 1 and kind in main_surface_kinds
+    ]
+    return {
+        "appliedAt": applied_at or "",
+        "surfaces": enriched,
+        "stale": [surface for surface in enriched if surface["stale"]],
+        "duplicates": duplicates,
+    }
+
+
+def get_permission_warnings():
+    if os.name == "nt":
+        return []
+    warnings = []
+    targets = list(get_profiles_file_paths())
+    for paths in get_token_file_paths().values():
+        targets.extend(paths)
+    for file_path in dict.fromkeys(targets):
+        if file_path.startswith("/mnt/c/"):
+            continue
+        try:
+            mode = os.stat(file_path).st_mode & 0o777
+        except OSError:
+            continue
+        if mode & 0o077:
+            warnings.append({
+                "path": file_path,
+                "mode": format(mode, "o"),
+                "reason": "group/other permissions are set; expected 600",
+            })
+    return warnings
+
+
+def get_doctor_report(surfaces=None, preferred_store=None):
+    session = detect_sessions(preferred_store or _preferred_store())
+    state = read_switch_state()
+    surface_report = evaluate_surfaces(
+        surfaces if surfaces is not None else get_running_surfaces(),
+        state.get("appliedAt", "") if isinstance(state, dict) else "",
+    )
+    permissions = get_permission_warnings()
+    warnings = []
+
+    for conflict in session.get("conflicts", []):
+        if conflict["type"] == "multiple-emails":
+            warnings.append({
+                "code": "store-conflict",
+                "severity": "error",
+                "message": "Multiple identities: " + ", ".join(conflict.get("emails", [])),
+            })
+        elif conflict["type"] == "database-identity-mismatch":
+            warnings.append({
+                "code": "store-conflict",
+                "severity": "error",
+                "message": "Database identity mismatch: "
+                + " vs ".join(conflict.get("emails", []))
+                + f" ({conflict.get('path')})",
+            })
+        elif conflict["type"] == "target-mismatch":
+            divergent = ", ".join(
+                f"{store.get('category')}@{store.get('home')}={store.get('email')}"
+                for store in conflict.get("stores", [])
+            )
+            warnings.append({
+                "code": "store-conflict",
+                "severity": "error",
+                "message": f"Expected {conflict.get('targetEmail')}; divergent: {divergent}",
+            })
+
+    for surface in surface_report["stale"]:
+        warnings.append({
+            "code": "stale-surface",
+            "severity": "error" if session.get("conflicts") else "warning",
+            "message": f"{surface['label']} (PID {surface.get('pid') or '?'}) started before the last switch "
+                       f"({surface.get('startedAt') or 'unknown'}); restart it to reload the token.",
+            "surface": surface,
+        })
+    for duplicate in surface_report["duplicates"]:
+        warnings.append({
+            "code": "duplicate-surface",
+            "severity": "warning",
+            "message": f"{duplicate['count']} {duplicate['kind']} processes are running; close the duplicates.",
+            "duplicate": duplicate,
+        })
+    for permission in permissions:
+        warnings.append({
+            "code": "permissions",
+            "severity": "warning",
+            "message": f"{permission['path']} has mode {permission['mode']}; expected 600.",
+            "permission": permission,
+        })
+    for warning in last_warnings():
+        warnings.append({"code": "vault", "severity": "warning", "message": warning})
+
+    return {
+        "ok": not any(warning["severity"] == "error" for warning in warnings),
+        "activeSession": {
+            "email": session.get("email", ""),
+            "targetEmail": session.get("target_email", ""),
+            "conflicts": session.get("conflicts", []),
+        },
+        "switchState": {
+            "appliedAt": state.get("appliedAt", "") if isinstance(state, dict) else "",
+            "targetEmail": state.get("targetEmail", "") if isinstance(state, dict) else "",
+        },
+        "surfaces": surface_report,
+        "permissions": permissions,
+        "warnings": warnings,
+    }
+
+
+def cmd_doctor(as_json=False):
+    report = get_doctor_report()
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Version: {VERSION}")
+        print(f"Active account: {report['activeSession']['email'] or '(none)'}")
+        print(f"Desired account: {report['activeSession']['targetEmail'] or '(none)'}")
+        print(f"Switch applied at: {report['switchState']['appliedAt'] or '(none)'}")
+        print("Running surfaces:")
+        if not report["surfaces"]["surfaces"]:
+            print("  (none detected)")
+        for surface in report["surfaces"]["surfaces"]:
+            stale = " [STARTED BEFORE LAST SWITCH]" if surface.get("stale") else ""
+            print(f"  * PID {surface.get('pid') or '?'} | {surface.get('label')} | {surface.get('startedAt') or 'unknown'}{stale}")
+        print("Warnings:")
+        if not report["warnings"]:
+            print("  (none)")
+        for warning in report["warnings"]:
+            print(f"  [{warning['severity']}] {warning['message']}")
+    return 0 if report["ok"] else 1
+
+
 def get_diagnostics():
     profiles = load_profiles()
     warnings = last_warnings()
@@ -1907,6 +2277,7 @@ def get_diagnostics():
         "conflicts": session.get("conflicts", []),
         "switchState": state,
         "storeDiff": diff_against_switch_state(state),
+        "doctor": get_doctor_report(),
         "savedProfiles": sorted(profiles.keys()),
         "profileCompleteness": {
             email: {
@@ -2212,6 +2583,9 @@ def main():
     diagnostics_parser = subparsers.add_parser("diagnostics", help="Show token and database paths")
     diagnostics_parser.add_argument("--json", action="store_true", help="Output JSON")
 
+    doctor_parser = subparsers.add_parser("doctor", help="Diagnose conflicts, stale surfaces and permissions")
+    doctor_parser.add_argument("--json", action="store_true", help="Output JSON")
+
     args = parser.parse_args()
 
     if args.command == "save":
@@ -2234,6 +2608,8 @@ def main():
         sys.exit(cmd_reset(args.yes))
     if args.command == "diagnostics":
         sys.exit(cmd_diagnostics(as_json=args.json))
+    if args.command == "doctor":
+        sys.exit(cmd_doctor(as_json=args.json))
 
     cmd_list()
 

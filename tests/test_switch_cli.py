@@ -158,9 +158,10 @@ class TestSwitchCLI(unittest.TestCase):
         self.assertIn("work@company.com", profiles)
         self.assertEqual(profiles["work@company.com"]["label"], "Work")
 
-        profile_path = os.path.join(self.home, ".gemini", "antigravity_profiles.json")
-        self.assertEqual(stat.S_IMODE(os.stat(profile_path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(self.token_path("cliToken")).st_mode), 0o600)
+        if os.name != "nt":
+            profile_path = os.path.join(self.home, ".gemini", "antigravity_profiles.json")
+            self.assertEqual(stat.S_IMODE(os.stat(profile_path).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(self.token_path("cliToken")).st_mode), 0o600)
 
     def test_manual_email_must_match_the_active_session(self):
         with self.assertRaisesRegex(RuntimeError, "No active Antigravity session"):
@@ -477,6 +478,7 @@ class TestSwitchCLI(unittest.TestCase):
         self.assertFalse(entry["complete"])
         self.assertTrue(any("database" in warning for warning in switch.last_warnings()))
 
+    @unittest.skipIf(os.name == "nt", "read-only chmod semantics differ on Windows")
     def test_restore_rolls_back_files_when_database_write_fails(self):
         self.write_token("cliToken", make_token("old@example.com", "old-access", "old-refresh"))
         os.chmod(self.db_path, 0o444)
@@ -756,6 +758,84 @@ class TestSwitchCLI(unittest.TestCase):
         self.assertTrue(refreshed["account_id"])
         self.assertIn(self.db_path, refreshed["db_tokens_by_path"])
         self.assertTrue(refreshed["complete"])
+
+    def test_classify_surface_command(self):
+        self.assertEqual(
+            switch.classify_surface_command(r"C:\Apps\Antigravity.exe")["kind"],
+            "desktop-win",
+        )
+        self.assertEqual(
+            switch.classify_surface_command(r"C:\Apps\Antigravity IDE.exe")["kind"],
+            "ide-win",
+        )
+        self.assertEqual(
+            switch.classify_surface_command(
+                "/home/u/.antigravity-server/bin/2.28.2/language_server --standalone --app_data_dir antigravity"
+            )["kind"],
+            "desktop-wsl",
+        )
+        self.assertEqual(
+            switch.classify_surface_command(
+                "/home/u/.antigravity-ide-server/bin/2.6.0/node /out/server-main.js --start-server"
+            )["kind"],
+            "ide-wsl",
+        )
+        self.assertEqual(
+            switch.classify_surface_command("/home/u/.gemini/bin/agy --hub --hub-port=45530")["kind"],
+            "agent-hub",
+        )
+        self.assertEqual(switch.classify_surface_command("/home/u/.gemini/bin/agy")["kind"], "cli")
+        self.assertIsNone(switch.classify_surface_command("node other.js"))
+        self.assertIsNone(switch.classify_surface_command(
+            r"C:\Apps\Antigravity IDE.exe --type=renderer --user-data-dir=C:\x"
+        ))
+        self.assertIsNone(switch.classify_surface_command(
+            "/home/u/.antigravity-ide-server/bin/2.6.0/node /out/bootstrap-fork --type=extensionHost"
+        ))
+
+    def test_evaluate_surfaces_marks_stale_and_duplicates(self):
+        report = switch.evaluate_surfaces([
+            {"pid": 1, "kind": "desktop-wsl", "label": "Desktop", "startedAtMs": 1000},
+            {"pid": 2, "kind": "desktop-wsl", "label": "Desktop", "startedAtMs": 2600},
+            {"pid": 3, "kind": "ide-wsl", "label": "IDE", "startedAtMs": 3000},
+        ], "1970-01-01T00:00:02.500Z")
+
+        self.assertEqual(len(report["stale"]), 1)
+        self.assertEqual(report["stale"][0]["pid"], 1)
+        self.assertEqual(report["duplicates"], [{"kind": "desktop-wsl", "count": 2}])
+
+    def test_get_doctor_report_flags_stale_surface_during_conflict(self):
+        self.write_token("standaloneToken", make_token("ide@example.com"))
+        self.write_token("cliToken", make_token("stale@example.com"))
+        switch.write_switch_state({
+            "targetEmail": "ide@example.com",
+            "appliedAt": "2026-01-01T00:00:00Z",
+        })
+
+        report = switch.get_doctor_report(
+            surfaces=[{
+                "pid": 123,
+                "kind": "desktop-wsl",
+                "label": "Antigravity Desktop 2.0 (WSL backend)",
+                "startedAtMs": 1000000000000,
+                "source": "test",
+            }],
+            preferred_store="standaloneToken",
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any(warning["code"] == "stale-surface" for warning in report["warnings"]))
+        self.assertTrue(any(warning["code"] == "store-conflict" for warning in report["warnings"]))
+
+    def test_get_permission_warnings_flags_group_readable_token(self):
+        if os.name == "nt":
+            return
+        self.write_token("cliToken", make_token("perm@example.com"))
+        os.chmod(self.token_path("cliToken"), 0o644)
+
+        self.assertTrue(any(item["path"] == self.token_path("cliToken") for item in switch.get_permission_warnings()))
+        os.chmod(self.token_path("cliToken"), 0o600)
+        self.assertFalse(any(item["path"] == self.token_path("cliToken") for item in switch.get_permission_warnings()))
 
     def test_find_profile_rejects_ambiguous_labels(self):
         profiles = {

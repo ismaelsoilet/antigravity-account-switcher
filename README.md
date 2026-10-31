@@ -3,21 +3,22 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.7.3-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.7.4-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
+[![CI](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml/badge.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml)
 
 An embedded extension and CLI utility that allows developers to seamlessly save, manage, and toggle between multiple Google accounts on the same computer without continuous browser re-authentication or session conflicts.
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-### What's new in 1.7.3
+### What's new in 1.7.4
 
-- **Login is now a full switch:** after Google sign-in, the new account is written to the IDE, Desktop and CLI instead of failing because the other stores were still on the old account.
-- **New `agy-switch adopt`** command and a **Use newest login** menu action for logins performed outside the extension.
-- **Profile identity model:** canonical Gmail comparison, refresh-token fingerprints, `account_id`, `aliases`, and automatic merge instead of duplicate profiles.
-- **Database identity validation:** `antigravityAuthStatus.email` and all `lastLoginUsername` fields must agree; mismatches are reported as `database-identity-mismatch` and block save/switch until repaired.
-- **Profile self-heal:** a successful switch refreshes the profile's fingerprints, `account_id` and per-database paths.
-- **Conflict UX:** the menu offers **Reapply target profile**; save errors show the full divergent-store detail.
+- **Reliability Doctor:** `agy-switch doctor` and the **Run Doctor** menu/command detect running Antigravity surfaces, flag main processes that started **before the last switch**, report duplicate main surfaces, store conflicts and unsafe file modes. It is read-only.
+- **Helper-process filtering:** Windows `--type=` helpers and WSL `bootstrap-fork`/extension-host/pty processes are ignored, so the Doctor reports only real surfaces.
+- **CI and releases:** GitHub Actions runs the JS and Python suites on Ubuntu and Windows; pushing a `v*` tag builds the VSIX and publishes a GitHub release.
+- **Specification:** see [docs/SPEC-1.7.4.md](docs/SPEC-1.7.4.md).
+
+Previous 1.7.3: sign-in as a full switch, `agy-switch adopt`, canonical-email/fingerprint profile dedupe, database identity validation and profile self-heal.
 
 ---
 
@@ -64,6 +65,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 * **Built-in Diagnostics:**  
   Run **Antigravity: Show Account Switcher Diagnostics** or `agy-switch diagnostics` to print detected database paths, token paths, runtime support and vault warnings.
 
+* **Reliability Doctor:**
+  Run **Antigravity: Run Account Switcher Doctor** or `agy-switch doctor` to detect running surfaces whose main process predates the last switch (the usual cause of a token being rewritten), duplicate main surfaces, store conflicts and unsafe file modes. The Doctor never writes to tokens, databases or profiles.
+
 * **Dual-Host Support (Windows & WSL Remote Workspaces):**  
   Configured with `"extensionKind": ["ui", "workspace"]` to function smoothly whether working on local Windows folders or remote WSL (`wsl+ubuntu`) workspaces.
 
@@ -90,7 +94,7 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 
 The switcher is designed for **one account at a time** across all surfaces. With the IDE, Desktop 2.0 and the CLI open at the same time, each process keeps its own copy of the OAuth token and may refresh it independently (the CLI refreshes roughly every hour). The switcher cannot force three running processes to keep three different accounts; any tool that writes the shared token files will win the last write.
 
-What v1.7.3 does instead:
+What v1.7.4 does instead:
 
 * runs a cross-process lock (`~/.gemini/.antigravity-switch.lock`) so two switches cannot interleave;
 * records the expected identity and hashes in `~/.gemini/antigravity_switch_state.json`;
@@ -100,7 +104,7 @@ What v1.7.3 does instead:
 
 The status bar prefers the surface selected by `antigravityAccountSwitcher.preferredStore` (`standaloneToken` by default, or `cliToken`), and always prefers the account most recently applied by the switcher while that store still exists. It never chooses a winner by modification time.
 
-### Identity rules (v1.7.3)
+### Identity rules (v1.7.4)
 
 * Gmail aliases are canonicalized for comparisons: `user+tag@gmail.com` and `u.ser@gmail.com` collapse to the same canonical address. The original email is still used when writing tokens.
 * Each profile stores an `account_id` and a refresh-token fingerprint per token category. Profiles that share a canonical email or a fingerprint are **merged into one** (with `aliases`) instead of creating a second entry.
@@ -112,7 +116,25 @@ The status bar prefers the surface selected by `antigravityAccountSwitcher.prefe
 
 When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Connect / Sign In to Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
 
-To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.7.3.
+To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.7.4.
+
+### Reliability Doctor
+
+The Doctor is the first thing to run when an account appears to flip back after a
+switch:
+
+```bash
+agy-switch doctor
+agy-switch doctor --json
+```
+
+It lists the main Antigravity surfaces (`desktop-wsl`, `ide-wsl`, `desktop-win`,
+`ide-win`, `agent-hub`, `cli`), their PIDs and start times, and marks any surface
+whose process started **before** the last switch. A surface that predates the
+switch is still holding the previous refresh token in memory; restart/reload that
+surface (or sign in again) before applying the profile again. The Doctor also
+reports duplicate main surfaces, store conflicts and group/other-readable files
+in the WSL home. It never modifies state.
 
 ### Conversation & Chat Sync
 * Conversation history is stored in local SQLite databases (`conversation_summaries.db`).
@@ -159,6 +181,10 @@ To use three different accounts simultaneously, each surface must run with an is
 8. **Diagnostics:**
    * Click **`Show Diagnostics`** to print paths, runtime support and vault warnings to the "Antigravity Account Switcher" output channel.
 
+9. **Doctor:**
+   * Click **`Run Doctor (surfaces, conflicts, permissions)`** to detect running main surfaces that predate the last switch, duplicate main surfaces, store conflicts and unsafe file modes.
+   * The JSON report is written to the output channel. Use it when an account flips back after a switch.
+
 ---
 
 ### B. From the Terminal (`agy-switch` CLI)
@@ -190,6 +216,10 @@ agy-switch clear
 
 # Inspect paths, runtime support and vault warnings
 agy-switch diagnostics
+
+# Diagnose running surfaces, stale processes, conflicts and file modes
+agy-switch doctor
+agy-switch doctor --json
 
 # Print the CLI version
 agy-switch --version
@@ -227,7 +257,7 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.7.3.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.7.4.vsix` located in the repository folder.
 4. Reload the window when prompted.
 
 To rebuild the VSIX from source:
@@ -263,6 +293,7 @@ The suite is hermetic: it uses temporary homes and temporary SQLite databases, a
 * **Status bar says "Email not detected":** a token exists but has no email claim. Use **Register Email for Active Session** (only accepted when it matches the active token) or sign in again.
 * **Database sync unavailable:** the host does not expose `node:sqlite`. Antigravity 1.107+ does; older or embedded hosts may not. Use **Show Diagnostics** to confirm.
 * **A switch reports a failure:** the extension does not reload silently on errors. Check the "Antigravity Account Switcher" output channel; when a write fails, the previous session is left intact.
+* **The account flips back after a switch:** run `agy-switch doctor`. The report names the surface whose main process started before the last switch; restart/reload it (or sign in again) before reapplying the profile. This is usually the IDE/Desktop/CLI process that still holds the old refresh token.
 * **Recovering a profile:** if a vault was corrupt, inspect the generated `.corrupt-*.json` backup before importing it manually.
 * **The CLI cannot find the databases:** run `agy-switch diagnostics`. On non-WSL Linux/macOS, database paths are discovered only where Antigravity actually stores `state.vscdb`; file-token switching still works.
 

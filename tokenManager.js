@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.7.3';
+const VERSION = '1.7.4';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;
@@ -2003,6 +2003,329 @@ function clearAllSessionTokensUnlocked() {
     }
 }
 
+function classifySurfaceCommand(command) {
+    const text = String(command || '');
+    if (!text) return null;
+    if (/Antigravity IDE\.exe/i.test(text)) {
+        if (/--type=/.test(text)) return null;
+        return { kind: 'ide-win', label: 'Antigravity IDE (Windows UI)' };
+    }
+    if (/(^|[\\/])Antigravity\.exe/i.test(text)) {
+        if (/--type=/.test(text)) return null;
+        return { kind: 'desktop-win', label: 'Antigravity Desktop 2.0 (Windows UI)' };
+    }
+    if (/language_server/i.test(text) && /--app_data_dir\s+antigravity/i.test(text)) {
+        return { kind: 'desktop-wsl', label: 'Antigravity Desktop 2.0 (WSL backend)' };
+    }
+    if (/antigravity-ide-server|server-main\.js/i.test(text)) {
+        if (/bootstrap-fork|--type=extensionHost|--type=fileWatcher|--type=ptyHost|--type=renderer|--type=nodeService|--type=utility|--type=gpu-process/i.test(text)) {
+            return null;
+        }
+        if (/server-main\.js/.test(text) && /--start-server/.test(text)) {
+            return { kind: 'ide-wsl', label: 'Antigravity IDE (WSL server)' };
+        }
+        return null;
+    }
+    if (/(^|[\\/])agy(?:\.exe)?\s+--hub/i.test(text)) {
+        return { kind: 'agent-hub', label: 'Antigravity agent hub' };
+    }
+    if (/(^|[\\/])agy(?:\.exe)?(?:\s|$)/i.test(text) && !/--hub/i.test(text)) {
+        return { kind: 'cli', label: 'Antigravity CLI (agy)' };
+    }
+    return null;
+}
+
+function parseProcStartTime(procRoot, pid, bootTimeMs, clockTicksPerSecond) {
+    const stat = fs.readFileSync(path.join(procRoot, String(pid), 'stat'), 'utf-8');
+    const close = stat.lastIndexOf(')');
+    if (close < 0) return 0;
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    const startTicks = Number(fields[19]);
+    if (!Number.isFinite(startTicks) || !bootTimeMs) return 0;
+    return bootTimeMs + (startTicks / (clockTicksPerSecond || 100)) * 1000;
+}
+
+function getLinuxBootTimeMs() {
+    try {
+        const stat = fs.readFileSync('/proc/stat', 'utf-8');
+        const match = stat.match(/^btime\s+(\d+)/m);
+        return match ? Number(match[1]) * 1000 : 0;
+    } catch {
+        return 0;
+    }
+}
+
+let linuxClockTicks = 0;
+function getLinuxClockTicks() {
+    if (linuxClockTicks) return linuxClockTicks;
+    try {
+        linuxClockTicks = Number(execFileSync('getconf', ['CLK_TCK'], {
+            encoding: 'utf-8',
+            timeout: 1000,
+            stdio: ['ignore', 'pipe', 'ignore']
+        }).trim()) || 100;
+    } catch {
+        linuxClockTicks = 100;
+    }
+    return linuxClockTicks;
+}
+
+function listLinuxSurfaces(options = {}) {
+    const procRoot = options.procRoot || '/proc';
+    const bootTimeMs = options.bootTimeMs !== undefined ? options.bootTimeMs : getLinuxBootTimeMs();
+    const clockTicksPerSecond = options.clockTicksPerSecond || getLinuxClockTicks();
+    const surfaces = [];
+    let pids = [];
+    try {
+        pids = fs.readdirSync(procRoot).filter(name => /^\d+$/.test(name));
+    } catch {
+        return surfaces;
+    }
+
+    for (const pid of pids) {
+        let command = '';
+        try {
+            command = fs.readFileSync(path.join(procRoot, pid, 'cmdline'), 'utf-8').replace(/\0/g, ' ').trim();
+        } catch {
+            continue;
+        }
+        const surface = classifySurfaceCommand(command);
+        if (!surface) continue;
+        let startedAtMs = 0;
+        try {
+            startedAtMs = parseProcStartTime(procRoot, pid, bootTimeMs, clockTicksPerSecond);
+        } catch {}
+        surfaces.push({
+            pid: Number(pid),
+            kind: surface.kind,
+            label: surface.label,
+            command,
+            startedAtMs,
+            startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : '',
+            source: 'linux'
+        });
+    }
+    return surfaces;
+}
+
+function parseWindowsDate(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value < 1e12 ? value * 1000 : value;
+    }
+    if (typeof value === 'string') {
+        const match = value.match(/\/Date\((\d+)\)\//);
+        if (match) return Number(match[1]);
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
+}
+
+function listWindowsSurfaces() {
+    try {
+        const script = "@(Get-CimInstance Win32_Process -Filter \"Name='Antigravity.exe' OR Name='Antigravity IDE.exe'\" | Select-Object ProcessId,Name,CreationDate,CommandLine) | ConvertTo-Json -Compress";
+        const raw = execFileSync('powershell.exe', ['-NoProfile', '-Command', script], {
+            encoding: 'utf-8',
+            timeout: 8000,
+            stdio: ['ignore', 'pipe', 'ignore']
+        });
+        const parsed = JSON.parse(raw);
+        const list = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+        return list.map(item => {
+            const surface = classifySurfaceCommand(item.CommandLine || item.Name || '');
+            if (!surface) return null;
+            const startedAtMs = parseWindowsDate(item.CreationDate);
+            return {
+                pid: Number(item.ProcessId) || 0,
+                kind: surface.kind,
+                label: surface.label,
+                command: item.CommandLine || item.Name || '',
+                startedAtMs,
+                startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : '',
+                source: 'windows'
+            };
+        }).filter(Boolean);
+    } catch {
+        return [];
+    }
+}
+
+function listMacSurfaces() {
+    try {
+        const raw = execFileSync('ps', ['-axo', 'pid=,lstart=,command='], {
+            encoding: 'utf-8',
+            timeout: 3000,
+            stdio: ['ignore', 'pipe', 'ignore']
+        });
+        return raw.split('\n').map(line => {
+            const match = line.trim().match(/^(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/);
+            if (!match) return null;
+            const surface = classifySurfaceCommand(match[3]);
+            if (!surface) return null;
+            const startedAtMs = Date.parse(match[2]) || 0;
+            return {
+                pid: Number(match[1]),
+                kind: surface.kind,
+                label: surface.label,
+                command: match[3],
+                startedAtMs,
+                startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : '',
+                source: 'mac'
+            };
+        }).filter(Boolean);
+    } catch {
+        return [];
+    }
+}
+
+let surfaceCache = { at: 0, value: [] };
+
+function getRunningSurfaces(options = {}) {
+    if (!options.refresh && surfaceCache.value.length > 0 && Date.now() - surfaceCache.at < 30000) {
+        return clone(surfaceCache.value);
+    }
+    const surfaces = [];
+    if (process.platform === 'linux') surfaces.push(...listLinuxSurfaces(options));
+    if (process.platform === 'darwin') surfaces.push(...listMacSurfaces());
+    if (process.platform === 'win32' || process.platform === 'linux') {
+        surfaces.push(...listWindowsSurfaces());
+    }
+    surfaceCache = { at: Date.now(), value: surfaces };
+    return clone(surfaces);
+}
+
+function evaluateSurfaces(surfaces, appliedAt) {
+    const appliedAtMs = Date.parse(appliedAt || '') || 0;
+    const counts = new Map();
+    const enriched = (surfaces || []).map(surface => {
+        const startedAtMs = Number(
+            surface.startedAtMs
+            || (surface.startedAt ? Date.parse(surface.startedAt) : 0)
+        ) || 0;
+        counts.set(surface.kind, (counts.get(surface.kind) || 0) + 1);
+        return {
+            ...surface,
+            startedAtMs,
+            startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : (surface.startedAt || ''),
+            stale: Boolean(appliedAtMs && startedAtMs && startedAtMs < appliedAtMs)
+        };
+    });
+    const mainSurfaceKinds = new Set(['desktop-wsl', 'ide-wsl', 'desktop-win', 'ide-win']);
+    const duplicates = [...counts.entries()]
+        .filter(([kind, count]) => count > 1 && mainSurfaceKinds.has(kind))
+        .map(([kind, count]) => ({ kind, count }));
+    return {
+        appliedAt: appliedAt || '',
+        surfaces: enriched,
+        stale: enriched.filter(surface => surface.stale),
+        duplicates
+    };
+}
+
+function getPermissionWarnings() {
+    if (process.platform === 'win32') return [];
+    const warnings = [];
+    const targets = [
+        ...getProfilesFilePaths(),
+        ...Object.values(getTokenFilePaths()).flat()
+    ];
+    for (const filePath of new Set(targets)) {
+        if (filePath.startsWith('/mnt/c/')) continue;
+        try {
+            if (!fs.existsSync(filePath)) continue;
+            const mode = fs.statSync(filePath).mode & 0o777;
+            if ((mode & 0o077) !== 0) {
+                warnings.push({
+                    path: filePath,
+                    mode: mode.toString(8),
+                    reason: 'group/other permissions are set; expected 600'
+                });
+            }
+        } catch {}
+    }
+    return warnings;
+}
+
+function getDoctorReport(options = {}) {
+    const session = detectSessions({ preferredStore: options.preferredStore || 'standaloneToken' });
+    const state = readSwitchState();
+    const surfaceReport = evaluateSurfaces(
+        options.surfaces || getRunningSurfaces({ refresh: options.refresh }),
+        state.appliedAt || ''
+    );
+    const permissions = getPermissionWarnings();
+    const warnings = [];
+
+    for (const conflict of session.conflicts || []) {
+        if (conflict.type === 'multiple-emails') {
+            warnings.push({
+                code: 'store-conflict',
+                severity: 'error',
+                message: `Multiple identities: ${conflict.emails.join(', ')}`
+            });
+        } else if (conflict.type === 'database-identity-mismatch') {
+            warnings.push({
+                code: 'store-conflict',
+                severity: 'error',
+                message: `Database identity mismatch: ${conflict.emails.join(' vs ')} (${conflict.path})`
+            });
+        } else if (conflict.type === 'target-mismatch') {
+            const divergent = (conflict.stores || [])
+                .map(store => `${store.category}@${store.home}=${store.email}`)
+                .join(', ');
+            warnings.push({
+                code: 'store-conflict',
+                severity: 'error',
+                message: `Expected ${conflict.targetEmail}; divergent: ${divergent}`
+            });
+        }
+    }
+
+    for (const surface of surfaceReport.stale) {
+        warnings.push({
+            code: 'stale-surface',
+            severity: session.conflicts.length > 0 ? 'error' : 'warning',
+            message: `${surface.label} (PID ${surface.pid || '?'}) started before the last switch (${surface.startedAt || 'unknown'}); restart it to reload the token.`,
+            surface
+        });
+    }
+    for (const duplicate of surfaceReport.duplicates) {
+        warnings.push({
+            code: 'duplicate-surface',
+            severity: 'warning',
+            message: `${duplicate.count} ${duplicate.kind} processes are running; close the duplicates.`,
+            duplicate
+        });
+    }
+    for (const permission of permissions) {
+        warnings.push({
+            code: 'permissions',
+            severity: 'warning',
+            message: `${permission.path} has mode ${permission.mode}; expected 600.`,
+            permission
+        });
+    }
+    for (const warning of lastLoadWarnings) {
+        warnings.push({ code: 'vault', severity: 'warning', message: warning });
+    }
+
+    return {
+        ok: warnings.filter(warning => warning.severity === 'error').length === 0,
+        activeSession: {
+            email: session.email,
+            targetEmail: session.targetEmail,
+            conflicts: session.conflicts || []
+        },
+        switchState: {
+            appliedAt: state.appliedAt || '',
+            targetEmail: state.targetEmail || ''
+        },
+        surfaces: surfaceReport,
+        permissions,
+        warnings
+    };
+}
+
 function getDiagnostics() {
     const profiles = loadProfiles();
     const warnings = getLastLoadWarnings();
@@ -2021,6 +2344,7 @@ function getDiagnostics() {
         conflicts: session.conflicts,
         switchState: state,
         storeDiff: diffAgainstSwitchState(state),
+        doctor: getDoctorReport(),
         savedProfiles: Object.keys(profiles),
         profileCompleteness: Object.fromEntries(Object.entries(profiles).map(([email, profile]) => [
             email,
@@ -2084,6 +2408,11 @@ module.exports = {
     getStoreSnapshot,
     getStoreMtimeSignature,
     diffAgainstSwitchState,
+    classifySurfaceCommand,
+    evaluateSurfaces,
+    getRunningSurfaces,
+    getPermissionWarnings,
+    getDoctorReport,
     acquireSwitchLock,
     snapshotActiveAccount,
     buildLoginProfile,

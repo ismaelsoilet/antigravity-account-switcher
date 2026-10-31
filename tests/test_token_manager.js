@@ -459,7 +459,7 @@ test('acquireSwitchLock blocks a concurrent switch and releases cleanly', async 
 });
 
 test('restoreProfile rolls the token files back when a database write fails', async () => {
-    if (!DatabaseSync) return;
+    if (!DatabaseSync || process.platform === 'win32') return;
     resetState();
     writeToken('cliToken', makeToken('old@example.com', 'old-access', 'old-refresh'));
     fs.chmodSync(dbPath, 0o444);
@@ -868,6 +868,81 @@ test('restoreProfile refreshes legacy profile metadata', async () => {
     assert.ok(refreshed.account_id);
     assert.ok(refreshed.db_tokens_by_path[dbPath]);
     assert.strictEqual(refreshed.complete, true);
+});
+
+test('classifySurfaceCommand identifies Antigravity surfaces', async () => {
+    assert.strictEqual(tokenManager.classifySurfaceCommand('C:\\Apps\\Antigravity.exe').kind, 'desktop-win');
+    assert.strictEqual(tokenManager.classifySurfaceCommand('C:\\Apps\\Antigravity IDE.exe').kind, 'ide-win');
+    assert.strictEqual(
+        tokenManager.classifySurfaceCommand('/home/u/.antigravity-server/bin/2.28.2/language_server --standalone --app_data_dir antigravity').kind,
+        'desktop-wsl'
+    );
+    assert.strictEqual(
+        tokenManager.classifySurfaceCommand('/home/u/.antigravity-ide-server/bin/2.6.0/node /out/server-main.js --start-server').kind,
+        'ide-wsl'
+    );
+    assert.strictEqual(
+        tokenManager.classifySurfaceCommand('/home/u/.gemini/bin/agy --hub --hub-port=45530').kind,
+        'agent-hub'
+    );
+    assert.strictEqual(tokenManager.classifySurfaceCommand('/home/u/.gemini/bin/agy').kind, 'cli');
+    assert.strictEqual(tokenManager.classifySurfaceCommand('node other.js'), null);
+    assert.strictEqual(
+        tokenManager.classifySurfaceCommand('C:\\Apps\\Antigravity IDE.exe --type=renderer --user-data-dir=C:\\x'),
+        null
+    );
+    assert.strictEqual(
+        tokenManager.classifySurfaceCommand('/home/u/.antigravity-ide-server/bin/2.6.0/node /out/bootstrap-fork --type=extensionHost'),
+        null
+    );
+});
+
+test('evaluateSurfaces marks stale and duplicate surfaces', async () => {
+    const report = tokenManager.evaluateSurfaces([
+        { pid: 1, kind: 'desktop-wsl', label: 'Desktop', startedAtMs: 1000 },
+        { pid: 2, kind: 'desktop-wsl', label: 'Desktop', startedAtMs: 2600 },
+        { pid: 3, kind: 'ide-wsl', label: 'IDE', startedAtMs: 3000 }
+    ], new Date(2500).toISOString());
+
+    assert.strictEqual(report.stale.length, 1);
+    assert.strictEqual(report.stale[0].pid, 1);
+    assert.deepStrictEqual(report.duplicates, [{ kind: 'desktop-wsl', count: 2 }]);
+});
+
+test('getDoctorReport flags a stale surface during a conflict', async () => {
+    resetState();
+    writeToken('standaloneToken', makeToken('ide@example.com'));
+    writeToken('cliToken', makeToken('stale@example.com'));
+    tokenManager.writeSwitchState({
+        targetEmail: 'ide@example.com',
+        appliedAt: new Date(Date.now() - 60000).toISOString()
+    });
+
+    const report = tokenManager.getDoctorReport({
+        preferredStore: 'standaloneToken',
+        surfaces: [{
+            pid: 123,
+            kind: 'desktop-wsl',
+            label: 'Antigravity Desktop 2.0 (WSL backend)',
+            startedAtMs: Date.now() - 120000,
+            source: 'test'
+        }]
+    });
+
+    assert.strictEqual(report.ok, false);
+    assert.ok(report.warnings.some(warning => warning.code === 'stale-surface'));
+    assert.ok(report.warnings.some(warning => warning.code === 'store-conflict'));
+});
+
+test('getPermissionWarnings flags group-readable token files', async () => {
+    if (process.platform === 'win32') return;
+    resetState();
+    writeToken('cliToken', makeToken('perm@example.com'));
+    fs.chmodSync(tokenPath('cliToken'), 0o644);
+
+    assert.ok(tokenManager.getPermissionWarnings().some(warning => warning.path === tokenPath('cliToken')));
+    fs.chmodSync(tokenPath('cliToken'), 0o600);
+    assert.ok(!tokenManager.getPermissionWarnings().some(warning => warning.path === tokenPath('cliToken')));
 });
 
 async function runTests() {

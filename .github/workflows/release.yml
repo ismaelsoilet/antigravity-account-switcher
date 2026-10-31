@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and publish VSIX
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Package VSIX
+        run: npx --yes @vscode/vsce package
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" ./*.vsix --title "$GITHUB_REF_NAME" --generate-notes

@@ -4,6 +4,35 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.7.4 — 2026-10-31
+
+### Added
+
+- **Reliability Doctor:** `agy-switch doctor` and `agy-switch doctor --json`, plus
+  the **Antigravity: Run Account Switcher Doctor** command and menu item.
+- Detects main Antigravity surfaces (`desktop-wsl`, `ide-wsl`, `desktop-win`,
+  `ide-win`, `agent-hub`, `cli`), their PIDs and start times, and marks surfaces
+  whose main process started **before the last successful switch**.
+- Reports duplicate main surfaces, store conflicts, group/other-readable WSL
+  token/vault files, and includes the report in diagnostics.
+- GitHub Actions **CI** on Ubuntu and Windows, and a **Release** workflow that
+  packages the VSIX and publishes a GitHub release on `v*` tags.
+- Specification: [docs/SPEC-1.7.4.md](docs/SPEC-1.7.4.md).
+
+### Fixed
+
+- Doctor ignores Windows `--type=` helpers and WSL `bootstrap-fork`,
+  extension-host, file-watcher and pty processes, so it reports only real
+  surfaces.
+- Duplicate warnings are limited to the main surfaces; multiple agent hubs or CLI
+  sessions are not treated as duplicate instances.
+- Tests are Windows-compatible: chmod-dependent rollback and mode assertions are
+  skipped where Windows semantics differ.
+
+### Tests
+
+- 43 JavaScript tests and 46 Python tests at release.
+
 ## 1.7.3 — 2026-10-31
 
 ### Added
