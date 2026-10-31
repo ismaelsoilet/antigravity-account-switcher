@@ -1,7 +1,7 @@
 # Master Development Plan — Secure, TOS-Safe Account Switcher
 
 Status: active, 2026-10-31
-Current build: `1.8.4` (rich dashboard, status-bar quota, neutral track, localized dates)
+Current build: `1.8.5` (async non-blocking quota, rich dashboard, localized dates)
 Next code milestone: `1.9.0` (vault encryption, Open VSX, hardening)
 
 ## 1. Product principles

@@ -4,6 +4,25 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.5 — 2026-10-31
+
+### Fixed
+
+- **Dashboard no longer blocks the extension host on `/usage`.** Quota is
+  fetched asynchronously, deduplicated and bounded to 6 seconds. The webview
+  renders a loading state, then local/cached data immediately; live data fills
+  in when available.
+- **Status bar quota no longer blocks activation or focus.** It shows
+  local/cached values first, a spinner while loading, and updates when the
+  official call finishes.
+- Guarded webview visibility APIs, added immediate loading HTML and an error
+  fallback so the Activity Bar view cannot stay blank.
+
+### Tests
+
+- 59 JavaScript tests (including async quota and dashboard loading) and 60
+  Python tests passing; 1 opt-in real keyring test skipped by default.
+
 ## 1.8.4 — 2026-10-31
 
 ### Added

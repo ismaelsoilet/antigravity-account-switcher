@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 
 let DatabaseSync = null;
 try {
@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.8.4';
+const VERSION = '1.8.5';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;
@@ -3090,13 +3090,17 @@ function parseUsageOutput(output) {
     return { models, source: 'agy /usage' };
 }
 
-function runUsageCommand(options = {}) {
-    const candidates = [
+function getUsageCandidates(options = {}) {
+    return [
         options.cliPath,
         process.env.AGY_CLI_PATH,
         path.join(os.homedir(), '.gemini', 'bin', 'agy'),
         'agy'
     ].filter(Boolean);
+}
+
+function runUsageCommand(options = {}) {
+    const candidates = getUsageCandidates(options);
     for (const candidate of candidates) {
         if (candidate !== 'agy' && !fs.existsSync(candidate)) continue;
         try {
@@ -3112,7 +3116,76 @@ function runUsageCommand(options = {}) {
     return { models: [], source: 'agy /usage' };
 }
 
+let usageCommandPromise = null;
+
+function runUsageCommandAsync(options = {}) {
+    if (usageCommandPromise) return usageCommandPromise;
+    usageCommandPromise = new Promise(resolve => {
+        const candidates = getUsageCandidates(options);
+        const tryNext = index => {
+            if (index >= candidates.length) {
+                resolve({ models: [], source: 'agy /usage' });
+                return;
+            }
+            const candidate = candidates[index];
+            if (candidate !== 'agy' && !fs.existsSync(candidate)) {
+                tryNext(index + 1);
+                return;
+            }
+            execFile(candidate, ['--print', '/usage', '--output-format', 'json'], {
+                encoding: 'utf-8',
+                timeout: options.usageTimeout || 6000,
+                maxBuffer: 4 * 1024 * 1024,
+                windowsHide: true
+            }, (error, stdout) => {
+                if (error) {
+                    if (error.code === 'ENOENT') {
+                        tryNext(index + 1);
+                        return;
+                    }
+                    resolve({ models: [], source: 'agy /usage' });
+                    return;
+                }
+                if (stdout) {
+                    const parsed = parseUsageOutput(stdout);
+                    if (parsed.models.length > 0) {
+                        resolve(parsed);
+                        return;
+                    }
+                }
+                resolve({ models: [], source: 'agy /usage' });
+            });
+        };
+        tryNext(0);
+    });
+    usageCommandPromise.finally(() => {
+        usageCommandPromise = null;
+    });
+    return usageCommandPromise;
+}
+
 let quotaCache = { at: 0, value: null };
+
+function buildQuotaReport(files, logs, liveModels, wantsLive) {
+    const seen = new Set();
+    const models = [];
+    for (const model of [...liveModels, ...files.models, ...logs.models]) {
+        const key = String(model.label || '').toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        models.push(model);
+    }
+    return {
+        available: models.length > 0,
+        live: liveModels.length > 0,
+        source: liveModels.length > 0 ? 'agy /usage' : (files.source || logs.source || ''),
+        updatedAt: liveModels.length > 0 ? new Date().toISOString() : (files.updatedAt || logs.updatedAt || ''),
+        models,
+        rateLimited: Boolean(logs.rateLimited),
+        signals: logs.signals || [],
+        reason: models.length > 0 ? '' : (wantsLive ? 'usage-unavailable' : 'no-local-quota-cache')
+    };
+}
 
 function getQuotaReport(options = {}) {
     const wantsLive = Boolean(options.live || options.usageRunner || options.usageOutput);
@@ -3135,26 +3208,40 @@ function getQuotaReport(options = {}) {
         live = runUsageCommand(options);
     }
     const liveModels = live && Array.isArray(live.models) ? live.models : [];
-    const seen = new Set();
-    const models = [];
-    for (const model of [...liveModels, ...files.models, ...logs.models]) {
-        const key = String(model.label || '').toLowerCase();
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        models.push(model);
-    }
-    const report = {
-        available: models.length > 0,
-        live: liveModels.length > 0,
-        source: liveModels.length > 0 ? 'agy /usage' : (files.source || logs.source || ''),
-        updatedAt: liveModels.length > 0 ? new Date().toISOString() : (files.updatedAt || logs.updatedAt || ''),
-        models,
-        rateLimited: Boolean(logs.rateLimited),
-        signals: logs.signals || [],
-        reason: models.length > 0 ? '' : (wantsLive ? 'usage-unavailable' : 'no-local-quota-cache')
-    };
+    const report = buildQuotaReport(files, logs, liveModels, wantsLive);
     quotaCache = { at: Date.now(), value: report };
     return clone(report);
+}
+
+function getQuotaReportAsync(options = {}) {
+    const wantsLive = options.live !== false;
+    if (!wantsLive) {
+        return Promise.resolve(getQuotaReport({ ...options, live: false, refresh: false }));
+    }
+    if (
+        !options.refresh
+        && quotaCache.value
+        && quotaCache.value.live
+        && Date.now() - quotaCache.at < 60000
+    ) {
+        return Promise.resolve(clone(quotaCache.value));
+    }
+    const files = readQuotaFromFiles(options);
+    const logs = readQuotaFromLogs(options);
+    let livePromise;
+    if (options.usageOutput) {
+        livePromise = Promise.resolve(parseUsageOutput(options.usageOutput));
+    } else if (typeof options.usageRunnerAsync === 'function') {
+        livePromise = Promise.resolve(options.usageRunnerAsync(options));
+    } else {
+        livePromise = runUsageCommandAsync(options);
+    }
+    return livePromise.then(live => {
+        const liveModels = live && Array.isArray(live.models) ? live.models : [];
+        const report = buildQuotaReport(files, logs, liveModels, true);
+        quotaCache = { at: Date.now(), value: report };
+        return clone(report);
+    });
 }
 
 function getDoctorReport(options = {}) {
@@ -3400,7 +3487,9 @@ module.exports = {
     parseQuotaPayload,
     parseUsageOutput,
     runUsageCommand,
+    runUsageCommandAsync,
     getQuotaReport,
+    getQuotaReportAsync,
     getDoctorReport,
     acquireSwitchLock,
     snapshotActiveAccount,

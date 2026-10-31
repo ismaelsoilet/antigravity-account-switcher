@@ -1144,6 +1144,29 @@ test('parseUsageOutput understands the official /usage JSON', async () => {
     assert.ok(parsed.models[0].label.includes('Gemini Models'));
 });
 
+test('getQuotaReportAsync resolves a live usage payload without blocking', async () => {
+    const report = await tokenManager.getQuotaReportAsync({
+        live: true,
+        usageOutput: JSON.stringify({
+            command: {
+                data: {
+                    groups: [{
+                        name: 'Gemini Models',
+                        buckets: [{ name: 'Weekly Limit Remaining', remaining_fraction: 0.45, reset_time: '2027-11-03T12:00:00Z' }]
+                    }]
+                }
+            }
+        }),
+        quotaPaths: [],
+        logDirs: [],
+        refresh: true
+    });
+
+    assert.strictEqual(report.available, true);
+    assert.strictEqual(report.live, true);
+    assert.strictEqual(report.models[0].remainingPercent, 45);
+});
+
 test('getQuotaReport can use a live usage payload', async () => {
     const report = tokenManager.getQuotaReport({
         live: true,

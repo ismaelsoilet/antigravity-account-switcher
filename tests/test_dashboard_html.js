@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('assert');
-const { escapeHtml, renderDashboardHtml } = require('../dashboardHtml');
+const { escapeHtml, renderDashboardHtml, renderDashboardLoadingHtml } = require('../dashboardHtml');
 
 const snapshot = {
     version: '1.8.4',
@@ -77,4 +77,5 @@ assert.ok(empty.includes('Open Settings &gt; View Usage'));
 assert.ok(!empty.includes('data-action="switch"'));
 assert.strictEqual(escapeHtml('<b>"x"</b>'), '&lt;b&gt;&quot;x&quot;&lt;/b&gt;');
 
+assert.ok(renderDashboardLoadingHtml().includes('Loading accounts and quota'));
 console.log('Dashboard HTML tests passed');

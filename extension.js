@@ -6,7 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const tokenManager = require('./tokenManager');
-const { renderDashboardHtml, escapeHtml } = require('./dashboardHtml');
+const { renderDashboardHtml, renderDashboardLoadingHtml, escapeHtml } = require('./dashboardHtml');
 
 let statusBarItem;
 let quotaStatusBarItem;
@@ -934,67 +934,66 @@ class DashboardViewProvider {
         this.context = context;
         this.view = null;
         this.pendingForceQuota = false;
+        this.updateSeq = 0;
     }
 
     resolveWebviewView(view) {
         this.view = view;
-        view.webview.options = {
-            enableScripts: true,
-            localResourceRoots: []
-        };
-        view.webview.onDidReceiveMessage(async message => {
-            if (!message || typeof message.command !== 'string') return;
-            try {
-                if (message.command === 'switch') {
-                    await switchAccount(message.email, message.label);
-                } else if (message.command === 'save') {
-                    await saveOrRenameAccount('', '');
-                } else if (message.command === 'login') {
-                    await loginNewAccount();
-                } else if (message.command === 'doctor') {
-                    await showDoctor();
-                } else if (message.command === 'diagnostics') {
-                    await showDiagnostics();
-                } else if (message.command === 'openSettings') {
-                    await vscode.commands.executeCommand(
-                        'workbench.action.openSettings',
-                        'antigravityAccountSwitcher'
-                    );
-                } else if (message.command === 'refresh') {
-                    await this.update(true);
+        try {
+            view.webview.options = {
+                enableScripts: true,
+                localResourceRoots: []
+            };
+            view.webview.onDidReceiveMessage(async message => {
+                if (!message || typeof message.command !== 'string') return;
+                try {
+                    if (message.command === 'switch') {
+                        await switchAccount(message.email, message.label);
+                    } else if (message.command === 'save') {
+                        await saveOrRenameAccount('', '');
+                    } else if (message.command === 'login') {
+                        await loginNewAccount();
+                    } else if (message.command === 'doctor') {
+                        await showDoctor();
+                    } else if (message.command === 'diagnostics') {
+                        await showDiagnostics();
+                    } else if (message.command === 'openSettings') {
+                        await vscode.commands.executeCommand(
+                            'workbench.action.openSettings',
+                            'antigravityAccountSwitcher'
+                        );
+                    } else if (message.command === 'refresh') {
+                        await this.update(true);
+                    }
+                } catch (error) {
+                    logError(`Dashboard action ${message.command} failed`, error);
+                    vscode.window.showErrorMessage(`Dashboard action failed: ${error.message || error}`);
                 }
-            } catch (error) {
-                logError(`Dashboard action ${message.command} failed`, error);
-                vscode.window.showErrorMessage(`Dashboard action failed: ${error.message || error}`);
+            });
+            if (typeof view.onDidChangeVisibility === 'function') {
+                view.onDidChangeVisibility(() => {
+                    if (view.visible) void this.update(false);
+                });
             }
-        });
-        view.onDidChangeVisibility(() => {
-            if (view.visible) void this.update(false);
-        });
-        void this.update(this.pendingForceQuota);
+        } catch (error) {
+            logError('Dashboard view setup failed', error);
+        }
+        try {
+            view.webview.html = renderDashboardLoadingHtml();
+        } catch {}
+        const force = this.pendingForceQuota;
         this.pendingForceQuota = false;
+        void this.update(force);
     }
 
-    buildSnapshot(forceQuota) {
+    buildSnapshot(quotaOverride, loading = false) {
         const session = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
         const profiles = tokenManager.loadProfiles();
         const keyring = tokenManager.getKeyringReport();
-        let quota;
-        try {
-            quota = tokenManager.getQuotaReport({
-                live: true,
-                refresh: Boolean(forceQuota),
-                usageTimeout: 8000
-            });
-        } catch {
-            quota = {
-                available: false,
-                models: [],
-                signals: [],
-                rateLimited: false,
-                reason: 'usage-unavailable'
-            };
-        }
+        const localQuota = tokenManager.getQuotaReport({ live: false, refresh: false });
+        const quota = quotaOverride
+            ? { ...quotaOverride, loading: Boolean(loading) }
+            : { ...localQuota, loading: Boolean(loading) };
         const matched = getProfileEntry(profiles, session.email);
         const activeLabel = matched
             ? matched.label
@@ -1031,11 +1030,31 @@ class DashboardViewProvider {
             this.pendingForceQuota = this.pendingForceQuota || Boolean(forceQuota);
             return;
         }
+        this.updateSeq += 1;
+        const sequence = this.updateSeq;
         try {
-            const snapshot = this.buildSnapshot(forceQuota);
-            const nonce = crypto.randomBytes(16).toString('hex');
-            this.view.webview.html = renderDashboardHtml(snapshot, nonce);
-            void updateQuotaStatusBar();
+            const localQuota = tokenManager.getQuotaReport({ live: false, refresh: false });
+            const needsLive = Boolean(forceQuota) || !localQuota.live;
+            const localSnapshot = this.buildSnapshot(localQuota, needsLive);
+            this.view.webview.html = renderDashboardHtml(
+                localSnapshot,
+                crypto.randomBytes(16).toString('hex')
+            );
+            if (!needsLive) {
+                void updateQuotaStatusBar(false);
+                return;
+            }
+            const live = await tokenManager.getQuotaReportAsync({
+                live: true,
+                refresh: Boolean(forceQuota),
+                usageTimeout: 6000
+            });
+            if (sequence !== this.updateSeq || !this.view) return;
+            this.view.webview.html = renderDashboardHtml(
+                this.buildSnapshot(live, false),
+                crypto.randomBytes(16).toString('hex')
+            );
+            void updateQuotaStatusBar(false);
         } catch (error) {
             logError('Dashboard update failed', error);
             this.view.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:12px;color:var(--vscode-foreground)"><strong>Dashboard unavailable</strong><p>${escapeHtml(error.message || String(error))}</p></body></html>`;
@@ -1071,6 +1090,7 @@ async function showQuota() {
     try {
         await openDashboard();
         if (dashboardProvider) dashboardProvider.refresh(true);
+        void updateQuotaStatusBar(true);
     } catch (error) {
         logError('Quota lookup failed', error);
         vscode.window.showErrorMessage(`Quota lookup failed: ${error.message || error}`);
@@ -1086,43 +1106,60 @@ async function refreshDashboardCommand() {
     dashboardProvider.refresh(true);
 }
 
-async function updateQuotaStatusBar() {
+function applyQuotaStatusBar(quota) {
+    if (!quotaStatusBarItem) return;
+    if (!quota || !quota.available) {
+        quotaStatusBarItem.text = '$(pulse) Quota';
+        quotaStatusBarItem.tooltip = 'Quota is not available locally. Click to open the Antigravity Accounts dashboard.';
+        quotaStatusBarItem.show();
+        return;
+    }
+    const weekly = quota.models.find(model => /weekly/i.test(model.label));
+    const fiveHour = quota.models.find(model => /five hour|5-hour|5h/i.test(model.label));
+    const geminiWeekly = quota.models.find(model => /gemini/i.test(model.label) && /weekly/i.test(model.label)) || weekly;
+    const geminiFive = quota.models.find(model => /gemini/i.test(model.label) && /five hour|5-hour|5h/i.test(model.label)) || fiveHour;
+    const parts = [];
+    if (geminiWeekly) parts.push(`${Math.round(geminiWeekly.remainingPercent)}%`);
+    if (geminiFive) parts.push(`5h ${Math.round(geminiFive.remainingPercent)}%`);
+    quotaStatusBarItem.text = `${quota.rateLimited ? '$(warning)' : '$(pulse)'} ${parts.join(' · ') || 'Quota'}`;
+    const tooltip = new vscode.MarkdownString();
+    const locale = getLocalizationLocale();
+    tooltip.appendMarkdown('**Antigravity quota**\n\n');
+    for (const model of quota.models) {
+        const reset = model.resetAt
+            ? new Intl.DateTimeFormat(locale, { dateStyle: 'short' }).format(new Date(model.resetAt))
+            : '';
+        tooltip.appendMarkdown(
+            `- ${model.label}: ${model.remainingPercent}%`
+            + `${model.exhausted ? ' (exhausted)' : ''}`
+            + `${reset ? ` · reset ${reset}` : ''}\n`
+        );
+    }
+    if (quota.rateLimited) {
+        tooltip.appendMarkdown('\nA recent 429 / quota signal was found in local logs. This is informational only.\n');
+    }
+    tooltip.appendMarkdown('\nClick to open the dashboard.');
+    quotaStatusBarItem.tooltip = tooltip;
+    quotaStatusBarItem.show();
+}
+
+async function updateQuotaStatusBar(forceLive = false) {
     if (!quotaStatusBarItem) return;
     try {
-        const quota = tokenManager.getQuotaReport({ live: true, refresh: false, usageTimeout: 8000 });
-        if (!quota.available) {
-            quotaStatusBarItem.text = '$(pulse) Quota';
-            quotaStatusBarItem.tooltip = 'Quota is not available locally. Click to open the Antigravity Accounts dashboard.';
+        const local = tokenManager.getQuotaReport({ live: false, refresh: false });
+        applyQuotaStatusBar(local);
+        if (local.live && !forceLive) return;
+        if (!local.available) {
+            quotaStatusBarItem.text = '$(sync~spin) Quota';
+            quotaStatusBarItem.tooltip = 'Loading quota from the official /usage…';
             quotaStatusBarItem.show();
-            return;
         }
-        const weekly = quota.models.find(model => /weekly/i.test(model.label));
-        const fiveHour = quota.models.find(model => /five hour|5-hour|5h/i.test(model.label));
-        const geminiWeekly = quota.models.find(model => /gemini/i.test(model.label) && /weekly/i.test(model.label)) || weekly;
-        const geminiFive = quota.models.find(model => /gemini/i.test(model.label) && /five hour|5-hour|5h/i.test(model.label)) || fiveHour;
-        const parts = [];
-        if (geminiWeekly) parts.push(`${Math.round(geminiWeekly.remainingPercent)}%`);
-        if (geminiFive) parts.push(`5h ${Math.round(geminiFive.remainingPercent)}%`);
-        quotaStatusBarItem.text = `${quota.rateLimited ? '$(warning)' : '$(pulse)'} ${parts.join(' · ') || 'Quota'}`;
-        const tooltip = new vscode.MarkdownString();
-        const locale = getLocalizationLocale();
-        tooltip.appendMarkdown('**Antigravity quota**\n\n');
-        for (const model of quota.models) {
-            const reset = model.resetAt
-                ? new Intl.DateTimeFormat(locale, { dateStyle: 'short' }).format(new Date(model.resetAt))
-                : '';
-            tooltip.appendMarkdown(
-                `- ${model.label}: ${model.remainingPercent}%`
-                + `${model.exhausted ? ' (exhausted)' : ''}`
-                + `${reset ? ` · reset ${reset}` : ''}\n`
-            );
-        }
-        if (quota.rateLimited) {
-            tooltip.appendMarkdown('\nA recent 429 / quota signal was found in local logs. This is informational only.\n');
-        }
-        tooltip.appendMarkdown('\nClick to open the dashboard.');
-        quotaStatusBarItem.tooltip = tooltip;
-        quotaStatusBarItem.show();
+        const live = await tokenManager.getQuotaReportAsync({
+            live: true,
+            refresh: Boolean(forceLive),
+            usageTimeout: 6000
+        });
+        applyQuotaStatusBar(live);
     } catch (error) {
         logError('Could not update quota status bar', error);
     }

@@ -76,11 +76,14 @@ function renderQuota(snapshot) {
             <section class="card quota-card">
                 <div class="section-head">
                     <div><h2>Quota</h2><p class="muted">Read-only. Nothing switches automatically.</p></div>
-                    <button class="ghost" data-action="refresh" title="Refresh quota">Refresh</button>
+                    <div class="head-actions">
+                        ${quota.loading ? '<span class="badge muted">CHECKING…</span>' : ''}
+                        <button class="ghost" data-action="refresh" title="Refresh quota">Refresh</button>
+                    </div>
                 </div>
                 <div class="empty">
-                    <strong>No local quota data</strong>
-                    <span>Open the official panel in Settings to see remaining limits.</span>
+                    <strong>${quota.loading ? 'Checking the official /usage…' : 'No local quota data'}</strong>
+                    <span>${quota.loading ? 'You can keep using the dashboard while it loads.' : 'Open the official panel in Settings to see remaining limits.'}</span>
                     <button class="primary" data-action="openSettings">Open Settings &gt; View Usage</button>
                 </div>
             </section>`;
@@ -125,7 +128,7 @@ function renderQuota(snapshot) {
                     <p class="muted">${quota.live ? 'Live from the official /usage' : 'Cached local quota'}${quota.updatedAt ? ` · ${escapeHtml(formatUpdated(quota.updatedAt, snapshot.locale))}` : ''}</p>
                 </div>
                 <div class="head-actions">
-                    <span class="badge ${quota.live ? 'live' : 'muted'}">${quota.live ? 'LIVE' : 'CACHED'}</span>
+                    <span class="badge ${quota.live ? 'live' : 'muted'}">${quota.loading ? 'REFRESHING…' : (quota.live ? 'LIVE' : 'CACHED')}</span>
                     <button class="ghost" data-action="refresh" title="Refresh quota">Refresh</button>
                 </div>
             </div>
@@ -186,6 +189,20 @@ function renderProfiles(snapshot) {
                     <button class="primary" data-action="login">Sign in</button>
                 </div>`}
         </section>`;
+}
+
+function renderDashboardLoadingHtml() {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+</head>
+<body style="margin:0;padding:14px;font-family:var(--vscode-font-family,system-ui,sans-serif);color:var(--vscode-foreground);background:transparent;">
+    <strong>Antigravity Accounts</strong>
+    <p style="color:var(--vscode-descriptionForeground);font-size:11px;">Loading accounts and quota…</p>
+</body>
+</html>`;
 }
 
 function renderDashboardHtml(snapshot, nonce) {
@@ -355,5 +372,6 @@ function renderDashboardHtml(snapshot, nonce) {
 
 module.exports = {
     escapeHtml,
+    renderDashboardLoadingHtml,
     renderDashboardHtml
 };
