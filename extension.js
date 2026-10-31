@@ -9,6 +9,15 @@ let statusBarItem;
 let outputChannel;
 let lastKnownEmail = '';
 const promptedSessions = new Set();
+const lastPromptAt = new Map();
+const conflictLogKeys = new Set();
+let switchInProgress = false;
+let suppressWatcherUntil = 0;
+let activationTime = Date.now();
+let pollTimer = null;
+let pollIntervalMs = 5000;
+let lastStoreSignature = '';
+const PROMPT_COOLDOWN_MS = 30 * 60 * 1000;
 
 function log(message) {
     if (outputChannel) outputChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
@@ -23,14 +32,52 @@ function safeMarkdown(value) {
     return String(value === undefined || value === null ? '' : value).replace(/`/g, "'");
 }
 
+function storeLabel(store) {
+    if (!store) return 'unknown store';
+    if (store.category === 'database') {
+        return `Database (${store.home === 'win' ? 'Windows' : 'WSL'})`;
+    }
+    const surface = store.category === 'cliToken' ? 'CLI' : 'IDE/Desktop';
+    return `${surface} token (${store.home === 'win' ? 'Windows' : 'WSL'})`;
+}
+
+function describeSessionConflicts(session) {
+    const lines = [];
+    for (const conflict of session.conflicts || []) {
+        if (conflict.type === 'multiple-emails') {
+            lines.push(`Multiple identities: ${conflict.emails.join(', ')}`);
+        } else if (conflict.type === 'database-identity-mismatch') {
+            lines.push(`Database identity mismatch: ${conflict.emails.join(' vs ')} (${conflict.path})`);
+        } else if (conflict.type === 'target-mismatch') {
+            const divergent = (conflict.stores || [])
+                .map(store => `${storeLabel(store)}=${store.email}`)
+                .join(', ');
+            lines.push(`Expected ${conflict.targetEmail}; divergent stores: ${divergent}`);
+        }
+    }
+    return lines.join('\n') || 'No conflict details available.';
+}
+
 function getProfileEntry(profiles, email) {
     if (!email) return null;
-    const wanted = email.toLowerCase();
-    return Object.values(profiles).find(profile => profile.email && profile.email.toLowerCase() === wanted) || null;
+    const wanted = tokenManager.canonicalEmail(email);
+    return Object.values(profiles).find(
+        profile => profile.email && tokenManager.canonicalEmail(profile.email) === wanted
+    ) || null;
+}
+
+function getPreferredStore() {
+    try {
+        return vscode.workspace
+            .getConfiguration('antigravityAccountSwitcher')
+            .get('preferredStore', 'standaloneToken');
+    } catch {
+        return 'standaloneToken';
+    }
 }
 
 async function getActiveAccountInfo() {
-    const session = tokenManager.detectActiveSession();
+    const session = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
     const profiles = tokenManager.loadProfiles();
     const matched = getProfileEntry(profiles, session.email);
 
@@ -40,6 +87,10 @@ async function getActiveAccountInfo() {
         needsEmail: session.needsEmail,
         email: session.email || '',
         source: session.source || '',
+        mtimeMs: session.mtimeMs || 0,
+        targetEmail: session.targetEmail || '',
+        conflicts: session.conflicts || [],
+        stores: session.stores || [],
         label: matched ? matched.label : (session.email ? session.email.split('@')[0] : (session.hasToken ? 'Email not detected' : 'No Account')),
         isSaved: Boolean(matched),
         dbAvailable: tokenManager.isDbSupportAvailable(),
@@ -63,17 +114,30 @@ async function updateStatusBar() {
             `* **Database sync:** ${dbStatus}`
         ];
 
+        const hasConflict = info.conflicts.length > 0;
         if (info.isActive && info.email) {
             const displayLabel = info.label || info.email.split('@')[0];
-            statusBarItem.text = `$(account) [${displayLabel}] ${info.email}`;
+            statusBarItem.text = hasConflict
+                ? `$(warning) [${displayLabel}] ${info.email} +${info.conflicts.length}`
+                : `$(account) [${displayLabel}] ${info.email}`;
             tooltip.push(
                 `* **Active account:** \`${safeMarkdown(info.email)}\``,
                 `* **Profile label:** \`${safeMarkdown(displayLabel)}\``,
                 `* **Vault status:** ${info.isSaved ? 'Saved' : 'Not saved yet'}`,
-                `* **Token source:** \`${safeMarkdown(info.source)}\``,
-                '',
-                '*(Click to switch accounts, add a new one, or rename the profile)*'
+                `* **Token source:** \`${safeMarkdown(info.source)}\``
             );
+            if (info.targetEmail) {
+                tooltip.push(`* **Desired account:** \`${safeMarkdown(info.targetEmail)}\``);
+            }
+            if (hasConflict) {
+                tooltip.push('', '**Store conflict detected** (the switcher will not auto-switch):');
+                for (const line of describeSessionConflicts(info).split('\n')) {
+                    tooltip.push(`* ${safeMarkdown(line)}`);
+                }
+                tooltip.push('* Use the menu and choose **Reapply target profile** to write the desired account to every store.');
+                tooltip.push('* If the conflict returns, reload/restart the surface shown as divergent (it is still signed in as the other account).');
+            }
+            tooltip.push('', '*(Click to switch accounts, add a new one, or rename the profile)*');
         } else if (info.hasToken) {
             statusBarItem.text = '$(warning) [Account] Email not detected';
             tooltip.push(
@@ -118,20 +182,78 @@ async function showAccountSwitcherMenu() {
         const items = [];
         const savedList = Object.values(profiles)
             .sort((left, right) => String(left.label).localeCompare(String(right.label)));
+        const hasConflict = activeInfo.conflicts.length > 0;
+
+        if (hasConflict && activeInfo.targetEmail) {
+            const target = getProfileEntry(profiles, activeInfo.targetEmail);
+            if (target && target.complete !== false) {
+                items.push(
+                    { label: 'CONFLICT RESOLUTION', kind: vscode.QuickPickItemKind.Separator },
+                    {
+                        label: `$(debug-restart) Reapply [${target.label}] ${target.email}`,
+                        description: 'Write the desired account to every token file and database',
+                        detail: 'Use this after reloading/restarting the surface that is still on the other account',
+                        accountEmail: target.email,
+                        accountLabel: target.label,
+                        isActive: false,
+                        action: 'switch'
+                    }
+                );
+            }
+        }
+
+        if (hasConflict) {
+            const switchState = tokenManager.readSwitchState();
+            const lastAppliedAt = Date.parse(switchState.appliedAt || '') || 0;
+            const newestLogin = activeInfo.stores
+                .filter(store => store.kind === 'file' && store.email && (store.mtimeMs || 0) > lastAppliedAt)
+                .sort((left, right) => (right.mtimeMs || 0) - (left.mtimeMs || 0))[0];
+            if (newestLogin && tokenManager.canonicalEmail(newestLogin.email) !== tokenManager.canonicalEmail(activeInfo.targetEmail || activeInfo.email)) {
+                items.push({
+                    label: `$(sign-in) Use newest login: ${newestLogin.email}`,
+                    description: 'Switch every surface to the account just signed in',
+                    detail: 'Useful when the IDE or Desktop logged into a new account while the other stores still have the old one',
+                    action: 'login_switch',
+                    loginPath: newestLogin.path,
+                    loginCategory: newestLogin.category,
+                    loginEmail: newestLogin.email
+                });
+            }
+        }
 
         if (savedList.length > 0) {
             items.push({ label: 'GOOGLE ACCOUNTS (SAVED IN VAULT)', kind: vscode.QuickPickItemKind.Separator });
             for (const profile of savedList) {
-                const isActive = Boolean(activeInfo.email && profile.email.toLowerCase() === activeInfo.email.toLowerCase());
-                items.push({
-                    label: isActive ? `$(check) [${profile.label}] ${profile.email}` : `$(account) [${profile.label}] ${profile.email}`,
-                    description: isActive ? 'Active Now' : 'Click to Switch',
-                    detail: profile.saved_at
+                const matchesActive = Boolean(
+                    activeInfo.email
+                    && tokenManager.canonicalEmail(profile.email) === tokenManager.canonicalEmail(activeInfo.email)
+                );
+                const isActive = matchesActive && !hasConflict;
+                const incomplete = profile.complete === false;
+                const aliases = (profile.aliases || []).filter(
+                    alias => tokenManager.canonicalEmail(alias) !== tokenManager.canonicalEmail(profile.email)
+                );
+                const savedDetail = incomplete
+                    ? 'Saved without the database identity; sign in live and save it again before switching'
+                    : (profile.saved_at
                         ? `Saved on: ${profile.saved_at.slice(0, 19).replace('T', ' ')}`
-                        : 'Saved profile',
+                        : 'Saved profile');
+                items.push({
+                    label: isActive
+                        ? `$(check) [${profile.label}] ${profile.email}`
+                        : `${incomplete || (hasConflict && matchesActive) ? '$(warning)' : '$(account)'} [${profile.label}] ${profile.email}`,
+                    description: isActive
+                        ? 'Active Now'
+                        : (incomplete
+                            ? 'Incomplete — re-login & save'
+                            : (hasConflict && matchesActive ? 'Conflict — click to reapply' : 'Click to Switch')),
+                    detail: aliases.length > 0
+                        ? `${savedDetail} • aliases: ${aliases.join(', ')}`
+                        : savedDetail,
                     accountEmail: profile.email,
                     accountLabel: profile.label,
                     isActive,
+                    incomplete,
                     action: 'switch'
                 });
             }
@@ -213,6 +335,12 @@ async function showAccountSwitcherMenu() {
                 return;
             }
             await switchAccount(selected.accountEmail, selected.accountLabel);
+        } else if (selected.action === 'login_switch') {
+            await applyLoginCandidate({
+                path: selected.loginPath,
+                category: selected.loginCategory,
+                email: selected.loginEmail
+            });
         } else if (selected.action === 'save' || selected.action === 'rename') {
             await saveOrRenameAccount(activeInfo.email, activeInfo.label);
         } else if (selected.action === 'manual_save') {
@@ -243,6 +371,12 @@ async function switchAccount(email, label) {
         vscode.window.showErrorMessage(`Account '${email}' was not found in the saved vault.`);
         return;
     }
+    if (profile.complete === false) {
+        vscode.window.showErrorMessage(
+            `Profile "[${label}] ${profile.email}" is incomplete: it was saved without the Antigravity database identity. Sign in live and save it again before switching.`
+        );
+        return;
+    }
 
     const hasDbTokens = Object.keys(profile.db_tokens || {}).length > 0;
     const hasFileTokens = Boolean(profile.file_tokens && (
@@ -251,7 +385,8 @@ async function switchAccount(email, label) {
 
     const details = [
         'Antigravity IDE will reload to apply this account to the IDE, Antigravity Desktop and the CLI.',
-        'Please save all open files before continuing.'
+        'Please save all open files before continuing.',
+        'If another Antigravity surface is still signed into a different account, reload/restart it after this switch; otherwise it may write its account back.'
     ];
     if (!hasDbTokens) details.push('This profile has no database tokens; the IDE database will be left unchanged.');
     if (!hasFileTokens) details.push('This profile has no OAuth token files; local token files will be cleared and you may need to sign in again.');
@@ -263,20 +398,37 @@ async function switchAccount(email, label) {
         'Cancel'
     );
     if (confirmation !== 'Switch & Reload') return;
+    if (switchInProgress) {
+        vscode.window.showInformationMessage('Another account switch is already in progress.');
+        return;
+    }
 
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5000;
     try {
         const result = tokenManager.restoreProfile(profile);
-        log(`Switched to ${profile.email}. DB written: ${result.db.written.length}; files written: ${result.files.written.length}; files removed: ${result.files.removed.length}.`);
+        conflictLogKeys.clear();
+        log(`Switched to ${profile.email}. DB written: ${result.db.written.length}; files written: ${result.files.written.length}; files removed: ${result.files.removed.length}; verified: ${result.verification.ok}; complete: ${result.complete}.`);
         if (result.db.skipped) {
-            log('No Antigravity database was found; database state was left unchanged.');
-            vscode.window.showWarningMessage('Account files were switched, but no Antigravity database was found. The database state was left unchanged.');
+            const reason = result.db.reason || 'no Antigravity database was found';
+            log(`Database state was left unchanged: ${reason}.`);
+            vscode.window.showWarningMessage(`Account files were switched, but the database was not updated (${reason}).`);
         }
         await updateStatusBar();
         void vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (error) {
         logError(`Failed to switch to ${profile.email}`, error);
         vscode.window.showErrorMessage(`Failed to switch account: ${error.message || error}`);
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
     }
+}
+
+function hasBlockingConflicts(session) {
+    return (session.conflicts || []).some(
+        conflict => conflict.type === 'multiple-emails' || conflict.type === 'database-identity-mismatch'
+    );
 }
 
 async function saveOrRenameAccount(email, currentLabel) {
@@ -285,11 +437,24 @@ async function saveOrRenameAccount(email, currentLabel) {
         vscode.window.showErrorMessage('No active Antigravity session was detected. Sign in before saving a profile.');
         return;
     }
+    if (hasBlockingConflicts(session)) {
+        const choice = await vscode.window.showErrorMessage(
+            'Cannot save: the Antigravity stores disagree about the active account.',
+            {
+                modal: true,
+                detail: `${describeSessionConflicts(session)}\n\nReload/restart the divergent surface, or use the menu → Reapply target profile.`
+            },
+            'Show Diagnostics',
+            'Cancel'
+        );
+        if (choice === 'Show Diagnostics') await showDiagnostics();
+        return;
+    }
     if (!session.email) {
         await manualRegisterAccount();
         return;
     }
-    if (email && email.toLowerCase() !== session.email.toLowerCase()) {
+    if (email && tokenManager.canonicalEmail(email) !== tokenManager.canonicalEmail(session.email)) {
         vscode.window.showErrorMessage(`The active session belongs to ${session.email}, not ${email}.`);
         return;
     }
@@ -302,13 +467,23 @@ async function saveOrRenameAccount(email, currentLabel) {
     });
     if (!newLabel || !newLabel.trim()) return;
 
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5000;
     try {
-        tokenManager.snapshotActiveAccount(newLabel.trim(), session.email);
+        const entry = tokenManager.snapshotActiveAccount(newLabel.trim(), session.email);
+        conflictLogKeys.clear();
         await updateStatusBar();
-        vscode.window.showInformationMessage(`Account ${session.email} saved as "[${newLabel.trim()}]".`);
+        const suffix = entry.complete ? '' : ' (incomplete: no database identity captured — sign in live and save again)';
+        const merged = tokenManager.canonicalEmail(entry.email) !== tokenManager.canonicalEmail(session.email)
+            ? ` (merged into existing profile ${entry.email})`
+            : '';
+        vscode.window.showInformationMessage(`Account ${entry.email} saved as "[${entry.label}]".${suffix}${merged}`);
     } catch (error) {
         logError('Failed to save the active account', error);
         vscode.window.showErrorMessage(`Failed to save account: ${error.message || error}`);
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
     }
 }
 
@@ -316,6 +491,19 @@ async function manualRegisterAccount() {
     const session = tokenManager.detectActiveSession();
     if (!session.hasToken) {
         vscode.window.showErrorMessage('No active OAuth token was found. Sign in before registering an account.');
+        return;
+    }
+    if (hasBlockingConflicts(session)) {
+        const choice = await vscode.window.showErrorMessage(
+            'Cannot register: the Antigravity stores disagree about the active account.',
+            {
+                modal: true,
+                detail: `${describeSessionConflicts(session)}\n\nReload/restart the divergent surface, or use the menu → Reapply target profile.`
+            },
+            'Show Diagnostics',
+            'Cancel'
+        );
+        if (choice === 'Show Diagnostics') await showDiagnostics();
         return;
     }
 
@@ -338,13 +526,63 @@ async function manualRegisterAccount() {
     });
     const cleanLabel = labelInput && labelInput.trim() ? labelInput.trim() : cleanEmail.split('@')[0];
 
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5000;
     try {
-        tokenManager.snapshotActiveAccount(cleanLabel, cleanEmail);
+        const entry = tokenManager.snapshotActiveAccount(cleanLabel, cleanEmail);
+        conflictLogKeys.clear();
         await updateStatusBar();
-        vscode.window.showInformationMessage(`Account ${cleanEmail} registered as "[${cleanLabel}]".`);
+        const suffix = entry.complete ? '' : ' (incomplete: no database identity captured — sign in live and save again)';
+        const merged = tokenManager.canonicalEmail(entry.email) !== tokenManager.canonicalEmail(cleanEmail)
+            ? ` (merged into existing profile ${entry.email})`
+            : '';
+        vscode.window.showInformationMessage(`Account ${entry.email} registered as "[${entry.label}]".${suffix}${merged}`);
     } catch (error) {
         logError('Failed to register the account', error);
         vscode.window.showErrorMessage(`Failed to register account: ${error.message || error}`);
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
+    }
+}
+
+async function applyLoginCandidate(candidate, suggestedLabel) {
+    if (!candidate || !candidate.path) {
+        vscode.window.showErrorMessage('No fresh login token was found. Sign in again.');
+        return;
+    }
+    const confirmation = await vscode.window.showWarningMessage(
+        `Switch all Antigravity surfaces to ${candidate.email}?`,
+        {
+            modal: true,
+            detail: 'This writes the new account to the IDE, Desktop and CLI, replacing the current account in every token file and database. Save any unsaved work first.'
+        },
+        'Switch All & Reload',
+        'Cancel'
+    );
+    if (confirmation !== 'Switch All & Reload') return;
+
+    const label = await vscode.window.showInputBox({
+        prompt: `Friendly label for ${candidate.email}:`,
+        value: suggestedLabel || candidate.email.split('@')[0],
+        ignoreFocusOut: true
+    });
+    if (!label || !label.trim()) return;
+
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5000;
+    try {
+        const { entry } = tokenManager.switchToLoginSession(candidate, label.trim());
+        conflictLogKeys.clear();
+        await updateStatusBar();
+        vscode.window.showInformationMessage(`All surfaces switched to ${entry.email} as "[${entry.label}]".`);
+        void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch (error) {
+        logError('Failed to switch all surfaces to the new login', error);
+        vscode.window.showErrorMessage(`Login switch failed: ${error.message || error}`);
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
     }
 }
 
@@ -366,7 +604,18 @@ async function loginNewAccount() {
     );
     if (confirmation !== 'Open Browser & Sign In') return;
 
-    const before = tokenManager.detectActiveSession();
+    const loginStart = Date.now();
+    const before = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
+    const beforeFingerprints = new Set(before.stores.map(store => store.fingerprint).filter(Boolean));
+    const beforeEmails = new Set(
+        before.stores
+            .flatMap(store => (store.kind === 'database' ? (store.identityEmails || []) : [store.email]))
+            .filter(Boolean)
+            .map(tokenManager.canonicalEmail)
+    );
+
+    let candidate = null;
+    let candidateConflict = null;
     try {
         await vscode.window.withProgress(
             {
@@ -378,13 +627,31 @@ async function loginNewAccount() {
                 await vscode.commands.executeCommand('antigravity.internal.loginWithRedirect');
                 const deadline = Date.now() + 20000;
                 while (Date.now() < deadline) {
-                    const current = tokenManager.detectActiveSession();
-                    const changed = current.hasToken && (
-                        !before.hasToken ||
-                        current.email !== before.email ||
-                        current.source !== before.source
-                    );
-                    if (changed) return;
+                    const current = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
+                    const fresh = current.stores.filter(store => (
+                        store.kind === 'file'
+                        && store.usable
+                        && store.hasToken
+                        && store.email
+                        && (store.mtimeMs || 0) >= loginStart - 2000
+                        && (
+                            (store.fingerprint && !beforeFingerprints.has(store.fingerprint))
+                            || !beforeEmails.has(tokenManager.canonicalEmail(store.email))
+                        )
+                    ));
+                    const distinct = new Map();
+                    for (const store of fresh) {
+                        const key = tokenManager.canonicalEmail(store.email);
+                        if (!distinct.has(key)) distinct.set(key, store);
+                    }
+                    if (distinct.size > 1) {
+                        candidateConflict = [...distinct.values()];
+                        return;
+                    }
+                    if (distinct.size === 1) {
+                        candidate = [...distinct.values()][0];
+                        return;
+                    }
                     await tokenManager.delay(500);
                 }
             }
@@ -395,41 +662,17 @@ async function loginNewAccount() {
         return;
     }
 
-    const session = tokenManager.detectActiveSession();
-    if (!session.hasToken) {
-        vscode.window.showWarningMessage('Sign-in was not detected yet. Finish the flow in your browser and then use "Save Active Account".');
+    if (candidateConflict) {
+        const emails = candidateConflict.map(store => store.email).join(', ');
+        vscode.window.showErrorMessage(`Sign-in produced multiple fresh identities (${emails}). Close or switch the other Antigravity surfaces and try again.`);
         return;
     }
-    if (!session.email) {
-        await manualRegisterAccount();
+    if (!candidate) {
+        vscode.window.showWarningMessage('Sign-in was not detected with a fresh token. Finish the flow in your browser and then use "Save Active Account".');
         return;
     }
 
-    const choice = await vscode.window.showInformationMessage(
-        `Signed in as ${session.email}.`,
-        'Save Profile & Reload',
-        'Reload',
-        'Later'
-    );
-    if (choice === 'Save Profile & Reload') {
-        const label = await vscode.window.showInputBox({
-            prompt: `Friendly label for ${session.email}:`,
-            value: session.email.split('@')[0],
-            ignoreFocusOut: true
-        });
-        if (label && label.trim()) {
-            try {
-                tokenManager.snapshotActiveAccount(label.trim(), session.email);
-            } catch (error) {
-                logError('Failed to save the new profile', error);
-                vscode.window.showErrorMessage(`Signed in, but the profile could not be saved: ${error.message || error}`);
-                return;
-            }
-        }
-        void vscode.commands.executeCommand('workbench.action.reloadWindow');
-    } else if (choice === 'Reload') {
-        void vscode.commands.executeCommand('workbench.action.reloadWindow');
-    }
+    await applyLoginCandidate(candidate, candidate.email.split('@')[0]);
 }
 
 async function logoutAccount() {
@@ -441,8 +684,11 @@ async function logoutAccount() {
     );
     if (confirmation !== 'Log Out') return;
 
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5000;
     try {
         tokenManager.clearAllSessionTokens();
+        conflictLogKeys.clear();
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');
         } catch {}
@@ -451,6 +697,9 @@ async function logoutAccount() {
     } catch (error) {
         logError('Logout failed', error);
         vscode.window.showErrorMessage(`Log out failed: ${error.message || error}`);
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
     }
 }
 
@@ -463,18 +712,30 @@ async function clearAllData() {
     );
     if (confirmation !== 'Clear Everything') return;
 
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5000;
     try {
-        tokenManager.saveProfiles({});
+        const lock = tokenManager.acquireSwitchLock();
+        try {
+            tokenManager.saveProfiles({});
+        } finally {
+            lock.release();
+        }
         tokenManager.clearAllSessionTokens();
+        conflictLogKeys.clear();
         try {
             await vscode.commands.executeCommand('antigravity.internal.logout');
         } catch {}
         promptedSessions.clear();
+        lastPromptAt.clear();
         await updateStatusBar();
         void vscode.commands.executeCommand('workbench.action.reloadWindow');
     } catch (error) {
         logError('Failed to clear switcher data', error);
         vscode.window.showErrorMessage(`Clear failed: ${error.message || error}`);
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
     }
 }
 
@@ -499,6 +760,7 @@ async function deleteAccount(savedList) {
     );
     if (confirmation !== 'Delete') return;
 
+    const lock = tokenManager.acquireSwitchLock();
     try {
         const profiles = tokenManager.loadProfiles();
         const entry = getProfileEntry(profiles, selected.accountEmail);
@@ -510,6 +772,8 @@ async function deleteAccount(savedList) {
     } catch (error) {
         logError('Failed to remove the account', error);
         vscode.window.showErrorMessage(`Failed to remove account: ${error.message || error}`);
+    } finally {
+        lock.release();
     }
 }
 
@@ -528,16 +792,24 @@ async function showDiagnostics() {
 }
 
 async function checkAndPromptNewAccountOnStartup() {
+    if (switchInProgress || Date.now() < suppressWatcherUntil) return;
     try {
         const info = await getActiveAccountInfo();
 
         if (info.vaultWarnings.length > 0) {
             log(`Vault warnings: ${info.vaultWarnings.join(' | ')}`);
         }
+        if (info.conflicts.length > 0) {
+            log('Skipping the save prompt because the stores disagree about the active account.');
+            return;
+        }
 
         if (info.hasToken && info.needsEmail) {
             if (promptedSessions.has('needs-email')) return;
+            const last = lastPromptAt.get('needs-email') || 0;
+            if (Date.now() - last < PROMPT_COOLDOWN_MS) return;
             promptedSessions.add('needs-email');
+            lastPromptAt.set('needs-email', Date.now());
             const choice = await vscode.window.showWarningMessage(
                 'Antigravity Account Switcher: an OAuth session is active, but its email could not be detected.',
                 'Register Email',
@@ -548,9 +820,13 @@ async function checkAndPromptNewAccountOnStartup() {
         }
 
         if (!info.email || info.isSaved) return;
-        const key = info.email.toLowerCase();
+        const emailKey = info.email.toLowerCase();
+        const key = `${emailKey}:${info.source || ''}:${info.mtimeMs || 0}`;
         if (promptedSessions.has(key)) return;
+        const last = lastPromptAt.get(emailKey) || 0;
+        if (Date.now() - last < PROMPT_COOLDOWN_MS) return;
         promptedSessions.add(key);
+        lastPromptAt.set(emailKey, Date.now());
 
         const choice = await vscode.window.showInformationMessage(
             `Antigravity Account Switcher: active account detected (${info.email}). Save it to your vault?`,
@@ -565,6 +841,53 @@ async function checkAndPromptNewAccountOnStartup() {
     }
 }
 
+async function evaluateStoreChanges(reason) {
+    if (switchInProgress || Date.now() < suppressWatcherUntil) return;
+    try {
+        const state = tokenManager.readSwitchState();
+        const signature = tokenManager.getStoreMtimeSignature();
+        if (signature === lastStoreSignature) return;
+        lastStoreSignature = signature;
+
+        const diff = tokenManager.diffAgainstSwitchState(state);
+
+        if (diff.conflicts.length > 0) {
+            for (const conflict of diff.conflicts) {
+                const key = `${conflict.kind}:${conflict.path}:${conflict.email}`;
+                if (conflictLogKeys.has(key)) continue;
+                conflictLogKeys.add(key);
+                log(`External account conflict (${reason}): ${conflict.kind} ${conflict.path} contains ${conflict.email}, expected ${conflict.expectedEmail}.`);
+            }
+            await updateStatusBar();
+            return;
+        }
+
+        if (diff.missing.length > 0) {
+            for (const missing of diff.missing) {
+                const key = `missing:${missing.path}`;
+                if (conflictLogKeys.has(key)) continue;
+                conflictLogKeys.add(key);
+                log(`External store deletion (${reason}): ${missing.path}`);
+            }
+            await updateStatusBar();
+            return;
+        }
+
+        if (diff.refreshes.length > 0) {
+            log(`Same-account token refresh detected (${reason}); no action taken.`);
+        }
+
+        const info = await getActiveAccountInfo();
+        const previousEmail = lastKnownEmail;
+        await updateStatusBar();
+        if (info.email && info.email !== previousEmail && !info.isSaved && info.mtimeMs >= activationTime) {
+            await checkAndPromptNewAccountOnStartup();
+        }
+    } catch (error) {
+        logError('Token watcher failed', error);
+    }
+}
+
 function setupTokenFileWatchers(context) {
     const paths = tokenManager.getTokenFilePaths();
     const directories = new Set(tokenManager.getGeminiDirs());
@@ -573,34 +896,38 @@ function setupTokenFileWatchers(context) {
     }
 
     let timer = null;
+    const schedule = reason => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+            timer = null;
+            void evaluateStoreChanges(reason);
+        }, 750);
+    };
+
     for (const directory of directories) {
         try {
             if (!fs.existsSync(directory)) continue;
-            const watcher = fs.watch(directory, () => {
-                if (timer) clearTimeout(timer);
-                timer = setTimeout(() => {
-                    timer = null;
-                    void (async () => {
-                        try {
-                            const session = tokenManager.detectActiveSession();
-                            const email = session.email ? session.email.toLowerCase() : '';
-                            const previousEmail = lastKnownEmail;
-                            await updateStatusBar();
-                            if (email && email !== previousEmail) {
-                                log(`Detected a new session: ${session.email}`);
-                                await checkAndPromptNewAccountOnStartup();
-                            }
-                        } catch (error) {
-                            logError('Token watcher failed', error);
-                        }
-                    })();
-                }, 750);
-            });
+            const watcher = fs.watch(directory, () => schedule('fs-watch'));
             context.subscriptions.push({ dispose: () => { try { watcher.close(); } catch {} } });
         } catch (error) {
             logError(`Could not watch ${directory}`, error);
         }
     }
+
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => schedule('poll'), pollIntervalMs);
+    context.subscriptions.push({
+        dispose: () => {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            if (timer) {
+                clearTimeout(timer);
+                timer = null;
+            }
+        }
+    });
 }
 
 function activate(context) {
@@ -619,6 +946,21 @@ function activate(context) {
         vscode.commands.registerCommand('antigravity-account-switcher.diagnostics', showDiagnostics)
     );
 
+    activationTime = Date.now();
+    try {
+        const configuredPoll = Number(
+            vscode.workspace.getConfiguration('antigravityAccountSwitcher').get('pollIntervalMs', 5000)
+        );
+        pollIntervalMs = Number.isFinite(configuredPoll) && configuredPoll >= 1000 ? configuredPoll : 5000;
+    } catch {
+        pollIntervalMs = 5000;
+    }
+
+    const initialized = tokenManager.initialize();
+    log(`Activated v${tokenManager.VERSION} (host: ${vscode.env.remoteName || 'local'}, poll: ${pollIntervalMs}ms).`);
+    log(`Homes: ${initialized.homes.join(', ') || '(none)'}`);
+    log(`Databases: ${initialized.dbPaths.join(', ') || '(none)'}`);
+
     void updateStatusBar();
     setupTokenFileWatchers(context);
 
@@ -626,7 +968,6 @@ function activate(context) {
         vscode.window.onDidChangeWindowState(state => {
             if (!state.focused) return;
             void updateStatusBar();
-            void checkAndPromptNewAccountOnStartup();
         })
     );
 

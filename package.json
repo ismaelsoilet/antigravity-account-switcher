@@ -2,7 +2,7 @@
   "name": "antigravity-account-switcher",
   "displayName": "Antigravity Account Switcher",
   "description": "Visual multi-account switcher and profile manager embedded directly in Antigravity IDE, synchronized across Antigravity 2.0 Desktop and the CLI.",
-  "version": "1.7.1",
+  "version": "1.7.3",
   "license": "MIT",
   "extensionKind": [
     "workspace",
@@ -39,6 +39,30 @@
     "package": "npx @vscode/vsce package"
   },
   "contributes": {
+    "configuration": {
+      "title": "Antigravity Account Switcher",
+      "properties": {
+        "antigravityAccountSwitcher.preferredStore": {
+          "type": "string",
+          "enum": [
+            "standaloneToken",
+            "cliToken"
+          ],
+          "enumDescriptions": [
+            "Prefer the Antigravity IDE/Desktop standalone token when stores disagree.",
+            "Prefer the Antigravity CLI token when stores disagree."
+          ],
+          "default": "standaloneToken",
+          "description": "Which token store wins when more than one account is present. Conflicts are always reported instead of switching automatically."
+        },
+        "antigravityAccountSwitcher.pollIntervalMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1000,
+          "description": "How often to poll token files for changes. Polling is required because file watch events are unreliable on /mnt/c (WSL)."
+        }
+      }
+    },
     "commands": [
       {
         "command": "antigravity-account-switcher.switch",
