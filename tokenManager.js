@@ -33,7 +33,7 @@ const FILE_KEY_ALIASES = {
 };
 const EMAIL_REGEX = /^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$/;
 const FILE_MODE = 0o600;
-const VERSION = '1.8.6';
+const VERSION = '1.8.7';
 const SWITCH_STATE_FILE = 'antigravity_switch_state.json';
 const SWITCH_LOCK_FILE = '.antigravity-switch.lock';
 const SWITCH_LOCK_STALE_MS = 15000;
@@ -1081,6 +1081,46 @@ function normalizeProfilesMap(profiles) {
     return output;
 }
 
+function assessProfileCompleteness(entry, options = {}) {
+    const policy = options.policy || getKeyringPolicy();
+    const fileTokens = normalizeFileTokens(entry && entry.file_tokens);
+    const tokenOk = Boolean(fileTokens.standaloneToken || fileTokens.cliToken || fileTokens.oauthCreds);
+    const dbTokensByPath = normalizeDbTokensByPath(entry && entry.db_tokens_by_path);
+    const mergedDbTokens = normalizeDbTokens(entry && entry.db_tokens);
+    const claimedDbPaths = Object.keys(dbTokensByPath);
+    const dbClaimed = claimedDbPaths.length > 0 || Object.keys(mergedDbTokens).length > 0;
+    const dbPresent = getDbPaths().length;
+    const dbOk = dbPresent === 0 || dbClaimed || Boolean(policy.wsl);
+    const keyringOk = !policy.required || Boolean(entry && entry.keyring);
+    const complete = tokenOk && dbOk && keyringOk;
+    const reasons = [];
+    if (!tokenOk) reasons.push('no-file-tokens');
+    if (!dbOk) reasons.push('no-db-identity');
+    if (!keyringOk) reasons.push('keyring-required-missing');
+    return {
+        complete,
+        tokenOk,
+        dbOk,
+        keyringOk,
+        keyringRequired: Boolean(policy.required),
+        dbPresent,
+        dbClaimed,
+        claimedDbPaths,
+        policy: policy.policy,
+        reasons
+    };
+}
+
+function repairProfilesCompleteness(profiles) {
+    const policy = getKeyringPolicy();
+    for (const entry of Object.values(profiles)) {
+        const completeness = assessProfileCompleteness(entry, { policy });
+        if (entry.complete !== true && completeness.complete) entry.complete = true;
+        entry.completeness = completeness;
+    }
+    return profiles;
+}
+
 function loadProfiles() {
     lastLoadWarnings = [];
     for (const profilePath of getProfilesFilePaths()) {
@@ -1105,7 +1145,7 @@ function loadProfiles() {
             continue;
         }
 
-        return normalizeProfilesMap(raw);
+        return repairProfilesCompleteness(normalizeProfilesMap(raw));
     }
     return {};
 }
@@ -1147,7 +1187,7 @@ function writeFileAtomic(filePath, content, mode = FILE_MODE) {
     }
 }
 
-function backupExistingVault(filePath) {
+function backupExistingVault(filePath, options = {}) {
     let content;
     try {
         if (!fs.existsSync(filePath)) return;
@@ -1160,6 +1200,11 @@ function backupExistingVault(filePath) {
     const backupPath = valid
         ? `${filePath}.bak`
         : `${filePath}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    if (options.preserveExistingBackup && fs.existsSync(backupPath)) {
+        try {
+            if (fs.statSync(backupPath).size > 2) return;
+        } catch {}
+    }
     writeFileAtomic(backupPath, content, FILE_MODE);
 }
 
@@ -1176,7 +1221,9 @@ function saveProfiles(profiles) {
     for (const target of targets) {
         try {
             fs.mkdirSync(path.dirname(target), { recursive: true });
-            backupExistingVault(target);
+            backupExistingVault(target, {
+                preserveExistingBackup: Object.keys(normalized).length === 0
+            });
             writeFileAtomic(target, data, FILE_MODE);
             written.push(target);
         } catch (error) {
@@ -1569,25 +1616,70 @@ function verifyRestore(entry, options = {}) {
         }
     }
 
+    const byPath = normalizeDbTokensByPath(entry.db_tokens_by_path);
+    const merged = normalizeDbTokens(entry.db_tokens);
+    const claimedDbPaths = new Set(Object.keys(byPath));
+    if (claimedDbPaths.size === 0 && Object.keys(merged).length > 0) {
+        for (const dbPath of getDbPaths()) claimedDbPaths.add(dbPath);
+    }
+
     const dbs = readDbStores().map(store => {
         const identityEmails = store.identityEmails || [];
+        const claimed = claimedDbPaths.has(store.path);
+        const hasAuthStatus = Boolean(store.tokens && store.tokens.antigravityAuthStatus);
+        let matches;
+        let reason = '';
+        if (identityEmails.length > 1) {
+            matches = false;
+            reason = 'identity-conflict';
+        } else if (identityEmails.length === 0) {
+            matches = !claimed;
+            reason = claimed ? 'empty-identity' : '';
+        } else {
+            matches = canonicalEmail(identityEmails[0]) === wanted;
+            reason = matches ? '' : 'identity-mismatch';
+        }
+        if (claimed && !hasAuthStatus) {
+            matches = false;
+            if (!reason) reason = 'missing-auth-status';
+        }
         return {
             path: store.path,
             email: store.email,
             identityEmails,
+            claimed,
             hasOauthToken: Boolean(store.hasOauthToken),
-            matches: identityEmails.length === 0
-                || (identityEmails.length === 1 && canonicalEmail(identityEmails[0]) === wanted)
+            hasAuthStatus,
+            matches,
+            reason
         };
     });
 
-    const keyring = options.keyringAvailable
+    const keyringExpected = options.keyringExpected !== undefined
+        ? Boolean(options.keyringExpected)
+        : Boolean(options.keyring);
+    const keyring = keyringExpected
         ? verifyKeyringRecord(options.keyring || entry.keyring)
-        : { ok: true, matches: true, present: false, email: '', target: KEYRING_TARGET };
+        : {
+            ok: true,
+            matches: true,
+            present: false,
+            expected: false,
+            email: '',
+            target: KEYRING_TARGET
+        };
     const filesOk = files.every(file => !file.email || file.matches) && missingFiles.length === 0;
     const dbsOk = dbs.every(database => database.matches);
-    const keyringOk = !options.keyringAvailable || keyring.matches;
-    return { ok: filesOk && dbsOk && keyringOk, files, missingFiles, dbs, keyring };
+    const keyringOk = !keyringExpected || keyring.matches;
+    return {
+        ok: filesOk && dbsOk && keyringOk,
+        files,
+        missingFiles,
+        dbs,
+        keyring,
+        keyringExpected,
+        expectedDbPaths: [...claimedDbPaths]
+    };
 }
 
 function writeProfileDbTokens(entry, email) {
@@ -1709,17 +1801,28 @@ function snapshotActiveAccount(customLabel, manualEmail) {
         const matchingStores = dbStores.filter(store => (
             (store.identityEmails || []).some(candidate => canonicalEmail(candidate) === canonicalEmail(email))
         ));
-        if (dbStores.length > 0 && matchingStores.length === 0) {
+        const emptyIdentityStores = dbStores.filter(store => (
+            !store.identityConflict && (store.identityEmails || []).length === 0
+        ));
+        if (dbStores.length > 0 && matchingStores.length === 0 && emptyIdentityStores.length === 0) {
             lastLoadWarnings.push(
                 'No database matched the active email; the profile was saved without database identity. Sign in live and save it again.'
             );
         }
-        const selectedStores = matchingStores;
+        if (emptyIdentityStores.length > 0) {
+            lastLoadWarnings.push(
+                `The profile will write the active identity to ${emptyIdentityStores.length} empty database(s).`
+            );
+        }
+        const selectedStores = [...matchingStores];
+        for (const store of emptyIdentityStores) {
+            if (!selectedStores.includes(store)) selectedStores.push(store);
+        }
         const dbTokensByPath = {};
         for (const store of selectedStores) {
             const tokens = normalizeDbTokens(store.tokens);
             patchDbIdentity(tokens, email);
-            if (Object.keys(tokens).length > 0) dbTokensByPath[store.path] = tokens;
+            dbTokensByPath[store.path] = tokens;
         }
         const dbTokens = mergeDbTokensByPath(dbTokensByPath);
         const hasDbIdentity = Object.values(dbTokensByPath).some(
@@ -1736,11 +1839,9 @@ function snapshotActiveAccount(customLabel, manualEmail) {
             throw new Error('No OAuth token files were found for the active session.');
         }
         patchTokenEmail(fileTokens, email);
-        const hasFileTokens = Boolean(fileTokens.cliToken || fileTokens.standaloneToken || fileTokens.oauthCreds);
-        const keyringProvider = getKeyringProvider();
-        const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
+        const keyringPolicy = getKeyringPolicy();
         let keyring = null;
-        if (keyringAvailable) {
+        if (keyringPolicy.providerAvailable) {
             keyring = getKeyringCredential({ refresh: true, email });
             if (keyring && canonicalEmail(keyring.email) !== canonicalEmail(email)) {
                 throw new Error(
@@ -1748,15 +1849,21 @@ function snapshotActiveAccount(customLabel, manualEmail) {
                     + 'Sign in again or resolve the keyring conflict before saving a profile.'
                 );
             }
-            if (!keyring) {
+            if (!keyring && keyringPolicy.required) {
                 lastLoadWarnings.push(
-                    'Profile saved without the Windows keyring; sign in again and save it before switching.'
+                    'Profile saved without the required Windows keyring; capture one before switching Windows surfaces.'
                 );
             }
         }
-        const complete = hasFileTokens
-            && (dbStores.length === 0 || hasDbIdentity)
-            && (!keyringAvailable || Boolean(keyring));
+        const completeness = assessProfileCompleteness(
+            {
+                file_tokens: fileTokens,
+                db_tokens_by_path: dbTokensByPath,
+                keyring
+            },
+            { policy: keyringPolicy }
+        );
+        const complete = completeness.complete;
         const fingerprints = {};
         for (const category of FILE_CATEGORIES) {
             if (!fileTokens[category]) continue;
@@ -1793,6 +1900,7 @@ function snapshotActiveAccount(customLabel, manualEmail) {
             label: makeUniqueLabel(profiles, email, rawLabel),
             saved_at: new Date().toISOString(),
             complete,
+            completeness,
             aliases,
             account_id: previous.account_id || accountId,
             fingerprints: { ...(previous.fingerprints || {}), ...fingerprints },
@@ -1855,16 +1963,12 @@ function buildLoginProfile(candidate, label) {
     for (const store of readDbStores()) {
         const tokens = normalizeDbTokens(store.tokens);
         patchDbIdentity(tokens, email);
-        if (Object.keys(tokens).length > 0) dbTokensByPath[store.path] = tokens;
+        dbTokensByPath[store.path] = tokens;
     }
     const dbTokens = mergeDbTokensByPath(dbTokensByPath);
-    const hasDbIdentity = Object.values(dbTokensByPath).some(
-        tokens => Boolean(tokens['antigravityAuthStatus'] || tokens['google.google-antigravity'])
-    );
-    const keyringProvider = getKeyringProvider();
-    const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
+    const keyringPolicy = getKeyringPolicy();
     let keyring = null;
-    if (keyringAvailable) {
+    if (keyringPolicy.providerAvailable) {
         keyring = getKeyringCredential({ refresh: true, email });
         if (keyring && canonicalEmail(keyring.email) !== canonicalEmail(email)) {
             throw new Error(
@@ -1872,14 +1976,21 @@ function buildLoginProfile(candidate, label) {
                 + 'Sign in again before adopting this login.'
             );
         }
-        if (!keyring) {
+        if (!keyring && keyringPolicy.required) {
             lastLoadWarnings.push(
-                'The fresh login has no Windows keyring yet; sign in again before switching.'
+                'The fresh login has no required Windows keyring; Windows surfaces may need one live sign-in.'
             );
         }
     }
-    const complete = (getDbPaths().length === 0 || hasDbIdentity)
-        && (!keyringAvailable || Boolean(keyring));
+    const completeness = assessProfileCompleteness(
+        {
+            file_tokens: fileTokens,
+            db_tokens_by_path: dbTokensByPath,
+            keyring
+        },
+        { policy: keyringPolicy }
+    );
+    const complete = completeness.complete;
 
     const fingerprints = {};
     for (const key of FILE_CATEGORIES) {
@@ -1902,6 +2013,7 @@ function buildLoginProfile(candidate, label) {
         label: makeUniqueLabel(profiles, email, rawLabel),
         saved_at: new Date().toISOString(),
         complete,
+        completeness,
         aliases: [],
         account_id: accountId,
         fingerprints,
@@ -1955,9 +2067,10 @@ function refreshProfileMetadata(entry, verification) {
         if (Object.keys(tokens).length > 0) dbTokensByPath[store.path] = tokens;
     }
     const dbTokens = mergeDbTokensByPath(dbTokensByPath);
-    const keyringProvider = getKeyringProvider();
-    const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
-    const keyring = keyringAvailable ? getKeyringCredential({ refresh: true, email }) : null;
+    const keyringPolicy = getKeyringPolicy();
+    const keyring = keyringPolicy.providerAvailable
+        ? getKeyringCredential({ refresh: true, email })
+        : null;
     if (keyring && canonicalEmail(keyring.email) !== wanted) {
         lastLoadWarnings.push(`The Windows keyring belongs to ${keyring.email}; the profile was not refreshed with it.`);
     }
@@ -1975,14 +2088,22 @@ function refreshProfileMetadata(entry, verification) {
         || fingerprints.oauthCreds
         || fingerprints.keyring
         || canonicalEmail(email);
-    const complete = (getDbPaths().length === 0 || Object.keys(dbTokensByPath).length > 0)
-        && (!keyringAvailable || Boolean(keyring && canonicalEmail(keyring.email) === wanted));
+    const completeness = assessProfileCompleteness(
+        {
+            file_tokens: fileTokens,
+            db_tokens_by_path: dbTokensByPath,
+            keyring: keyring && canonicalEmail(keyring.email) === wanted ? keyring : (existing.keyring || null)
+        },
+        { policy: keyringPolicy }
+    );
+    const complete = Boolean(existing.complete) || completeness.complete;
 
     const refreshed = {
         ...existing,
         schema: PROFILE_SCHEMA_VERSION,
         email: existing.email,
         complete,
+        completeness,
         fingerprints: { ...(existing.fingerprints || {}), ...fingerprints },
         account_id: existing.account_id || accountId,
         db_tokens: dbTokens,
@@ -2007,31 +2128,48 @@ function restoreProfile(profile) {
     }
 
     const keyringProvider = getKeyringProvider();
-    const keyringAvailable = Boolean(keyringProvider && keyringProvider.available);
-    const keyring = keyringAvailable ? normalizeKeyringRecord(entry.keyring, entry.email) : null;
-    if (keyringAvailable && !keyring) {
-        throw new Error(
-            `Profile incomplete: sign in to ${entry.email}, then run agy-switch save to capture the Windows keyring.`
+    const keyringPolicy = getKeyringPolicy();
+    const keyringPlan = planKeyringRestore(entry, keyringPolicy);
+    let keyring = null;
+    let keyringStatus = keyringPlan.action;
+    if (keyringPlan.action === 'write') {
+        keyring = normalizeKeyringRecord(entry.keyring, entry.email);
+        if (!keyring) {
+            keyringStatus = 'invalid';
+            lastLoadWarnings.push(
+                `Profile ${entry.email} carries an invalid keyring; it was not written.`
+            );
+        }
+    } else if (keyringPlan.action === 'missing') {
+        lastLoadWarnings.push(
+            `Profile ${entry.email} has no captured keyring; Windows surfaces may need one live sign-in.`
+        );
+    } else if (keyringPlan.action === 'unavailable') {
+        lastLoadWarnings.push(
+            `Profile ${entry.email} carries a keyring, but the keyring provider is unavailable; it was not written.`
         );
     }
 
     const lock = acquireSwitchLock();
     let captured = null;
     try {
-        captured = captureCurrentState({ includeKeyring: keyringAvailable });
+        captured = captureCurrentState({ includeKeyring: true });
         const fileResult = writeTokensToFiles(entry.file_tokens, entry.email);
         const dbResult = writeProfileDbTokens(entry, entry.email);
-        if (keyringAvailable) keyringProvider.write(keyring);
-        const verification = verifyRestore(entry, { keyring, keyringAvailable });
+        if (keyring) keyringProvider.write(keyring);
+        const verification = verifyRestore(entry, {
+            keyring,
+            keyringExpected: Boolean(keyring)
+        });
 
         if (!verification.ok) {
             const diverged = [
                 ...verification.files.filter(file => file.email && !file.matches)
                     .map(file => `${file.path}=${file.email}`),
                 ...verification.dbs.filter(database => !database.matches)
-                    .map(database => `${database.path}=${(database.identityEmails || []).join(' vs ')}`),
+                    .map(database => `${database.path}=${(database.identityEmails || []).join(' vs ')} (${database.reason || 'mismatch'})`),
                 ...verification.missingFiles.map(file => `${file.path}=missing`),
-                ...(keyringAvailable && verification.keyring && !verification.keyring.matches
+                ...(verification.keyringExpected && verification.keyring && !verification.keyring.matches
                     ? [`keyring=${verification.keyring.email || 'missing'} expected ${entry.email}`]
                     : [])
             ];
@@ -2040,13 +2178,21 @@ function restoreProfile(profile) {
 
         writeSwitchState(buildSwitchState(entry, verification));
         const refreshedProfile = refreshProfileMetadata(entry, verification);
+        const completeness = assessProfileCompleteness(
+            { ...entry, keyring },
+            { policy: keyringPolicy }
+        );
         return {
             email: entry.email,
             db: dbResult,
             files: fileResult,
-            keyring: keyringAvailable ? redactedKeyringRecord(keyring) : null,
+            keyring: keyring ? redactedKeyringRecord(keyring) : null,
+            keyringStatus,
+            keyringPolicy: keyringPolicy.policy,
+            keyringRequired: Boolean(keyringPolicy.required),
             verification,
-            complete: Boolean(entry.complete),
+            completeness,
+            complete: Boolean(entry.complete) || completeness.complete,
             profile: refreshedProfile
         };
     } catch (error) {
@@ -2130,10 +2276,13 @@ function clearAllSessionTokensUnlocked() {
 
     const keyringProvider = getKeyringProvider();
     if (keyringProvider && keyringProvider.available) {
-        try {
-            keyringProvider.delete(KEYRING_TARGET);
-        } catch (error) {
-            failed.push(`keyring: ${error.message}`);
+        const credential = getKeyringCredential({ refresh: false });
+        if (credential) {
+            try {
+                keyringProvider.delete(KEYRING_TARGET);
+            } catch (error) {
+                failed.push(`keyring: ${error.message}`);
+            }
         }
     }
 
@@ -2710,6 +2859,78 @@ function setKeyringProviderForTests(provider) {
     keyringCache = { at: 0, value: null };
 }
 
+let keyringPolicyOverride = null;
+
+function setKeyringPolicyForTests(policy) {
+    keyringPolicyOverride = policy ? { ...policy } : null;
+    keyringCache = { at: 0, value: null };
+}
+
+function getKeyringPolicy() {
+    if (keyringPolicyOverride) return { ...keyringPolicyOverride };
+    const provider = getKeyringProvider();
+    const providerAvailable = Boolean(provider && provider.available);
+    const wsl = isWslEnvironment();
+    if (!providerAvailable) {
+        return {
+            providerAvailable: false,
+            policy: 'unsupported',
+            required: false,
+            reason: 'unsupported-platform',
+            wsl
+        };
+    }
+    if (wsl) {
+        return {
+            providerAvailable: true,
+            policy: 'optional',
+            required: false,
+            reason: 'wsl-file-storage',
+            wsl: true
+        };
+    }
+    return {
+        providerAvailable: true,
+        policy: 'managed',
+        required: true,
+        reason: 'windows-credential-manager',
+        wsl: false
+    };
+}
+
+function planKeyringRestore(entry, policy = getKeyringPolicy()) {
+    if (!entry || !entry.keyring) {
+        return {
+            action: policy.required ? 'missing' : 'skip',
+            required: Boolean(policy.required),
+            reason: policy.required ? 'keyring-required-missing' : 'keyring-optional'
+        };
+    }
+    if (!policy.providerAvailable) {
+        return {
+            action: 'unavailable',
+            required: Boolean(policy.required),
+            reason: 'provider-unavailable'
+        };
+    }
+    return {
+        action: 'write',
+        required: Boolean(policy.required),
+        reason: 'profile-keyring'
+    };
+}
+
+function getKeyringStatus(options = {}) {
+    const policy = getKeyringPolicy();
+    const record = policy.providerAvailable
+        ? getKeyringCredential({ refresh: Boolean(options.refresh) })
+        : null;
+    return {
+        ...policy,
+        credentialPresent: Boolean(record)
+    };
+}
+
 function normalizeKeyringRecord(raw, fallbackEmail) {
     if (!raw) return null;
     const source = typeof raw === 'string' ? { raw } : raw;
@@ -2800,9 +3021,14 @@ let keyringCache = { at: 0, value: null };
 
 function getKeyringReport(options = {}) {
     const provider = getKeyringProvider();
+    const policy = getKeyringPolicy();
     if (!provider || !provider.available) {
         return {
             available: false,
+            providerAvailable: false,
+            credentialPresent: false,
+            policy: policy.policy,
+            required: Boolean(policy.required),
             provider: provider && provider.id ? provider.id : 'none',
             target: KEYRING_TARGET,
             managed: false,
@@ -2814,9 +3040,20 @@ function getKeyringReport(options = {}) {
     }
     const record = getKeyringCredential({ refresh: true, target: options.target || KEYRING_TARGET });
     const report = record
-        ? redactedKeyringRecord(record)
+        ? {
+            ...redactedKeyringRecord(record),
+            available: true,
+            providerAvailable: true,
+            credentialPresent: true,
+            policy: policy.policy,
+            required: Boolean(policy.required)
+        }
         : {
             available: false,
+            providerAvailable: true,
+            credentialPresent: false,
+            policy: policy.policy,
+            required: Boolean(policy.required),
             provider: provider.id || 'windows-credential-manager',
             target: options.target || KEYRING_TARGET,
             managed: true,
@@ -3273,7 +3510,7 @@ function getDoctorReport(options = {}) {
         });
     }
 
-    if (keyring && keyring.managed) {
+    if (keyring && keyring.required) {
         const profiles = loadProfiles();
         const missingKeyring = Object.values(profiles)
             .filter(profile => profile.complete && !profile.keyring)
@@ -3282,7 +3519,7 @@ function getDoctorReport(options = {}) {
             warnings.push({
                 code: 'keyring-profile-missing',
                 severity: 'warning',
-                message: `Profiles without a captured keyring: ${missingKeyring.join(', ')}. Sign in to each account and run agy-switch save before switching.`
+                message: `Profiles without a required keyring: ${missingKeyring.join(', ')}. Sign in to each account and run agy-switch save before switching Windows surfaces.`
             });
         }
     }
@@ -3397,22 +3634,28 @@ function getDiagnostics() {
         switchState: state,
         storeDiff: diffAgainstSwitchState(state),
         keyring,
+        keyringPolicy: getKeyringPolicy(),
         quota: getQuotaReport(),
         doctor: getDoctorReport(),
         savedProfiles: Object.keys(profiles),
-        profileCompleteness: Object.fromEntries(Object.entries(profiles).map(([email, profile]) => [
-            email,
-            {
-                complete: Boolean(profile.complete) && (!keyring.managed || Boolean(profile.keyring)),
-                saved_at: profile.saved_at || '',
-                aliases: profile.aliases || [],
-                account_id: profile.account_id || '',
-                fingerprints: Object.keys(profile.fingerprints || {}),
-                dbPaths: Object.keys(profile.db_tokens_by_path || {}),
-                keyring: Boolean(profile.keyring),
-                keyringFingerprint: profile.fingerprints && profile.fingerprints.keyring ? profile.fingerprints.keyring : ''
-            }
-        ])),
+        profileCompleteness: Object.fromEntries(Object.entries(profiles).map(([email, profile]) => {
+            const assessment = profile.completeness
+                || assessProfileCompleteness(profile, { policy: getKeyringPolicy() });
+            return [
+                email,
+                {
+                    complete: Boolean(profile.complete) || assessment.complete,
+                    ...assessment,
+                    saved_at: profile.saved_at || '',
+                    aliases: profile.aliases || [],
+                    account_id: profile.account_id || '',
+                    fingerprints: Object.keys(profile.fingerprints || {}),
+                    dbPaths: Object.keys(profile.db_tokens_by_path || {}),
+                    keyring: Boolean(profile.keyring),
+                    keyringFingerprint: profile.fingerprints && profile.fingerprints.keyring ? profile.fingerprints.keyring : ''
+                }
+            ];
+        })),
         vaultWarnings: warnings
     };
 }
@@ -3477,7 +3720,13 @@ module.exports = {
     writeWindowsKeyringCredential,
     deleteWindowsKeyringCredential,
     getKeyringProvider,
+    getKeyringPolicy,
+    getKeyringStatus,
+    planKeyringRestore,
     setKeyringProviderForTests,
+    setKeyringPolicyForTests,
+    assessProfileCompleteness,
+    repairProfilesCompleteness,
     normalizeKeyringRecord,
     redactedKeyringRecord,
     getKeyringCredential,

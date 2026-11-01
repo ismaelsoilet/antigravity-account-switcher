@@ -4,7 +4,7 @@ const assert = require('assert');
 const { escapeHtml, renderDashboardHtml, renderDashboardLoadingHtml } = require('../dashboardHtml');
 
 const snapshot = {
-    version: '1.8.6',
+    version: '1.8.7',
     locale: 'pt-BR',
     active: {
         email: 'user@example.com',
@@ -66,7 +66,7 @@ const usHtml = renderDashboardHtml({
 assert.ok(usHtml.includes('11/03/2027'));
 
 const empty = renderDashboardHtml({
-    version: '1.8.6',
+    version: '1.8.7',
     locale: 'pt-BR',
     active: {},
     keyring: { available: false, managed: false },
@@ -78,6 +78,30 @@ assert.ok(empty.includes('Open Settings &gt; View Usage'));
 assert.ok(empty.includes('Add account'));
 assert.ok(!empty.includes('data-action="switch"'));
 assert.strictEqual(escapeHtml('<b>"x"</b>'), '&lt;b&gt;&quot;x&quot;&lt;/b&gt;');
+
+const optionalKeyringHtml = renderDashboardHtml({
+    ...snapshot,
+    keyring: {
+        available: false,
+        managed: true,
+        providerAvailable: true,
+        credentialPresent: false,
+        policy: 'optional',
+        required: false,
+        reason: 'wsl-file-storage'
+    },
+    profiles: [{
+        email: 'user@example.com',
+        label: 'Work',
+        active: false,
+        keyring: false,
+        keyringRequired: false,
+        complete: true
+    }]
+}, 'opt123');
+assert.ok(optionalKeyringHtml.includes('data-action="switch"'));
+assert.ok(optionalKeyringHtml.includes('Keyring optional'));
+assert.ok(!optionalKeyringHtml.includes('Keyring missing'));
 
 assert.ok(renderDashboardLoadingHtml().includes('Loading accounts and quota'));
 console.log('Dashboard HTML tests passed');

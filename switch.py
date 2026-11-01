@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Account Switcher - CLI Core Engine (v1.8.6)
+Antigravity Account Switcher - CLI Core Engine (v1.8.7)
 
 Manages the authentication state shared by Antigravity IDE, Antigravity Desktop
 and the Antigravity CLI:
@@ -26,7 +26,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.8.6"
+VERSION = "1.8.7"
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$")
 FILE_CATEGORIES = ("standaloneToken", "cliToken", "oauthCreds")
 FILE_KEY_ALIASES = {
@@ -896,7 +896,7 @@ def _atomic_write(file_path, content, mode=FILE_MODE):
         raise
 
 
-def _backup_existing_vault(file_path):
+def _backup_existing_vault(file_path, preserve_existing=False):
     if not os.path.exists(file_path):
         return
     try:
@@ -911,6 +911,12 @@ def _backup_existing_vault(file_path):
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
         backup_path = f"{file_path}.corrupt-{stamp}.json"
+    if preserve_existing and os.path.exists(backup_path):
+        try:
+            if os.path.getsize(backup_path) > 2:
+                return
+        except OSError:
+            pass
     _atomic_write(backup_path, content, FILE_MODE)
 
 
@@ -926,7 +932,7 @@ def save_profiles(profiles):
     for target in targets:
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            _backup_existing_vault(target)
+            _backup_existing_vault(target, preserve_existing=not normalized)
             _atomic_write(target, data, FILE_MODE)
             written.append(target)
         except Exception as error:
@@ -953,7 +959,7 @@ def load_profiles():
         if not isinstance(raw, dict):
             warn(f"Vault has an unexpected format: {profile_path}")
             continue
-        return normalize_profiles_map(raw)
+        return repair_profiles_completeness(normalize_profiles_map(raw))
     return {}
 
 
@@ -1456,32 +1462,57 @@ def verify_restore(entry, options=None):
             if not os.path.exists(token_path):
                 missing_files.append({"path": token_path, "category": category})
 
+    by_path = normalize_db_tokens_by_path(entry.get("db_tokens_by_path"))
+    merged = normalize_db_tokens(entry.get("db_tokens") or {})
+    claimed_db_paths = set(by_path)
+    if not claimed_db_paths and merged:
+        claimed_db_paths = set(get_db_paths())
+
     dbs = []
     for store in read_db_stores():
         identity_emails = store.get("identityEmails", [])
+        claimed = store["path"] in claimed_db_paths
+        has_auth_status = bool((store.get("tokens") or {}).get("antigravityAuthStatus"))
+        if len(identity_emails) > 1:
+            matches, reason = False, "identity-conflict"
+        elif len(identity_emails) == 0:
+            matches, reason = (not claimed), ("empty-identity" if claimed else "")
+        else:
+            matches = canonical_email(identity_emails[0]) == wanted
+            reason = "" if matches else "identity-mismatch"
+        if claimed and not has_auth_status:
+            matches = False
+            reason = reason or "missing-auth-status"
         dbs.append({
             "path": store["path"],
             "email": store["email"],
             "identityEmails": identity_emails,
+            "claimed": claimed,
             "hasOauthToken": bool(store.get("hasOauthToken")),
-            "matches": len(identity_emails) == 0
-                or (len(identity_emails) == 1 and canonical_email(identity_emails[0]) == wanted),
+            "hasAuthStatus": has_auth_status,
+            "matches": matches,
+            "reason": reason,
         })
 
+    keyring_expected = options.get("keyringExpected")
+    if keyring_expected is None:
+        keyring_expected = bool(options.get("keyring"))
     keyring = (
         verify_keyring_record(options.get("keyring") or entry.get("keyring"))
-        if options.get("keyringAvailable")
-        else {"ok": True, "matches": True, "present": False, "email": "", "target": KEYRING_TARGET}
+        if keyring_expected
+        else {"ok": True, "matches": True, "present": False, "expected": False, "email": "", "target": KEYRING_TARGET}
     )
     files_ok = all((not file["email"]) or file["matches"] for file in files) and not missing_files
     dbs_ok = all(database["matches"] for database in dbs)
-    keyring_ok = not options.get("keyringAvailable") or keyring["matches"]
+    keyring_ok = (not keyring_expected) or keyring["matches"]
     return {
         "ok": files_ok and dbs_ok and keyring_ok,
         "files": files,
         "missingFiles": missing_files,
         "dbs": dbs,
         "keyring": keyring,
+        "keyringExpected": keyring_expected,
+        "expectedDbPaths": sorted(claimed_db_paths),
     }
 
 
@@ -1606,15 +1637,23 @@ def snapshot_active_account(custom_label=None, manual_email=None):
             store for store in db_stores
             if any(canonical_email(candidate) == canonical_email(email) for candidate in store.get("identityEmails", []))
         ]
-        if db_stores and not matching:
+        empty_identity = [
+            store for store in db_stores
+            if not store.get("identityConflict") and not store.get("identityEmails")
+        ]
+        if db_stores and not matching and not empty_identity:
             warn("No database matched the active email; the profile was saved without database identity. Sign in live and save it again.")
-        selected = matching
+        if empty_identity:
+            warn(f"The profile will write the active identity to {len(empty_identity)} empty database(s).")
+        selected = list(matching)
+        for store in empty_identity:
+            if store not in selected:
+                selected.append(store)
         db_tokens_by_path = {}
         for store in selected:
             tokens = normalize_db_tokens(store["tokens"])
             _patch_db_identity(tokens, email)
-            if tokens:
-                db_tokens_by_path[store["path"]] = tokens
+            db_tokens_by_path[store["path"]] = tokens
         db_tokens = merge_db_tokens_by_path(db_tokens_by_path)
         has_db_identity = any(
             tokens.get("antigravityAuthStatus") or tokens.get("google.google-antigravity")
@@ -1627,21 +1666,26 @@ def snapshot_active_account(custom_label=None, manual_email=None):
         if not any(file_tokens.values()):
             raise RuntimeError("No OAuth token files were found for the active session.")
         _patch_token_email(file_tokens, email)
-        keyring_provider = get_keyring_provider()
-        keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
+        keyring_policy = get_keyring_policy()
         keyring = None
-        if keyring_available:
+        if keyring_policy["providerAvailable"]:
             keyring = get_keyring_credential({"refresh": True, "email": email})
             if keyring and canonical_email(keyring["email"]) != canonical_email(email):
                 raise RuntimeError(
                     f"The Windows keyring belongs to {keyring['email']}, not {email}. "
                     "Sign in again or resolve the keyring conflict before saving a profile."
                 )
-            if not keyring:
-                warn("Profile saved without the Windows keyring; sign in again and save it before switching.")
-        complete = bool(any(file_tokens.values())) and (not db_stores or has_db_identity) and (
-            not keyring_available or bool(keyring)
+            if not keyring and keyring_policy["required"]:
+                warn("Profile saved without the required Windows keyring; capture one before switching Windows surfaces.")
+        completeness = assess_profile_completeness(
+            {
+                "file_tokens": file_tokens,
+                "db_tokens_by_path": db_tokens_by_path,
+                "keyring": keyring,
+            },
+            keyring_policy,
         )
+        complete = completeness["complete"]
 
         fingerprints = {}
         for category in FILE_CATEGORIES:
@@ -1684,6 +1728,7 @@ def snapshot_active_account(custom_label=None, manual_email=None):
             "label": make_unique_label(profiles, email, raw_label),
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "complete": complete,
+            "completeness": completeness,
             "aliases": aliases,
             "account_id": previous.get("account_id") or account_id,
             "fingerprints": {**(previous.get("fingerprints") or {}), **fingerprints},
@@ -1738,9 +1783,12 @@ def refresh_profile_metadata(entry, verification):
             db_tokens_by_path[store["path"]] = tokens
     db_tokens = merge_db_tokens_by_path(db_tokens_by_path)
 
-    keyring_provider = get_keyring_provider()
-    keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
-    keyring = get_keyring_credential({"refresh": True, "email": email}) if keyring_available else None
+    keyring_policy = get_keyring_policy()
+    keyring = (
+        get_keyring_credential({"refresh": True, "email": email})
+        if keyring_policy["providerAvailable"]
+        else None
+    )
     if keyring and canonical_email(keyring["email"]) != wanted:
         warn(f"The Windows keyring belongs to {keyring['email']}; the profile was not refreshed with it.")
     fingerprints = {}
@@ -1760,15 +1808,22 @@ def refresh_profile_metadata(entry, verification):
         or fingerprints.get("keyring")
         or canonical_email(email)
     )
-    complete = (not get_db_paths() or bool(db_tokens_by_path)) and (
-        not keyring_available or bool(keyring and canonical_email(keyring["email"]) == wanted)
+    completeness = assess_profile_completeness(
+        {
+            "file_tokens": file_tokens,
+            "db_tokens_by_path": db_tokens_by_path,
+            "keyring": keyring if keyring and canonical_email(keyring["email"]) == wanted else existing.get("keyring"),
+        },
+        keyring_policy,
     )
+    complete = bool(existing.get("complete")) or completeness["complete"]
 
     refreshed = dict(existing)
     refreshed.update({
         "schema": PROFILE_SCHEMA_VERSION,
         "email": existing["email"],
         "complete": complete,
+        "completeness": completeness,
         "fingerprints": {**(existing.get("fingerprints") or {}), **fingerprints},
         "account_id": existing.get("account_id") or account_id,
         "db_tokens": db_tokens,
@@ -1791,37 +1846,44 @@ def restore_profile(profile):
         raise RuntimeError("Invalid or incomplete profile.")
 
     keyring_provider = get_keyring_provider()
-    keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
-    keyring = normalize_keyring_record(entry.get("keyring"), entry["email"]) if keyring_available else None
-    if keyring_available and not keyring:
-        raise RuntimeError(
-            f"Profile incomplete: sign in to {entry['email']}, then run agy-switch save to capture the Windows keyring."
-        )
+    keyring_policy = get_keyring_policy()
+    keyring_plan = plan_keyring_restore(entry, keyring_policy)
+    keyring = None
+    keyring_status = keyring_plan["action"]
+    if keyring_status == "write":
+        keyring = normalize_keyring_record(entry.get("keyring"), entry["email"])
+        if not keyring:
+            keyring_status = "invalid"
+            warn(f"Profile {entry['email']} carries an invalid keyring; it was not written.")
+    elif keyring_status == "missing":
+        warn(f"Profile {entry['email']} has no captured keyring; Windows surfaces may need one live sign-in.")
+    elif keyring_status == "unavailable":
+        warn(f"Profile {entry['email']} carries a keyring, but the keyring provider is unavailable; it was not written.")
 
     with acquire_switch_lock():
-        captured = capture_current_state({"include_keyring": keyring_available})
+        captured = capture_current_state({"include_keyring": True})
         try:
             file_result = write_file_tokens(entry["file_tokens"], entry["email"])
             db_result = write_profile_db_tokens(entry, entry["email"])
-            if keyring_available:
+            if keyring:
                 keyring_provider.write(keyring)
             verification = verify_restore(entry, {
                 "keyring": keyring,
-                "keyringAvailable": keyring_available,
+                "keyringExpected": bool(keyring),
             })
             if not verification["ok"]:
                 diverged = [
                     f"{file['path']}={file['email']}"
                     for file in verification["files"] if file["email"] and not file["matches"]
                 ] + [
-                    f"{database['path']}={' vs '.join(database.get('identityEmails', []))}"
+                    f"{database['path']}={' vs '.join(database.get('identityEmails', []))} ({database.get('reason') or 'mismatch'})"
                     for database in verification["dbs"] if not database["matches"]
                 ] + [
                     f"{missing['path']}=missing"
                     for missing in verification["missingFiles"]
                 ] + (
                     [f"keyring={verification['keyring'].get('email') or 'missing'} expected {entry['email']}"]
-                    if keyring_available and not verification["keyring"]["matches"]
+                    if verification.get("keyringExpected") and not verification["keyring"]["matches"]
                     else []
                 )
                 raise RuntimeError(
@@ -1831,13 +1893,21 @@ def restore_profile(profile):
 
             write_switch_state(build_switch_state(entry, verification))
             refreshed_profile = refresh_profile_metadata(entry, verification)
+            completeness = assess_profile_completeness(
+                {**entry, "keyring": keyring},
+                keyring_policy,
+            )
             return {
                 "email": entry["email"],
                 "db": db_result,
                 "files": file_result,
-                "keyring": redacted_keyring_record(keyring) if keyring_available else None,
+                "keyring": redacted_keyring_record(keyring) if keyring else None,
+                "keyringStatus": keyring_status,
+                "keyringPolicy": keyring_policy["policy"],
+                "keyringRequired": bool(keyring_policy["required"]),
                 "verification": verification,
-                "complete": bool(entry.get("complete")),
+                "completeness": completeness,
+                "complete": bool(entry.get("complete")) or completeness["complete"],
                 "profile": refreshed_profile,
             }
         except Exception as error:
@@ -1875,28 +1945,28 @@ def build_login_profile(email, label=None):
     for db_store in read_db_stores():
         tokens = normalize_db_tokens(db_store["tokens"])
         _patch_db_identity(tokens, email)
-        if tokens:
-            db_tokens_by_path[db_store["path"]] = tokens
+        db_tokens_by_path[db_store["path"]] = tokens
     db_tokens = merge_db_tokens_by_path(db_tokens_by_path)
-    has_db_identity = any(
-        tokens.get("antigravityAuthStatus") or tokens.get("google.google-antigravity")
-        for tokens in db_tokens_by_path.values()
-    )
-    keyring_provider = get_keyring_provider()
-    keyring_available = bool(keyring_provider and getattr(keyring_provider, "available", False))
+    keyring_policy = get_keyring_policy()
     keyring = None
-    if keyring_available:
+    if keyring_policy["providerAvailable"]:
         keyring = get_keyring_credential({"refresh": True, "email": email})
         if keyring and canonical_email(keyring["email"]) != canonical_email(email):
             raise RuntimeError(
                 f"The Windows keyring belongs to {keyring['email']}, not {email}. "
                 "Sign in again before adopting this login."
             )
-        if not keyring:
-            warn("The fresh login has no Windows keyring yet; sign in again before switching.")
-    complete = (not get_db_paths() or has_db_identity) and (
-        not keyring_available or bool(keyring)
+        if not keyring and keyring_policy["required"]:
+            warn("The fresh login has no required Windows keyring; Windows surfaces may need one live sign-in.")
+    completeness = assess_profile_completeness(
+        {
+            "file_tokens": file_tokens,
+            "db_tokens_by_path": db_tokens_by_path,
+            "keyring": keyring,
+        },
+        keyring_policy,
     )
+    complete = completeness["complete"]
 
     fingerprints = {}
     for category in FILE_CATEGORIES:
@@ -1923,6 +1993,7 @@ def build_login_profile(email, label=None):
         "label": make_unique_label(profiles, email, raw_label),
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "complete": complete,
+        "completeness": completeness,
         "aliases": [],
         "account_id": account_id,
         "fingerprints": fingerprints,
@@ -2010,10 +2081,12 @@ def _clear_session_tokens_unlocked():
 
     provider = get_keyring_provider()
     if provider and getattr(provider, "available", False):
-        try:
-            provider.delete(KEYRING_TARGET)
-        except Exception as error:
-            failed.append(f"keyring: {error}")
+        credential = get_keyring_credential({"refresh": False})
+        if credential:
+            try:
+                provider.delete(KEYRING_TARGET)
+            except Exception as error:
+                failed.append(f"keyring: {error}")
 
     for failure in clear_switch_state()["failed"]:
         failed.append(failure)
@@ -2643,6 +2716,112 @@ def set_keyring_provider_for_tests(provider):
     _KEYRING_CACHE["value"] = None
 
 
+_KEYRING_POLICY_OVERRIDE = None
+
+
+def set_keyring_policy_for_tests(policy):
+    global _KEYRING_POLICY_OVERRIDE
+    _KEYRING_POLICY_OVERRIDE = dict(policy) if policy else None
+    _KEYRING_CACHE["at"] = 0.0
+    _KEYRING_CACHE["value"] = None
+
+
+def get_keyring_policy():
+    if _KEYRING_POLICY_OVERRIDE:
+        return dict(_KEYRING_POLICY_OVERRIDE)
+    provider = get_keyring_provider()
+    provider_available = bool(provider and getattr(provider, "available", False))
+    file_storage = os.name != "nt"
+    if not provider_available:
+        return {
+            "providerAvailable": False,
+            "policy": "unsupported",
+            "required": False,
+            "reason": "unsupported-platform",
+            "wsl": file_storage,
+        }
+    if file_storage:
+        return {
+            "providerAvailable": True,
+            "policy": "optional",
+            "required": False,
+            "reason": "file-token-storage",
+            "wsl": True,
+        }
+    return {
+        "providerAvailable": True,
+        "policy": "managed",
+        "required": True,
+        "reason": "windows-credential-manager",
+        "wsl": False,
+    }
+
+
+def plan_keyring_restore(entry, policy=None):
+    policy = policy or get_keyring_policy()
+    if not entry or not entry.get("keyring"):
+        return {
+            "action": "missing" if policy["required"] else "skip",
+            "required": bool(policy["required"]),
+            "reason": "keyring-required-missing" if policy["required"] else "keyring-optional",
+        }
+    if not policy["providerAvailable"]:
+        return {
+            "action": "unavailable",
+            "required": bool(policy["required"]),
+            "reason": "provider-unavailable",
+        }
+    return {
+        "action": "write",
+        "required": bool(policy["required"]),
+        "reason": "profile-keyring",
+    }
+
+
+def assess_profile_completeness(entry, policy=None):
+    policy = policy or get_keyring_policy()
+    entry = entry if isinstance(entry, dict) else {}
+    file_tokens = normalize_file_tokens(entry.get("file_tokens"))
+    token_ok = any(file_tokens.get(category) for category in FILE_CATEGORIES)
+    db_tokens_by_path = normalize_db_tokens_by_path(entry.get("db_tokens_by_path"))
+    merged_db_tokens = normalize_db_tokens(entry.get("db_tokens") or {})
+    claimed_db_paths = list(db_tokens_by_path.keys())
+    db_claimed = bool(claimed_db_paths) or bool(merged_db_tokens)
+    db_present = len(get_db_paths())
+    db_ok = db_present == 0 or db_claimed or bool(policy.get("wsl"))
+    keyring_ok = not policy["required"] or bool(entry.get("keyring"))
+    complete = token_ok and db_ok and keyring_ok
+    reasons = []
+    if not token_ok:
+        reasons.append("no-file-tokens")
+    if not db_ok:
+        reasons.append("no-db-identity")
+    if not keyring_ok:
+        reasons.append("keyring-required-missing")
+    return {
+        "complete": complete,
+        "tokenOk": token_ok,
+        "dbOk": db_ok,
+        "keyringOk": keyring_ok,
+        "keyringRequired": bool(policy["required"]),
+        "dbPresent": db_present,
+        "dbClaimed": db_claimed,
+        "claimedDbPaths": claimed_db_paths,
+        "policy": policy["policy"],
+        "reasons": reasons,
+    }
+
+
+def repair_profiles_completeness(profiles):
+    policy = get_keyring_policy()
+    for entry in profiles.values():
+        completeness = assess_profile_completeness(entry, policy)
+        if entry.get("complete") is not True and completeness["complete"]:
+            entry["complete"] = True
+        entry["completeness"] = completeness
+    return profiles
+
+
 def normalize_keyring_record(raw, fallback_email=None):
     if not raw:
         return None
@@ -2763,9 +2942,14 @@ def read_windows_keyring(options=None):
 
 def get_keyring_report(refresh=False):
     provider = get_keyring_provider()
+    policy = get_keyring_policy()
     if not provider or not getattr(provider, "available", False):
         return {
             "available": False,
+            "providerAvailable": False,
+            "credentialPresent": False,
+            "policy": policy["policy"],
+            "required": bool(policy["required"]),
             "provider": getattr(provider, "id", "none"),
             "target": KEYRING_TARGET,
             "managed": False,
@@ -2774,13 +2958,27 @@ def get_keyring_report(refresh=False):
     if not refresh and _KEYRING_CACHE["value"] and time.monotonic() - _KEYRING_CACHE["at"] < 30:
         return json.loads(json.dumps(_KEYRING_CACHE["value"]))
     record = get_keyring_credential({"refresh": True})
-    report = redacted_keyring_record(record) if record else {
-        "available": False,
-        "provider": getattr(provider, "id", "windows-credential-manager"),
-        "target": KEYRING_TARGET,
-        "managed": True,
-        "reason": "not-found",
-    }
+    if record:
+        report = {
+            **redacted_keyring_record(record),
+            "available": True,
+            "providerAvailable": True,
+            "credentialPresent": True,
+            "policy": policy["policy"],
+            "required": bool(policy["required"]),
+        }
+    else:
+        report = {
+            "available": False,
+            "providerAvailable": True,
+            "credentialPresent": False,
+            "policy": policy["policy"],
+            "required": bool(policy["required"]),
+            "provider": getattr(provider, "id", "windows-credential-manager"),
+            "target": KEYRING_TARGET,
+            "managed": True,
+            "reason": "not-found",
+        }
     _KEYRING_CACHE["at"] = time.monotonic()
     _KEYRING_CACHE["value"] = report
     return json.loads(json.dumps(report))
@@ -3196,7 +3394,7 @@ def get_doctor_report(surfaces=None, preferred_store=None, keyring=None, quota=N
                        "or sign in again.",
         })
 
-    if keyring and keyring.get("managed"):
+    if keyring and keyring.get("required"):
         profiles = load_profiles()
         missing_keyring = [
             profile.get("email", email)
@@ -3360,14 +3558,14 @@ def get_diagnostics():
         "switchState": state,
         "storeDiff": diff_against_switch_state(state),
         "keyring": keyring,
+        "keyringPolicy": get_keyring_policy(),
         "quota": get_quota_report(),
         "doctor": get_doctor_report(),
         "savedProfiles": sorted(profiles.keys()),
         "profileCompleteness": {
             email: {
-                "complete": bool(profile.get("complete")) and (
-                    not keyring.get("managed") or bool(profile.get("keyring"))
-                ),
+                "complete": bool(profile.get("complete")) or assessment["complete"],
+                **assessment,
                 "saved_at": profile.get("saved_at", ""),
                 "aliases": profile.get("aliases", []),
                 "account_id": profile.get("account_id", ""),
@@ -3377,6 +3575,7 @@ def get_diagnostics():
                 "keyringFingerprint": (profile.get("fingerprints") or {}).get("keyring", ""),
             }
             for email, profile in profiles.items()
+            for assessment in [profile.get("completeness") or assess_profile_completeness(profile)]
         },
         "vaultWarnings": warnings,
     }

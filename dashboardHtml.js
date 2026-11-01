@@ -145,7 +145,8 @@ function renderProfiles(snapshot) {
     const profiles = snapshot.profiles || [];
     const rows = profiles.map(profile => {
         const active = Boolean(profile.active);
-        const missingKeyring = !profile.keyring;
+        const keyringRequired = profile.keyringRequired === true;
+        const missingKeyring = keyringRequired && !profile.keyring;
         const canSwitch = !active && !missingKeyring && profile.complete !== false;
         const initial = (profile.label || profile.email || '?').trim().slice(0, 1).toUpperCase();
         const label = profile.label || profile.email;
@@ -157,7 +158,7 @@ function renderProfiles(snapshot) {
                     ? '<span class="badge warn">Incomplete</span>'
                     : '';
         const hint = missingKeyring
-            ? 'Sign in to this account and run Save Current to capture the keyring.'
+            ? 'Sign in to this account and run Save Current to capture the required keyring.'
             : 'Manual switch with confirmation.';
         return `
             <div class="profile-row ${active ? 'is-active' : ''}">
@@ -216,11 +217,15 @@ function renderDashboardHtml(snapshot, nonce) {
             <span>${escapeHtml(active.conflictDetails || 'The stores disagree. Run Doctor before switching.')}</span>
             <button class="link" data-action="doctor">Run Doctor</button>
         </div>` : '';
+    const keyringPolicy = keyring.policy
+        || (keyring.required ? 'managed' : keyring.providerAvailable ? 'optional' : 'unsupported');
     const keyringBadge = keyring.available
         ? `<span class="badge ok">Keyring managed</span>`
-        : keyring.managed
-            ? `<span class="badge warn">Keyring not found</span>`
-            : `<span class="badge muted">Keyring unavailable</span>`;
+        : keyringPolicy === 'optional'
+            ? `<span class="badge muted">Keyring optional (WSL file storage)</span>`
+            : keyringPolicy === 'managed'
+                ? `<span class="badge warn">Keyring required, not found</span>`
+                : `<span class="badge muted">Keyring unavailable</span>`;
 
     return `<!DOCTYPE html>
 <html lang="en">

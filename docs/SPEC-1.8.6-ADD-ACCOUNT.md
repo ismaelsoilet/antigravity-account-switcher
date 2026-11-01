@@ -1,5 +1,9 @@
 # SPEC 1.8.6 — Cancel-safe Add Google Account
 
+> **Superseded in part by 1.8.7.** The keyring policy and strict DB verification
+> in `docs/SPEC-1.8.7-KEYRING-POLICY.md` replace the strict keyring precondition
+> and the empty-identity verification acceptance described here.
+
 ## Problem
 
 Antigravity stores one active Google identity. Calling the internal sign-in

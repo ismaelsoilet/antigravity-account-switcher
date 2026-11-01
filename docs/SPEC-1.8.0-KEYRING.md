@@ -1,5 +1,10 @@
 # SPEC 1.8.0 — Keyring-Aware Manual Switching
 
+> **Policy updated in 1.8.7.** The strict “keyring required” rule applies only to
+> native Windows (`managed` policy). On WSL/Linux, Antigravity uses file-based
+> token storage and the keyring is an optional mirror. See
+> `docs/SPEC-1.8.7-KEYRING-POLICY.md`.
+
 Status: implemented in 1.8.0
 Depends on: 1.8.0-alpha.1 read-only keyring detection
 Scope: one manually selected account at a time; no parallel accounts, no quota

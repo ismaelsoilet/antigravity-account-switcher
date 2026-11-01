@@ -7,7 +7,7 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.6-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.8.7-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
 [![CI](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml/badge.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml)
 
@@ -15,17 +15,18 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-### What's new in 1.8.6
+### What's new in 1.8.7
 
-- **One-step “Add account” flow:** the extension now saves/refreshes the current profile, signs out of it, opens Google sign-in, detects the new account, saves it with an automatic label and syncs every surface. This removes the manual “sign out first” step.
-- **Cancel-safe:** the previous token files, databases and keyring are captured before sign-out. If sign-in is cancelled, times out or fails, they are restored and the window reloads.
-- **Less friction:** no second confirmation and no label prompt; the new profile is named from the email prefix and can be renamed later.
-- **Clearer browser guidance:** after sign-out, the progress tells you to choose the desired account and use **“Use another account”** if the old one is preselected.
+- **WSL no longer requires a Windows keyring.** Antigravity on WSL uses file-based token storage, so the switcher now treats the Windows Credential Manager entry as an optional mirror, not a precondition. Add account and Reapply can finally complete on WSL.
+- **Strict verification:** an empty Windows DB identity is no longer accepted as a successful switch when the profile claims that database.
+- **Profiles self-heal:** legacy token-only profiles stored as `complete:false` are repaired on load; existing `true` flags are never downgraded.
+- **Empty DBs are initialized:** snapshot/login profiles write the active identity into empty IDE/Desktop databases instead of leaving them anonymous.
+- **Backup safety:** an empty vault save cannot overwrite a non-empty `.bak`.
+- Previous 1.8.6: cancel-safe Add account flow.
 - Previous 1.8.5: non-blocking async quota and resilient dashboard.
 - Previous 1.8.4: localized dates (`pt-BR` day/month/year).
-- Previous 1.8.2: rich Accounts webview and onboarding.
 
-Previous 1.8.1: official `/usage` quota and the first Activity Bar dashboard.
+Previous 1.8.2: rich Accounts webview and onboarding.
 
 ### Product direction
 
@@ -110,7 +111,7 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 
 The switcher is designed for **one account at a time** across all surfaces. With the IDE, Desktop 2.0 and the CLI open at the same time, each process keeps its own copy of the OAuth token and may refresh it independently (the CLI refreshes roughly every hour). The switcher cannot force three running processes to keep three different accounts; any tool that writes the shared token files will win the last write.
 
-What v1.8.6 does instead:
+What v1.8.7 does instead:
 
 * runs a cross-process lock (`~/.gemini/.antigravity-switch.lock`) so two switches cannot interleave;
 * records the expected identity and hashes in `~/.gemini/antigravity_switch_state.json`;
@@ -120,7 +121,7 @@ What v1.8.6 does instead:
 
 The status bar prefers the surface selected by `antigravityAccountSwitcher.preferredStore` (`standaloneToken` by default, or `cliToken`), and always prefers the account most recently applied by the switcher while that store still exists. It never chooses a winner by modification time.
 
-### Identity rules (v1.8.6)
+### Identity rules (v1.8.7)
 
 * Gmail aliases are canonicalized for comparisons: `user+tag@gmail.com` and `u.ser@gmail.com` collapse to the same canonical address. The original email is still used when writing tokens.
 * Each profile stores an `account_id` and a refresh-token fingerprint per token category. Profiles that share a canonical email or a fingerprint are **merged into one** (with `aliases`) instead of creating a second entry.
@@ -132,7 +133,7 @@ The status bar prefers the surface selected by `antigravityAccountSwitcher.prefe
 
 When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Add Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
 
-To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.6; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
+To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.7; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
 
 ### Reliability Doctor
 
@@ -294,7 +295,7 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.8.6.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.8.7.vsix` located in the repository folder.
 4. Reload the window when prompted.
 
 To rebuild the VSIX from source:
@@ -327,6 +328,7 @@ The suite is hermetic: it uses temporary homes and temporary SQLite databases, a
 
 ## 🩺 Troubleshooting
 
+* **Keyring not found on WSL:** expected when Antigravity uses file-based token storage. The keyring is optional there and no longer blocks switching. To make Windows IDE/Desktop surfaces follow, sign in once on Windows and save again.
 * **Status bar says "Email not detected":** a token exists but has no email claim. Use **Register Email for Active Session** (only accepted when it matches the active token) or sign in again.
 * **Database sync unavailable:** the host does not expose `node:sqlite`. Antigravity 1.107+ does; older or embedded hosts may not. Use **Show Diagnostics** to confirm.
 * **A switch reports a failure:** the extension does not reload silently on errors. Check the "Antigravity Account Switcher" output channel; when a write fails, the previous session is left intact.

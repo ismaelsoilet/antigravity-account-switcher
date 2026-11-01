@@ -4,6 +4,34 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.7 — 2026-11-01
+
+### Fixed
+
+- **WSL Add account and Reapply no longer abort on a missing Windows
+  keyring.** Antigravity on WSL uses file-based token storage; the Windows
+  Credential Manager entry is now an optional mirror, not a precondition.
+  Profiles without a keyring write files and databases normally and report a
+  warning instead of throwing.
+- **Verification no longer accepts an empty claimed database identity.**
+  A profile that claims a `state.vscdb` fails verification with
+  `empty-identity` if that database has no account identity; unclaimed empty
+  databases still pass.
+- **Legacy token-only profiles self-heal.** `complete:false` profiles are
+  upgraded on load when they are valid for the host; stored `true` flags are
+  never downgraded.
+- **Empty IDE/Desktop databases are initialized** with the active identity
+  during snapshot/login, instead of remaining anonymous.
+- **Backup safety:** an empty vault save preserves a non-empty `.bak`.
+- Diagnostics now distinguish provider availability, credential presence and
+  keyring policy (`managed`, `optional`, `unsupported`).
+
+### Tests
+
+- 64 JavaScript and 62 Python tests passing; 1 opt-in real keyring test
+  skipped. The Add account harness covers success and rollback with a
+  provider that is available but has no credential (the WSL production state).
+
 ## 1.8.6 — 2026-10-31
 
 ### Fixed

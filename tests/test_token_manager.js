@@ -69,6 +69,7 @@ function resetState() {
         write() { throw new Error('keyring disabled in this test'); },
         delete() { return false; }
     });
+    tokenManager.setKeyringPolicyForTests(null);
 }
 
 function setDbRows(rows) {
@@ -717,12 +718,12 @@ test('restoreProfile skips a database without ItemTable instead of aborting', as
     process.env.AGY_SWITCH_DB_PATHS = dbPath;
 });
 
-test('snapshotActiveAccount keeps the incomplete-profile warning visible', async () => {
+test('snapshotActiveAccount completes empty-identity databases on WSL-like hosts', async () => {
     resetState();
     writeToken('cliToken', makeToken('warn@example.com'));
     const entry = tokenManager.snapshotActiveAccount('Warn', 'warn@example.com');
 
-    assert.strictEqual(entry.complete, false);
+    assert.strictEqual(entry.complete, true);
     assert.ok(tokenManager.getLastLoadWarnings().some(warning => /database/i.test(warning)));
 });
 
@@ -838,6 +839,7 @@ test('snapshotActiveAccount makes duplicate labels unique', async () => {
     const first = tokenManager.snapshotActiveAccount('Work', 'first@example.com');
     assert.strictEqual(first.label, 'Work');
 
+    setDbRows({});
     writeToken('cliToken', makeToken('second@example.com', 'access-2', 'refresh-2'));
     const second = tokenManager.snapshotActiveAccount('Work', 'second@example.com');
     assert.strictEqual(second.label, 'Work 2');
@@ -1081,20 +1083,125 @@ test('keyring-aware restore writes the credential and verifies it', async () => 
     assert.strictEqual(tokenManager.readCurrentFileTokens('new@example.com').cliToken.id_token_email, 'new@example.com');
 });
 
-test('strict mode blocks a profile without a keyring', async () => {
+test('a missing keyring is optional when the host uses file storage', async () => {
     resetState();
     installKeyring(keyringRecord('key@example.com'));
 
-    assert.throws(
-        () => tokenManager.restoreProfile({
-            email: 'key@example.com',
-            label: 'Key',
-            complete: true,
-            file_tokens: { cliToken: makeToken('key@example.com') },
-            db_tokens_by_path: {}
-        }),
-        /Profile incomplete: sign in to key@example\.com/
+    const result = tokenManager.restoreProfile({
+        email: 'key@example.com',
+        label: 'Key',
+        complete: true,
+        file_tokens: { cliToken: makeToken('key@example.com') },
+        db_tokens_by_path: {}
+    });
+
+    assert.strictEqual(result.verification.ok, true);
+    assert.strictEqual(result.keyringStatus, 'skip');
+    assert.strictEqual(result.keyring, null);
+    assert.strictEqual(tokenManager.readCurrentFileTokens('key@example.com').cliToken.id_token_email, 'key@example.com');
+});
+
+test('provider available but no credential does not block a WSL restore', async () => {
+    resetState();
+    tokenManager.setKeyringProviderForTests({
+        id: 'fake-keyring',
+        target: tokenManager.KEYRING_TARGET,
+        available: true,
+        read() { return null; },
+        write() { throw new Error('keyring write should not run without a profile record'); },
+        delete() { return false; }
+    });
+    tokenManager.setKeyringPolicyForTests({
+        providerAvailable: true,
+        policy: 'optional',
+        required: false,
+        reason: 'wsl-file-storage',
+        wsl: true
+    });
+    writeToken('cliToken', makeToken('wsl@example.com'));
+
+    const entry = tokenManager.snapshotActiveAccount('WSL', 'wsl@example.com');
+    assert.strictEqual(entry.complete, true);
+    assert.strictEqual(entry.keyring, null);
+
+    const result = tokenManager.restoreProfile(entry);
+    assert.strictEqual(result.verification.ok, true);
+    assert.strictEqual(result.keyringStatus, 'skip');
+    assert.strictEqual(result.keyring, null);
+});
+
+test('verifyRestore rejects an empty claimed database identity', () => {
+    if (!DatabaseSync) return;
+    resetState();
+    writeToken('cliToken', makeToken('claimed@example.com'));
+    const entry = {
+        email: 'claimed@example.com',
+        file_tokens: { cliToken: makeToken('claimed@example.com') },
+        db_tokens_by_path: {
+            [dbPath]: {
+                antigravityAuthStatus: JSON.stringify({ email: 'claimed@example.com', apiKey: '' })
+            }
+        }
+    };
+    const verification = tokenManager.verifyRestore(entry);
+    assert.strictEqual(verification.ok, false);
+    assert.strictEqual(verification.dbs[0].reason, 'empty-identity');
+});
+
+test('buildLoginProfile writes identity to an empty database', () => {
+    if (!DatabaseSync) return;
+    resetState();
+    writeToken('standaloneToken', makeToken('fresh@example.com'));
+    const entry = tokenManager.buildLoginProfile({
+        path: tokenPath('standaloneToken'),
+        category: 'standaloneToken',
+        email: 'fresh@example.com'
+    }, 'Fresh');
+    assert.ok(entry.db_tokens_by_path[dbPath]);
+    assert.strictEqual(
+        JSON.parse(entry.db_tokens_by_path[dbPath].antigravityAuthStatus).email,
+        'fresh@example.com'
     );
+    assert.strictEqual(entry.complete, true);
+});
+
+test('loadProfiles repairs a legacy token-only profile on WSL', () => {
+    resetState();
+    tokenManager.setKeyringPolicyForTests({
+        providerAvailable: true,
+        policy: 'optional',
+        required: false,
+        reason: 'wsl-file-storage',
+        wsl: true
+    });
+    const profile = {
+        email: 'legacy@example.com',
+        label: 'Legacy',
+        complete: false,
+        file_tokens: { cliToken: makeToken('legacy@example.com') },
+        db_tokens: {},
+        db_tokens_by_path: {}
+    };
+    tokenManager.saveProfiles({ 'legacy@example.com': profile });
+    const loaded = tokenManager.loadProfiles()['legacy@example.com'];
+    assert.strictEqual(loaded.complete, true);
+    assert.strictEqual(loaded.completeness.reasons.length, 0);
+});
+
+test('saveProfiles does not clobber a non-empty backup with an empty vault', () => {
+    resetState();
+    const profile = {
+        email: 'backup@example.com',
+        label: 'Backup',
+        complete: true,
+        file_tokens: { cliToken: makeToken('backup@example.com') }
+    };
+    tokenManager.saveProfiles({ 'backup@example.com': profile });
+    tokenManager.saveProfiles({});
+    tokenManager.saveProfiles({});
+    const backupPath = `${tokenManager.getProfilesFilePaths()[0]}.bak`;
+    const backup = JSON.parse(fs.readFileSync(backupPath, 'utf-8'));
+    assert.ok(backup['backup@example.com']);
 });
 
 test('snapshot rejects a keyring that belongs to another account', async () => {

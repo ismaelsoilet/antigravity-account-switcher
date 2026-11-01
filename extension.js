@@ -451,33 +451,37 @@ async function switchAccount(email, label) {
         return;
     }
     if (profile.complete === false) {
+        const reasons = profile.completeness && profile.completeness.reasons
+            ? ` (${profile.completeness.reasons.join(', ')})`
+            : '';
         vscode.window.showErrorMessage(
-            `Profile "[${label}] ${profile.email}" is incomplete: it was saved without the Antigravity database identity. Sign in live and save it again before switching.`
+            `Profile "[${label}] ${profile.email}" is incomplete${reasons}. `
+            + 'Sign in to this account and save the profile again before switching.'
         );
         return;
     }
 
-    const keyringProvider = typeof tokenManager.getKeyringProvider === 'function'
-        ? tokenManager.getKeyringProvider()
+    const keyringPolicy = typeof tokenManager.getKeyringPolicy === 'function'
+        ? tokenManager.getKeyringPolicy()
         : null;
-    if (keyringProvider && keyringProvider.available && !profile.keyring) {
-        vscode.window.showErrorMessage(
-            `Profile "[${label}] ${profile.email}" has no captured Windows keyring. Sign in to this account and save the profile again before switching.`
-        );
-        return;
-    }
-
+    const keyringRequired = Boolean(keyringPolicy && keyringPolicy.required);
     const hasDbTokens = Object.keys(profile.db_tokens || {}).length > 0;
     const hasFileTokens = Boolean(profile.file_tokens && (
         profile.file_tokens.cliToken || profile.file_tokens.standaloneToken || profile.file_tokens.oauthCreds
     ));
 
     const details = [
-        'Antigravity IDE will reload to apply this account to the IDE, Antigravity Desktop, the CLI and the Windows keyring.',
-        'Please save all open files before continuing.',
-        'The Windows keyring is written and verified; if another surface is still signed into a different account, reload/restart it after this switch.'
+        'Antigravity IDE will reload to apply this account to the IDE, Antigravity Desktop and the CLI.',
+        'Please save all open files before continuing.'
     ];
-    if (!hasDbTokens) details.push('This profile has no database tokens; the IDE database will be left unchanged.');
+    if (keyringRequired) {
+        details.push(profile.keyring
+            ? 'The Windows keyring is written and verified; if another surface is still signed into a different account, reload/restart it after this switch.'
+            : 'This profile has no Windows keyring; Windows surfaces may need one live sign-in after the switch.');
+    } else {
+        details.push('This host uses file-based token storage; the Windows keyring is optional and will not block the switch.');
+    }
+    if (!hasDbTokens) details.push('This profile has no explicit database tokens; the IDE database will be left unchanged unless the profile supplies a merged identity.');
     if (!hasFileTokens) details.push('This profile has no OAuth token files; local token files will be cleared and you may need to sign in again.');
 
     const confirmation = await vscode.window.showWarningMessage(
@@ -1110,6 +1114,8 @@ class DashboardViewProvider {
                 label: profile.label || profile.email,
                 complete: profile.complete !== false,
                 keyring: Boolean(profile.keyring),
+                keyringRequired: Boolean(keyring && keyring.required),
+                completeness: profile.completeness || null,
                 active: Boolean(
                     session.email
                     && tokenManager.canonicalEmail(profile.email) === tokenManager.canonicalEmail(session.email)

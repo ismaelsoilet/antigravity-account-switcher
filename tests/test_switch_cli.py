@@ -464,7 +464,7 @@ class TestSwitchCLI(unittest.TestCase):
                 "label": "Incomplete",
                 "complete": False,
                 "db_tokens": {},
-                "file_tokens": {"standaloneToken": make_token("incomplete@example.com")},
+                "file_tokens": {},
             }
         })
         self.assertEqual(switch.cmd_load("incomplete@example.com"), 1)
@@ -514,10 +514,10 @@ class TestSwitchCLI(unittest.TestCase):
                 "file_tokens": {"cliToken": make_token("target@example.com")},
             })
 
-    def test_snapshot_keeps_incomplete_warning(self):
+    def test_snapshot_completes_empty_identity_database(self):
         self.write_token("cliToken", make_token("warn@example.com"))
         entry = switch.snapshot_active_account("Warn", "warn@example.com")
-        self.assertFalse(entry["complete"])
+        self.assertTrue(entry["complete"])
         self.assertTrue(any("database" in warning for warning in switch.last_warnings()))
 
     @unittest.skipIf(os.name == "nt", "read-only chmod semantics differ on Windows")
@@ -713,6 +713,7 @@ class TestSwitchCLI(unittest.TestCase):
         first = switch.snapshot_active_account("Work", "first@example.com")
         self.assertEqual(first["label"], "Work")
 
+        self.set_db_rows({})
         self.write_token("cliToken", make_token("second@example.com", "access-2", "refresh-2"))
         second = switch.snapshot_active_account("Work", "second@example.com")
         self.assertEqual(second["label"], "Work 2")
@@ -950,18 +951,35 @@ class TestSwitchCLI(unittest.TestCase):
             "new@example.com",
         )
 
-    def test_strict_mode_blocks_profile_without_keyring(self):
+    def test_missing_keyring_is_optional_on_file_storage(self):
         self.keyring = FakeKeyringProvider(make_keyring_record("key@example.com"))
         switch.set_keyring_provider_for_tests(self.keyring)
 
-        with self.assertRaisesRegex(RuntimeError, "Profile incomplete: sign in to key@example.com"):
-            switch.restore_profile({
-                "email": "key@example.com",
-                "label": "Key",
-                "complete": True,
-                "file_tokens": {"cliToken": make_token("key@example.com")},
-                "db_tokens_by_path": {},
-            })
+        result = switch.restore_profile({
+            "email": "key@example.com",
+            "label": "Key",
+            "complete": True,
+            "file_tokens": {"cliToken": make_token("key@example.com")},
+            "db_tokens_by_path": {},
+        })
+
+        self.assertTrue(result["verification"]["ok"])
+        self.assertEqual(result["keyringStatus"], "skip")
+        self.assertIsNone(result["keyring"])
+
+    def test_provider_available_without_credential_does_not_block(self):
+        self.keyring = FakeKeyringProvider(record=None, available=True)
+        switch.set_keyring_provider_for_tests(self.keyring)
+        self.write_token("cliToken", make_token("wsl@example.com"))
+
+        entry = switch.snapshot_active_account("WSL", "wsl@example.com")
+        self.assertTrue(entry["complete"])
+        self.assertIsNone(entry["keyring"])
+
+        result = switch.restore_profile(entry)
+        self.assertTrue(result["verification"]["ok"])
+        self.assertEqual(result["keyringStatus"], "skip")
+        self.assertIsNone(result["keyring"])
 
     def test_snapshot_rejects_keyring_from_another_account(self):
         self.keyring = FakeKeyringProvider(make_keyring_record("other@example.com"))
@@ -970,6 +988,20 @@ class TestSwitchCLI(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "stores disagree|keyring belongs"):
             switch.snapshot_active_account("Key", "key@example.com")
+
+    def test_verify_restore_rejects_empty_claimed_database(self):
+        self.write_token("cliToken", make_token("claimed@example.com"))
+        verification = switch.verify_restore({
+            "email": "claimed@example.com",
+            "file_tokens": {"cliToken": make_token("claimed@example.com")},
+            "db_tokens_by_path": {
+                self.db_path: {
+                    "antigravityAuthStatus": json.dumps({"email": "claimed@example.com", "apiKey": ""})
+                }
+            },
+        })
+        self.assertFalse(verification["ok"])
+        self.assertEqual(verification["dbs"][0]["reason"], "empty-identity")
 
     def test_parse_quota_payload_normalizes_values(self):
         models = switch.parse_quota_payload({
