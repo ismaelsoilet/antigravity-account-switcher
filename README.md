@@ -7,7 +7,7 @@
 > **Visual Account Switcher & Profile Manager for Google Antigravity (IDE, Desktop 2.0, and CLI)**
 
 [![GitHub license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.5-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.8.6-blue.svg)](package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux-lightgrey.svg)]()
 [![CI](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml/badge.svg)](https://github.com/ismaelsoilet/antigravity-account-switcher/actions/workflows/ci.yml)
 
@@ -15,11 +15,13 @@ An embedded extension and CLI utility that allows developers to seamlessly save,
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-### What's new in 1.8.5
+### What's new in 1.8.6
 
-- **No more blank dashboard or reload loop:** the official `/usage` call is now asynchronous, deduplicated and bounded (6 s). The webview renders a loading state and then local/cached data immediately; live quota fills in when ready.
-- **Status bar no longer blocks:** it shows cached/local quota first, a spinner while loading, and updates when `/usage` finishes. Activation and window focus never wait on the CLI.
-- **Robust webview setup:** guarded view visibility APIs, immediate loading HTML and an error fallback.
+- **One-step “Add account” flow:** the extension now saves/refreshes the current profile, signs out of it, opens Google sign-in, detects the new account, saves it with an automatic label and syncs every surface. This removes the manual “sign out first” step.
+- **Cancel-safe:** the previous token files, databases and keyring are captured before sign-out. If sign-in is cancelled, times out or fails, they are restored and the window reloads.
+- **Less friction:** no second confirmation and no label prompt; the new profile is named from the email prefix and can be renamed later.
+- **Clearer browser guidance:** after sign-out, the progress tells you to choose the desired account and use **“Use another account”** if the old one is preselected.
+- Previous 1.8.5: non-blocking async quota and resilient dashboard.
 - Previous 1.8.4: localized dates (`pt-BR` day/month/year).
 - Previous 1.8.2: rich Accounts webview and onboarding.
 
@@ -51,11 +53,12 @@ yours. See [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md).
 * **Safeguarded Account Switching with Confirmation Dialog:**  
   Prevents accidental switches during active work. Selecting a profile opens a modal confirmation with a reload alert. Upon confirmation, Antigravity IDE immediately applies the session and reloads.
 
-* **Streamlined New Account Flow with Auto-Reload:**  
+* **Cancel-safe Add Account Flow:**
   When adding a new Google account:
-  1. Displays an explanatory confirmation dialog.
-  2. Opens Google OAuth in your default browser.
-  3. Waits for a fresh token, offers **Switch All & Reload**, writes the new account to the IDE, Desktop and CLI, and reloads only after every store converges.
+  1. Saves/refreshes the current profile and captures its token files, databases and keyring.
+  2. Signs out of the current account and opens Google sign-in, so the browser can show the account chooser.
+  3. Detects the new account, saves it with an automatic label, applies it to the IDE/Desktop/CLI and reloads only after every store converges.
+  4. Restores the captured previous state and reloads if sign-in is cancelled or fails.
 
 * **Strict Session Gating (Zero Phantom Accounts):**  
   Validates that a token is usable (a non-expired access token or a refresh token) and never infers a session from historical SQLite onboarding keys. Manual registration only works while a real OAuth token exists and the email matches the token owner.
@@ -107,7 +110,7 @@ Google Antigravity utilizes **Unified State Sync (USS)** (`antigravityUnifiedSta
 
 The switcher is designed for **one account at a time** across all surfaces. With the IDE, Desktop 2.0 and the CLI open at the same time, each process keeps its own copy of the OAuth token and may refresh it independently (the CLI refreshes roughly every hour). The switcher cannot force three running processes to keep three different accounts; any tool that writes the shared token files will win the last write.
 
-What v1.8.5 does instead:
+What v1.8.6 does instead:
 
 * runs a cross-process lock (`~/.gemini/.antigravity-switch.lock`) so two switches cannot interleave;
 * records the expected identity and hashes in `~/.gemini/antigravity_switch_state.json`;
@@ -117,19 +120,19 @@ What v1.8.5 does instead:
 
 The status bar prefers the surface selected by `antigravityAccountSwitcher.preferredStore` (`standaloneToken` by default, or `cliToken`), and always prefers the account most recently applied by the switcher while that store still exists. It never chooses a winner by modification time.
 
-### Identity rules (v1.8.5)
+### Identity rules (v1.8.6)
 
 * Gmail aliases are canonicalized for comparisons: `user+tag@gmail.com` and `u.ser@gmail.com` collapse to the same canonical address. The original email is still used when writing tokens.
 * Each profile stores an `account_id` and a refresh-token fingerprint per token category. Profiles that share a canonical email or a fingerprint are **merged into one** (with `aliases`) instead of creating a second entry.
 * A profile menu entry shows its aliases. Labels are unique; a duplicate label is automatically suffixed (`Work 2`).
 * A `state.vscdb` is only considered a valid identity when `antigravityAuthStatus.email` and every `lastLoginUsername` / `jetski.onboarding.lastLoginUsername` agree. If they differ, the status bar reports `database-identity-mismatch` and saving/switching is blocked until the account is repaired (apply a profile or sign in again).
 * Manual registration requires the typed email to match a token or database identity. It cannot invent an email when the active token belongs to another account.
-* The sign-in flow waits for a **fresh token** (mtime after the sign-in started and a new fingerprint or email); a refresh from another surface no longer counts as a successful login. After the user confirms, it applies the new account to every store.
+* The **Add account** flow snapshots the current token files, databases and keyring, signs out, waits for a usable token file from the new login (rejecting multiple identities), then applies the new account to every store. If login is cancelled or fails, the snapshot is restored.
 * After every successful switch, the target profile's metadata is refreshed (fingerprints, `account_id`, `db_tokens_by_path`, `complete`). Legacy profiles therefore repair themselves the first time they are applied.
 
-When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Connect / Sign In to Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
+When saving while another surface is still on a different account, the save is blocked with an explicit conflict message. To complete a login instead, use **Add Google Account** or `agy-switch adopt`; for an already-saved profile, use **Reapply target profile** in the menu.
 
-To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.5; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
+To use three different accounts simultaneously, each surface must run with an isolated profile/data directory. That is not implemented in v1.8.6; see [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md) for why full isolation is not the next core feature.
 
 ### Reliability Doctor
 
@@ -190,10 +193,12 @@ neither exists, it shows **Open Settings > View Usage**.
    * If the conflict is a newly signed-in account, choose **`Use newest login: email`** instead.
    * Reload/restart the surface named as divergent if the conflict returns; it is still signed in as the other account.
 
-4. **Connecting a New Account:**
-   * Click **`Connect / Sign In to Google Account...`**.
-   * Complete Google Sign-In in your browser.
-   * Confirm **`Switch All & Reload`**; the new account is written to the IDE, Desktop and CLI, and the profile is saved.
+4. **Adding a New Account:**
+   * Click **`Add account`** (dashboard) or **`Add Google Account...`** (menu). Antigravity permits one active Google account at a time, so the extension must sign out of the current one first.
+   * Confirm **`Sign Out & Continue`** (or **`Sign In & Continue`** when already signed out). The current profile is saved/refreshed automatically; its token files, databases and keyring are captured before sign-out.
+   * In the browser, choose the account you want to add. If the current account is preselected, choose **“Use another account”**.
+   * The new account is detected, saved with a label based on the email prefix, applied to the IDE/Desktop/CLI and the window reloads. You can rename the label later.
+   * If you cancel or sign-in fails, the previous account is restored and the window reloads. Finish running agent tasks and close other Antigravity windows/CLI sessions before starting.
 
 5. **Saving an Active Account:**
    * Click **`Save Active Account...`** to store the current session into the vault under a custom label (e.g., `Work`, `Personal`, `Contractor`).
@@ -289,7 +294,7 @@ Then reload Antigravity IDE (`Ctrl + Shift + P` → `Developer: Reload Window`).
 
 1. In Antigravity IDE, open the Command Palette (`Ctrl + Shift + P`).
 2. Type and select **`Extensions: Install from VSIX...`**.
-3. Select `antigravity-account-switcher-1.8.5.vsix` located in the repository folder.
+3. Select `antigravity-account-switcher-1.8.6.vsix` located in the repository folder.
 4. Reload the window when prompted.
 
 To rebuild the VSIX from source:

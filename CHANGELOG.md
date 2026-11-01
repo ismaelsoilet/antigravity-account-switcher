@@ -4,6 +4,30 @@ All notable changes to Antigravity Account Switcher are documented here.
 The project follows a pragmatic semantic versioning scheme: patch releases harden
 switching and identity handling, minor releases add workflows or storage formats.
 
+## 1.8.6 — 2026-10-31
+
+### Fixed
+
+- **Adding a Google account is now a single, cancel-safe flow.** Antigravity
+  allows one active account; the extension now saves/refreshes the current
+  profile, captures its token files, databases and keyring, signs out, opens
+  Google sign-in, detects the new account, saves it with an automatic label and
+  applies it to every surface.
+- **No lost current account.** If sign-in is cancelled, times out or fails, the
+  captured state is restored and the window reloads. Conflicts and an active
+  session without an email abort the flow before sign-out.
+- **Less friction.** Removed the second “Switch all” confirmation and the label
+  prompt; the new profile is auto-labeled from the email prefix and can be
+  renamed later.
+- **Clearer browser guidance.** The progress explicitly asks the user to select
+  the desired account and use “Use another account” when the old account is
+  preselected.
+
+### Tests
+
+- 60 JavaScript tests (including the new transactional rollback test) and 60
+  Python tests passing; 1 opt-in real keyring test skipped by default.
+
 ## 1.8.5 — 2026-10-31
 
 ### Fixed

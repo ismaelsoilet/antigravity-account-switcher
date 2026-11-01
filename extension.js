@@ -333,8 +333,8 @@ async function showAccountSwitcherMenu() {
 
         items.push({ label: 'ACCOUNT ACTIONS', kind: vscode.QuickPickItemKind.Separator });
         items.push({
-            label: '$(add) Connect / Sign In to Google Account...',
-            detail: 'Opens the browser for Google OAuth and saves the new profile after sign-in.',
+            label: '$(add) Add Google Account...',
+            detail: 'Saves the current profile, signs out, opens Google sign-in, and restores the previous account if cancelled.',
             action: 'login'
         });
 
@@ -638,38 +638,65 @@ async function manualRegisterAccount() {
     }
 }
 
-async function applyLoginCandidate(candidate, suggestedLabel) {
-    if (!candidate || !candidate.path) {
+function chooseLoginCandidate(session) {
+    const stores = (session.stores || []).filter(store => (
+        store.kind === 'file'
+        && store.usable
+        && store.hasToken
+        && store.email
+    ));
+    const byEmail = new Map();
+    for (const store of stores) {
+        const key = tokenManager.canonicalEmail(store.email);
+        if (!byEmail.has(key)) byEmail.set(key, store);
+    }
+    if (byEmail.size > 1) {
+        throw new Error(
+            `Sign-in produced multiple fresh identities (${[...byEmail.keys()].join(', ')}). `
+            + 'Close or switch the other Antigravity surfaces, then try again.'
+        );
+    }
+    if (byEmail.size === 0) return null;
+    const order = ['standaloneToken', 'cliToken', 'oauthCreds'];
+    return [...byEmail.values()].sort(
+        (left, right) => order.indexOf(left.category) - order.indexOf(right.category)
+    )[0];
+}
+
+function scheduleWindowReload() {
+    setTimeout(() => {
+        void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }, 900);
+}
+
+async function applyLoginCandidate(candidate) {
+    if (!candidate || !candidate.path || !candidate.email) {
         vscode.window.showErrorMessage('No fresh login token was found. Sign in again.');
         return;
     }
+    const profiles = tokenManager.loadProfiles();
+    const existing = getProfileEntry(profiles, candidate.email);
+    const label = existing && existing.label ? existing.label : candidate.email.split('@')[0];
     const confirmation = await vscode.window.showWarningMessage(
         `Switch all Antigravity surfaces to ${candidate.email}?`,
         {
             modal: true,
-            detail: 'This writes the new account to the IDE, Desktop and CLI, replacing the current account in every token file and database. Save any unsaved work first.'
+            detail: 'This writes the signed-in account to every token file and database. Saved profiles are kept.'
         },
         'Switch All & Reload',
         'Cancel'
     );
     if (confirmation !== 'Switch All & Reload') return;
 
-    const label = await vscode.window.showInputBox({
-        prompt: `Friendly label for ${candidate.email}:`,
-        value: suggestedLabel || candidate.email.split('@')[0],
-        ignoreFocusOut: true
-    });
-    if (!label || !label.trim()) return;
-
     switchInProgress = true;
     suppressWatcherUntil = Date.now() + 5000;
     try {
-        const { entry } = tokenManager.switchToLoginSession(candidate, label.trim());
+        const { entry } = tokenManager.switchToLoginSession(candidate, label);
         conflictLogKeys.clear();
         await updateStatusBar();
         refreshDashboard();
-        vscode.window.showInformationMessage(`All surfaces switched to ${entry.email} as "[${entry.label}]".`);
-        void vscode.commands.executeCommand('workbench.action.reloadWindow');
+        vscode.window.showInformationMessage(`All surfaces switched to ${entry.email} as [${entry.label}]. Reloading...`);
+        scheduleWindowReload();
     } catch (error) {
         logError('Failed to switch all surfaces to the new login', error);
         vscode.window.showErrorMessage(`Login switch failed: ${error.message || error}`);
@@ -682,90 +709,156 @@ async function applyLoginCandidate(candidate, suggestedLabel) {
 async function loginNewAccount() {
     const commands = await vscode.commands.getCommands(false);
     if (!commands.includes('antigravity.internal.loginWithRedirect')) {
-        vscode.window.showErrorMessage('This Antigravity version does not expose the sign-in command. Sign in from the Antigravity account menu and then use "Save Active Account".');
+        vscode.window.showErrorMessage(
+            'This Antigravity version does not expose the sign-in command. '
+            + 'Sign in from the Antigravity account menu, choose the new account, and then use "Save Active Account".'
+        );
         return;
     }
 
-    const confirmation = await vscode.window.showInformationMessage(
-        'Connect Google Account',
-        {
-            modal: true,
-            detail: 'The browser will open for Google OAuth. After you finish, the extension detects the new session and asks you to name the profile.'
-        },
-        'Open Browser & Sign In',
+    const before = tokenManager.detectSessions({
+        preferredStore: getPreferredStore(),
+        includeKeyring: true
+    });
+    const previousEmail = before.hasToken ? (before.email || '') : '';
+    if (before.hasToken && !previousEmail) {
+        vscode.window.showErrorMessage(
+            'The active session has no detectable email. Register or save it before adding another account.'
+        );
+        return;
+    }
+    if (previousEmail && hasBlockingConflicts(before)) {
+        vscode.window.showErrorMessage(
+            'Cannot add an account while the Antigravity stores disagree. '
+            + 'Resolve the conflict from the dashboard first.'
+        );
+        return;
+    }
+    if (previousEmail && !commands.includes('antigravity.internal.logout')) {
+        vscode.window.showErrorMessage(
+            'This Antigravity version does not expose the sign-out command. '
+            + 'Use "Log Out Current Account", sign in with the new account, then use "Save Active Account".'
+        );
+        return;
+    }
+
+    const detail = previousEmail
+        ? `Antigravity supports one active Google account at a time. To add another account, the extension will:\n\n`
+            + `1. save/refresh the profile for ${previousEmail};\n`
+            + `2. sign out of ${previousEmail};\n`
+            + `3. open Google sign-in;\n`
+            + `4. save the new account and apply it to every surface.\n\n`
+            + `In the browser, choose the account you want to add. If ${previousEmail} appears preselected, choose "Use another account".\n\n`
+            + `If you cancel or sign-in fails, ${previousEmail} is restored. `
+            + `Finish running agent tasks and close other Antigravity windows/CLI sessions first.`
+        : 'The browser will open for Google sign-in. The new account will be saved and applied to every surface.';
+    const continueLabel = previousEmail ? 'Sign Out & Continue' : 'Sign In & Continue';
+    const confirmation = await vscode.window.showWarningMessage(
+        'Add Google Account',
+        { modal: true, detail },
+        continueLabel,
         'Cancel'
     );
-    if (confirmation !== 'Open Browser & Sign In') return;
+    if (confirmation !== continueLabel) return;
 
-    const loginStart = Date.now();
-    const before = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
-    const beforeFingerprints = new Set(before.stores.map(store => store.fingerprint).filter(Boolean));
-    const beforeEmails = new Set(
-        before.stores
-            .flatMap(store => (store.kind === 'database' ? (store.identityEmails || []) : [store.email]))
-            .filter(Boolean)
-            .map(tokenManager.canonicalEmail)
-    );
-
+    let rollback = null;
     let candidate = null;
-    let candidateConflict = null;
+    switchInProgress = true;
+    suppressWatcherUntil = Date.now() + 5 * 60 * 1000;
     try {
+        if (previousEmail) {
+            const profiles = tokenManager.loadProfiles();
+            const existing = getProfileEntry(profiles, previousEmail);
+            const label = existing && existing.label ? existing.label : previousEmail.split('@')[0];
+            tokenManager.snapshotActiveAccount(label, previousEmail);
+        }
+        rollback = tokenManager.captureCurrentState({ includeKeyring: true });
+
         await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
-                title: 'Antigravity: waiting for Google sign-in to complete...',
+                title: previousEmail ? 'Antigravity: adding Google account' : 'Antigravity: signing in',
                 cancellable: false
             },
-            async () => {
-                await vscode.commands.executeCommand('antigravity.internal.loginWithRedirect');
-                const deadline = Date.now() + 20000;
+            async progress => {
+                if (previousEmail) {
+                    progress.report({ message: `Signing out of ${previousEmail}...` });
+                    await vscode.commands.executeCommand('antigravity.internal.logout');
+                    tokenManager.clearAllSessionTokens();
+                } else if (commands.includes('antigravity.internal.logout')) {
+                    try {
+                        await vscode.commands.executeCommand('antigravity.internal.logout');
+                    } catch {}
+                }
+                progress.report({
+                    message: previousEmail
+                        ? `Signed out. In the browser, choose the account to add (use "Use another account" if ${previousEmail} appears).`
+                        : 'In the browser, choose the account to add.'
+                });
+                const authResult = await vscode.commands.executeCommand('antigravity.internal.loginWithRedirect');
+                if (authResult && authResult.hasValidAuth === false) {
+                    throw new Error(authResult.uiMessage || 'Google sign-in did not complete.');
+                }
+                progress.report({ message: 'Reading the new session...' });
+                const deadline = Date.now() + 30000;
                 while (Date.now() < deadline) {
                     const current = tokenManager.detectSessions({ preferredStore: getPreferredStore() });
-                    const fresh = current.stores.filter(store => (
-                        store.kind === 'file'
-                        && store.usable
-                        && store.hasToken
-                        && store.email
-                        && (store.mtimeMs || 0) >= loginStart - 2000
-                        && (
-                            (store.fingerprint && !beforeFingerprints.has(store.fingerprint))
-                            || !beforeEmails.has(tokenManager.canonicalEmail(store.email))
-                        )
-                    ));
-                    const distinct = new Map();
-                    for (const store of fresh) {
-                        const key = tokenManager.canonicalEmail(store.email);
-                        if (!distinct.has(key)) distinct.set(key, store);
-                    }
-                    if (distinct.size > 1) {
-                        candidateConflict = [...distinct.values()];
-                        return;
-                    }
-                    if (distinct.size === 1) {
-                        candidate = [...distinct.values()][0];
-                        return;
-                    }
+                    candidate = chooseLoginCandidate(current);
+                    if (candidate) return;
                     await tokenManager.delay(500);
                 }
+                throw new Error(
+                    'Google sign-in was not detected with a fresh token. '
+                    + 'Finish the browser flow and try again.'
+                );
             }
         );
+
+        if (!candidate) throw new Error('No fresh login token was found. Sign in again.');
+
+        const profiles = tokenManager.loadProfiles();
+        const existing = getProfileEntry(profiles, candidate.email);
+        const label = existing && existing.label ? existing.label : candidate.email.split('@')[0];
+        const { entry } = tokenManager.switchToLoginSession(candidate, label);
+        conflictLogKeys.clear();
+        await updateStatusBar();
+        refreshDashboard();
+        const sameAccount = previousEmail
+            && tokenManager.canonicalEmail(previousEmail) === tokenManager.canonicalEmail(entry.email);
+        vscode.window.showInformationMessage(
+            sameAccount
+                ? `Signed in as ${entry.email} again; profile [${entry.label}] refreshed and all surfaces synced. Reloading...`
+                : `Added ${entry.email} as [${entry.label}]. All surfaces synced. Reloading...`
+        );
+        scheduleWindowReload();
     } catch (error) {
-        logError('Google sign-in command failed', error);
-        vscode.window.showErrorMessage(`Google Sign-In failed or was cancelled: ${error.message || error}`);
-        return;
+        logError('Add Google account failed', error);
+        if (rollback) {
+            const restored = tokenManager.restoreCapturedState(rollback);
+            if (restored.failed.length > 0) {
+                vscode.window.showErrorMessage(
+                    `Add account failed: ${error.message || error}. `
+                    + `The previous account could not be fully restored: ${restored.failed.join(' | ')}`
+                );
+                if (outputChannel) outputChannel.show(true);
+            } else {
+                vscode.window.showWarningMessage(
+                    `Add account failed: ${error.message || error}. `
+                    + (previousEmail ? `Previous account ${previousEmail} restored. Reloading...` : 'Previous state restored. Reloading...')
+                );
+                try {
+                    await updateStatusBar();
+                    refreshDashboard();
+                } catch {}
+                scheduleWindowReload();
+            }
+        } else {
+            vscode.window.showErrorMessage(`Add account failed: ${error.message || error}. No changes were made.`);
+        }
+    } finally {
+        switchInProgress = false;
+        suppressWatcherUntil = Date.now() + 5000;
     }
-
-    if (candidateConflict) {
-        const emails = candidateConflict.map(store => store.email).join(', ');
-        vscode.window.showErrorMessage(`Sign-in produced multiple fresh identities (${emails}). Close or switch the other Antigravity surfaces and try again.`);
-        return;
-    }
-    if (!candidate) {
-        vscode.window.showWarningMessage('Sign-in was not detected with a fresh token. Finish the flow in your browser and then use "Save Active Account".');
-        return;
-    }
-
-    await applyLoginCandidate(candidate, candidate.email.split('@')[0]);
 }
 
 async function logoutAccount() {

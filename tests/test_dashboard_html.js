@@ -4,7 +4,7 @@ const assert = require('assert');
 const { escapeHtml, renderDashboardHtml, renderDashboardLoadingHtml } = require('../dashboardHtml');
 
 const snapshot = {
-    version: '1.8.4',
+    version: '1.8.6',
     locale: 'pt-BR',
     active: {
         email: 'user@example.com',
@@ -50,6 +50,7 @@ assert.ok(html.includes('Work'));
 assert.ok(html.includes('Keyring managed'));
 assert.ok(html.includes('data-action="switch"'));
 assert.ok(html.includes('data-action="openSettings"'));
+assert.ok(html.includes('Add account'));
 assert.ok(html.includes('03/11/2027'));
 assert.ok(html.includes("script-src 'nonce-abc123'"));
 assert.ok(html.includes('--bar-bg: rgba(127,127,127,.18)'));
@@ -65,7 +66,7 @@ const usHtml = renderDashboardHtml({
 assert.ok(usHtml.includes('11/03/2027'));
 
 const empty = renderDashboardHtml({
-    version: '1.8.4',
+    version: '1.8.6',
     locale: 'pt-BR',
     active: {},
     keyring: { available: false, managed: false },
@@ -74,6 +75,7 @@ const empty = renderDashboardHtml({
 }, 'def456');
 assert.ok(empty.includes('No local quota data'));
 assert.ok(empty.includes('Open Settings &gt; View Usage'));
+assert.ok(empty.includes('Add account'));
 assert.ok(!empty.includes('data-action="switch"'));
 assert.strictEqual(escapeHtml('<b>"x"</b>'), '&lt;b&gt;&quot;x&quot;&lt;/b&gt;');
 

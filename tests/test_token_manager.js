@@ -889,6 +889,27 @@ test('switchToLoginSession applies a fresh login to every store', async () => {
     assert.ok(tokenManager.loadProfiles()['new@example.com']);
 });
 
+test('captureCurrentState and restoreCapturedState roll back an add-account attempt', () => {
+    if (!DatabaseSync) return;
+    resetState();
+    writeToken('standaloneToken', makeToken('old@example.com', 'old-a', 'old-r'));
+    setDbRows({
+        antigravityAuthStatus: JSON.stringify({ email: 'old@example.com' })
+    });
+
+    const captured = tokenManager.captureCurrentState();
+    writeToken('standaloneToken', makeToken('new@example.com', 'new-a', 'new-r'));
+    setDbRows({
+        antigravityAuthStatus: JSON.stringify({ email: 'new@example.com' })
+    });
+
+    const result = tokenManager.restoreCapturedState(captured);
+    assert.deepStrictEqual(result.failed, []);
+    const token = JSON.parse(fs.readFileSync(tokenPath('standaloneToken'), 'utf-8'));
+    assert.strictEqual(token.id_token_email, 'old@example.com');
+    assert.strictEqual(JSON.parse(readDbValue('antigravityAuthStatus')).email, 'old@example.com');
+});
+
 test('restoreProfile refreshes legacy profile metadata', async () => {
     if (!DatabaseSync) return;
     resetState();

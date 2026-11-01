@@ -179,14 +179,14 @@ function renderProfiles(snapshot) {
                 <div><h2>Profiles</h2><p class="muted">One active account at a time.</p></div>
                 <div class="head-actions">
                     <button class="ghost" data-action="save">Save current</button>
-                    <button class="ghost" data-action="login">Sign in</button>
+                    <button class="ghost" data-action="login" title="Adds another account: saves and signs out of the current one first">Add account</button>
                 </div>
             </div>
             ${rows || `
                 <div class="empty">
                     <strong>No saved profiles</strong>
-                    <span>Sign in to an account and save the current session.</span>
-                    <button class="primary" data-action="login">Sign in</button>
+                    <span>Sign in with Google and save the current session.</span>
+                    <button class="primary" data-action="login">Add account</button>
                 </div>`}
         </section>`;
 }
@@ -351,7 +351,7 @@ function renderDashboardHtml(snapshot, nonce) {
         <button class="ghost" data-action="doctor">Doctor</button>
         <button class="ghost" data-action="diagnostics">Diagnostics</button>
         <button class="ghost" data-action="save">Save current</button>
-        <button class="ghost" data-action="login">Sign in</button>
+        <button class="ghost" data-action="login" title="Adds another account: saves and signs out of the current one first">Add account</button>
     </div>
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
